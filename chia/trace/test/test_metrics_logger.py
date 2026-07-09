@@ -5,7 +5,66 @@ import os
 import random
 import tempfile
 
-from chia.trace.metrics import MetricsLogger, NullBackend, TensorBoardBackend
+import pytest
+
+from chia.trace.metrics import (
+    MetricsBackend, MetricsLogger, NullBackend, TensorBoardBackend, _BACKENDS, register_backend,
+)
+
+
+class _RecordingBackend(MetricsBackend):
+    """Minimal out-of-tree backend: keeps scalars in memory."""
+
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.scalars = []
+
+    def log_scalar(self, tag, value, step):
+        self.scalars.append((tag, value, step))
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def clean_registry():
+    """Keep a test's registration out of the process-wide _BACKENDS table."""
+    before = dict(_BACKENDS)
+    yield
+    _BACKENDS.clear()
+    _BACKENDS.update(before)
+
+
+def test_register_backend_makes_it_selectable(clean_registry):
+    register_backend("recording", _RecordingBackend)
+
+    m = MetricsLogger(backend="recording", run_dir="/tmp/x")
+    m.log_scalar("loss", 0.5, step=3)
+
+    assert isinstance(m._backend, _RecordingBackend)
+    assert m._backend.kwargs == {"run_dir": "/tmp/x"}  # kwargs reach the backend ctor
+    assert m._backend.scalars == [("loss", 0.5, 3)]
+    m.close()
+
+
+def test_register_backend_is_idempotent(clean_registry):
+    register_backend("recording", _RecordingBackend)
+    register_backend("recording", _RecordingBackend)  # re-import must not raise
+
+    assert _BACKENDS["recording"] is _RecordingBackend
+
+
+def test_register_backend_rejects_a_non_backend(clean_registry):
+    with pytest.raises(TypeError, match="MetricsBackend subclass"):
+        register_backend("bogus", dict)
+
+
+def test_unknown_backend_still_raises():
+    with pytest.raises(ValueError, match="Unknown metrics backend"):
+        MetricsLogger(backend="never-registered")
 
 
 def test_null_backend():
