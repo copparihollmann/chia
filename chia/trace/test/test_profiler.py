@@ -42,6 +42,11 @@ TestProfilerWithRay (local Ray + collector):
         real worker IP, worker ID, exec_time, and wall_time.
   12. test_get_unwraps_transparently
         get() returns the plain value, not a _ProfiledResult wrapper.
+  12b. test_get_unwraps_a_list_of_refs
+        get([ref, ...]) unwraps every element, not just a lone ref.
+  12c. test_batched_get_registers_dependency_edges
+        A batched get() registers each element, so a fan-in still records
+        obj_ref_deps.
   13. test_local_call_profiled
         Local @ChiaFunction call emits local_start + local_end events.
   14. test_dependency_chain_via_ray
@@ -97,6 +102,18 @@ class Artifact:
         self.name = name
     def __repr__(self):
         return f"Artifact({self.name!r})"
+
+
+@ChiaFunction()
+def chia_make_artifact(name):
+    """Returns a non-scalar, so its result is eligible for dependency tracking
+    (unlike the int from chia_add, which is in _SKIP_DEPENDENCY_TYPES)."""
+    return Artifact(name)
+
+
+@ChiaFunction()
+def chia_use_artifact(artifact):
+    return artifact.name.upper()
 
 
 def _print_events(events, header=""):
@@ -479,6 +496,40 @@ class TestProfilerWithRay(unittest.TestCase):
 
         self.assertEqual(result, 7)
         self.assertNotIsInstance(result, _ProfiledResult)
+
+    def test_get_unwraps_a_list_of_refs(self):
+        """get([ref, ...]) unwraps every element, per its Sequence[ObjectRef[R]] -> List[R] overload."""
+        refs = [chia_add.chia_remote(1, 2), chia_add.chia_remote(3, 4)]
+        results = get(refs)
+
+        self.assertEqual(results, [3, 7])
+        for r in results:
+            self.assertNotIsInstance(r, _ProfiledResult)
+
+    def test_batched_get_registers_dependency_edges(self):
+        """A batched get() must register each element, or a fan-in loses its edges.
+
+        The unwrap and the registration are the same call: skipping
+        on_remote_complete() per element also skips _register_result(), so a
+        consumer of a batched get()'s values records no obj_ref_deps and the
+        fan-out/fan-in shape is missing from the trace. Uses Artifact rather than
+        an int because scalars are in _SKIP_DEPENDENCY_TYPES and never produce
+        edges (see test_dependency_chain_via_ray).
+        """
+        refs = [chia_make_artifact.chia_remote("a"), chia_make_artifact.chia_remote("b")]
+        artifacts = get(refs)  # batched — the path under test
+
+        result = get(chia_use_artifact.chia_remote(artifacts[0]))
+        self.assertEqual(result, "A")
+
+        events = self._get_events()
+        _print_events(events, "test_batched_get_registers_dependency_edges")
+
+        dispatches = [e for e in events if e["type"] == "dispatch"]
+        producer_a, consumer = dispatches[0], dispatches[-1]
+        self.assertEqual(producer_a["func"], "chia_make_artifact")
+        self.assertEqual(consumer["func"], "chia_use_artifact")
+        self.assertIn(producer_a["call_id"], consumer["obj_ref_deps"])
 
     def test_local_call_profiled(self):
         """Local ChiaFunction call emits local_start + local_end."""
