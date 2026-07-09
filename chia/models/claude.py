@@ -21,6 +21,40 @@ if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
 
 
+#: Variables Claude Code exports to the processes it spawns. A chia loop is very often launched
+#: from *inside* a Claude Code session, in which case a ``claude`` subprocess inherits these and
+#: behaves as a nested child of that session instead of a fresh top-level run. Strip them all.
+#:
+#: The first group changes behaviour and is the reason this exists:
+#:
+#: - ``CLAUDECODE``, ``CLAUDE_CODE_CHILD_SESSION`` — mark the process as a nested child.
+#: - ``CLAUDE_CODE_SSE_PORT`` — the child dials the parent's SSE relay, which is gone as soon as
+#:   the parent's turn ends.
+#: - ``CLAUDE_CODE_SESSION_ID`` — collides with the ``--session-id``/``--resume`` this class
+#:   manages itself, so cross-worker session resume silently targets the wrong session.
+#: - ``CLAUDE_CODE_EXECPATH`` — resolves ``claude`` to the parent's binary rather than the one on
+#:   the worker's PATH, which on a heterogeneous cluster is a different version.
+#: - ``CLAUDE_EFFORT`` — silently overrides the effort the caller asked for.
+#:
+#: The second group is inherited *metadata* rather than routing. It is stripped for
+#: reproducibility: a run's environment should not depend on whether a human or another agent
+#: launched it.
+#:
+#: - ``CLAUDE_CODE_ENTRYPOINT``, ``AI_AGENT`` — describe how the parent was started.
+_NESTED_SESSION_ENV_VARS = (
+    # behaviour-changing
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_EFFORT",
+    # inherited metadata
+    "CLAUDE_CODE_ENTRYPOINT",
+    "AI_AGENT",
+)
+
+
 # ---------------------------------------------------------------------------
 # Result type — claude-specific
 # ---------------------------------------------------------------------------
@@ -360,6 +394,7 @@ class ClaudeCodeLLM(LLMCallBase):
         resume_session: bool = False,
         projects_cwd: Optional[str] = "/home/ray/.claude/projects/-home-ray-llm-env",
         extra_cli_args: Optional[List[str]] = None,
+        extra_env: Optional[dict] = None,
         log_stream: bool = True,
         log_all: bool = False,
         backend: str = "cli",
@@ -379,6 +414,7 @@ class ClaudeCodeLLM(LLMCallBase):
         self.timeout_seconds = timeout_seconds
         self.model = model
         self.extra_cli_args = extra_cli_args or []
+        self.extra_env = dict(extra_env or {})
         self.logger = logging.getLogger(logging_name)
         self.log_stream = log_stream
         self.log_all = log_all
@@ -814,6 +850,17 @@ class ClaudeCodeLLM(LLMCallBase):
         cmd += ["-p", "-"]
         return cmd
 
+    def _child_env(self) -> dict:
+        """Environment for the ``claude`` subprocess.
+
+        Drops :data:`_NESTED_SESSION_ENV_VARS` so the child is a fresh top-level session rather
+        than a nested child of whatever Claude Code session spawned this process, then applies
+        ``extra_env`` (e.g. ``CLAUDE_CONFIG_DIR`` to bill a run to a specific account).
+        """
+        env = {k: v for k, v in os.environ.items() if k not in _NESTED_SESSION_ENV_VARS}
+        env.update(self.extra_env)
+        return env
+
     def _run_claude(
         self,
         user_message: str,
@@ -822,7 +869,7 @@ class ClaudeCodeLLM(LLMCallBase):
         """Run claude with simple capture (no event streaming)."""
         cmd = self._build_cmd(tools)
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
-        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env = self._child_env()
 
         result = subprocess.run(
             cmd,
@@ -876,7 +923,7 @@ class ClaudeCodeLLM(LLMCallBase):
         """
         cmd = self._build_cmd(tools)
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
-        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env = self._child_env()
 
         result_text_parts: list[str] = []
         stderr_parts: list[str] = []
