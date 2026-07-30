@@ -123,6 +123,12 @@ def record_run_usage(
             tracking_mode="local",
         )
 
+        # Persist the model where aet's cross-experiment `aet spend` rollup discovers a run's identity
+        # (run_record/trajectory are not written by this token-only sink), so per-model attribution is
+        # correct instead of bucketing the run under "(unknown)".
+        if model:
+            run_logger.log_params({"gen_ai.response.model": model})
+
         input_tokens = _as_int("input_tokens")
         output_tokens = _as_int("output_tokens")
         cache_read = _as_int("cache_read_input_tokens")
