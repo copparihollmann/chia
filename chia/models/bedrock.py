@@ -408,7 +408,13 @@ class BedrockLLM(LLMCallBase):
             messages: list[dict] = [
                 {"role": "user", "content": [{"text": user_message}]}
             ]
-            meta = {"input_tokens": 0, "output_tokens": 0, "num_turns": 0}
+            meta = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "num_turns": 0,
+            }
             final_text = ""
 
             for _ in range(self.max_tool_iterations):
@@ -435,6 +441,14 @@ class BedrockLLM(LLMCallBase):
                 usage = resp.get("usage", {})
                 meta["input_tokens"] += usage.get("inputTokens", 0) or 0
                 meta["output_tokens"] += usage.get("outputTokens", 0) or 0
+                # Prompt-cache buckets are only present when the model/request
+                # uses caching; treat a missing field as zero.
+                meta["cache_read_input_tokens"] += (
+                    usage.get("cacheReadInputTokens", 0) or 0
+                )
+                meta["cache_creation_input_tokens"] += (
+                    usage.get("cacheWriteInputTokens", 0) or 0
+                )
 
                 out_message = resp["output"]["message"]
                 stop_reason = resp.get("stopReason")
@@ -516,7 +530,20 @@ class BedrockLLM(LLMCallBase):
                 )
 
         # --- Metadata + log file ---
+        # Estimate cost from token counts before pruning zeros; only record it
+        # when the price is actually known (never a fabricated 0).
+        from chia.models.usage import estimate_cost_usd
+
+        cost = estimate_cost_usd(
+            meta["input_tokens"],
+            meta["output_tokens"],
+            meta["cache_read_input_tokens"],
+            meta["cache_creation_input_tokens"],
+            model=self.model,
+        )
         self._last_metadata = {k: v for k, v in meta.items() if v}
+        if cost is not None:
+            self._last_metadata["cost_usd"] = cost
 
         stream_parts.append("-" * 80 + "\n\n")
         if self._log_prefix is not None:

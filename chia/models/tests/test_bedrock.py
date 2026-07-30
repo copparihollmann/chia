@@ -214,6 +214,54 @@ def test_converse_no_tools_request_shaping_and_result(monkeypatch):
     assert llm._last_metadata["model"] == "amazon.nova-lite-v1:0"
 
 
+def test_converse_surfaces_cache_tokens_and_cost(monkeypatch):
+    # A Converse response carrying prompt-cache buckets. These are only present
+    # when the model/request uses caching, so the older _cv_response helper omits
+    # them; build the usage block explicitly here.
+    resp = {
+        "output": {"message": {"role": "assistant",
+                               "content": [_cv_text("cached PONG")]}},
+        "stopReason": "end_turn",
+        "usage": {
+            "inputTokens": 12,
+            "outputTokens": 7,
+            "cacheReadInputTokens": 100,
+            "cacheWriteInputTokens": 40,
+            "totalTokens": 159,
+        },
+    }
+    _install_fake_boto3(monkeypatch, [resp], {"calls": []})
+
+    llm = BedrockLLM(model="anthropic.claude-sonnet-4-6", region="us-east-1")
+    cli = llm.prompt("ping", tools=[])
+
+    assert cli.success is True
+    meta = llm._last_metadata
+    assert meta["input_tokens"] == 12
+    assert meta["output_tokens"] == 7
+    assert meta["cache_read_input_tokens"] == 100
+    assert meta["cache_creation_input_tokens"] == 40
+    # Cost is recorded only when the price is known; when present it is a real
+    # positive number (never a fabricated 0).
+    if "cost_usd" in meta:
+        assert isinstance(meta["cost_usd"], float)
+        assert meta["cost_usd"] > 0
+
+
+def test_converse_omits_cache_tokens_when_absent(monkeypatch):
+    # No cache buckets in the usage block -> canonical cache keys stay absent
+    # (pruned as zeros), never invented.
+    _install_fake_boto3(
+        monkeypatch,
+        [_cv_response([_cv_text("PONG")], "end_turn", in_tok=10, out_tok=5)],
+        {"calls": []},
+    )
+    llm = BedrockLLM(model="amazon.nova-lite-v1:0", region="us-east-1")
+    llm.prompt("ping", tools=[])
+    assert "cache_read_input_tokens" not in llm._last_metadata
+    assert "cache_creation_input_tokens" not in llm._last_metadata
+
+
 def test_converse_tool_loop_executes_mcp_and_feeds_results(monkeypatch):
     capture = {"calls": [], "urls": [], "tool_calls": []}
     _install_fake_boto3(
