@@ -368,6 +368,14 @@ class ClaudeCodeLLM(LLMCallBase):
         thinking: Optional[str] = "adaptive",
         max_tool_iterations: int = 100,
         dangerously_skip_permissions: bool = True,
+        use_bedrock: bool = False,
+        subagent_model: Optional[str] = None,
+        background_model: Optional[str] = None,
+        region: Optional[str] = None,
+        bearer_token: Optional[str] = None,
+        opus_model: Optional[str] = None,
+        sonnet_model: Optional[str] = None,
+        haiku_model: Optional[str] = None,
         config=UNSET,
     ):
         super().__init__(system_message=system_message,
@@ -393,6 +401,23 @@ class ClaudeCodeLLM(LLMCallBase):
         self.max_tokens = max_tokens
         self.thinking = thinking
         self.max_tool_iterations = max_tool_iterations
+
+        # Bedrock multi-model routing (CLI backend). When ``use_bedrock`` is
+        # True the ``claude`` subprocess env is augmented with the Bedrock
+        # tier env vars (see ``chia.models.bedrock_config``): ``self.model``
+        # stays the primary/orchestrator, ``subagent_model`` runs all Task-tool
+        # subagents, ``background_model`` handles background chores, and the
+        # opus/sonnet/haiku pins resolve aliases to concrete profiles. All are
+        # optional; with ``use_bedrock=False`` (the default) the subprocess env
+        # is unchanged.
+        self.use_bedrock = use_bedrock
+        self.subagent_model = subagent_model
+        self.background_model = background_model
+        self.region = region
+        self.bearer_token = bearer_token
+        self.opus_model = opus_model
+        self.sonnet_model = sonnet_model
+        self.haiku_model = haiku_model
 
         # The CLI backend ignores the API-only parameters; warn if any were
         # set away from their defaults so a misdirected config doesn't pass
@@ -814,6 +839,39 @@ class ClaudeCodeLLM(LLMCallBase):
         cmd += ["-p", "-"]
         return cmd
 
+    def _subprocess_env(self) -> dict:
+        """Environment for the ``claude`` subprocess.
+
+        Starts from the current process env with ``CLAUDECODE`` stripped (the
+        CLI refuses to run nested otherwise). When ``use_bedrock`` is set, the
+        Bedrock multi-model env vars are overlaid via
+        :func:`chia.models.bedrock_config.bedrock_model_env`, with ``self.model``
+        as the primary/orchestrator. Only the tiers/overrides that were provided
+        are forwarded, so unset ones fall back to the helper's defaults.
+        """
+        base = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        if not self.use_bedrock:
+            return base
+
+        from chia.models.bedrock_config import bedrock_model_env
+
+        kwargs: dict = {"primary": self.model, "base_env": base}
+        if self.subagent_model is not None:
+            kwargs["subagent"] = self.subagent_model
+        if self.background_model is not None:
+            kwargs["background"] = self.background_model
+        if self.region is not None:
+            kwargs["region"] = self.region
+        if self.bearer_token is not None:
+            kwargs["bearer_token"] = self.bearer_token
+        if self.opus_model is not None:
+            kwargs["opus"] = self.opus_model
+        if self.sonnet_model is not None:
+            kwargs["sonnet"] = self.sonnet_model
+        if self.haiku_model is not None:
+            kwargs["haiku"] = self.haiku_model
+        return bedrock_model_env(**kwargs)
+
     def _run_claude(
         self,
         user_message: str,
@@ -822,7 +880,7 @@ class ClaudeCodeLLM(LLMCallBase):
         """Run claude with simple capture (no event streaming)."""
         cmd = self._build_cmd(tools)
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
-        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env = self._subprocess_env()
 
         result = subprocess.run(
             cmd,
@@ -876,7 +934,7 @@ class ClaudeCodeLLM(LLMCallBase):
         """
         cmd = self._build_cmd(tools)
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
-        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env = self._subprocess_env()
 
         result_text_parts: list[str] = []
         stderr_parts: list[str] = []
