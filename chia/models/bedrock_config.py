@@ -49,6 +49,94 @@ DEFAULT_HAIKU_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 DEFAULT_REGION = "us-east-1"
 
 
+# --------------------------------------------------------------------------- #
+# Verified Bedrock model registry (provider-agnostic).
+#
+# Two integration paths, because Claude Code the CLI only speaks the Anthropic
+# Messages API:
+#   * Anthropic models  -> drive Claude Code via :func:`bedrock_model_env`
+#     (``CLAUDE_CODE_USE_BEDROCK`` + ``ANTHROPIC_MODEL`` ...), which gives the
+#     native orchestrator / Task-subagent / background tiering.
+#   * Non-Anthropic models -> the CLI CANNOT drive them; run them through chia's
+#     own ``BedrockLLM`` (the Converse API), which normalises tool use across
+#     providers. The orchestrator/delegate/background pattern is then expressed
+#     by picking a model per tier from this registry (see :class:`ModelTier`).
+#
+# ``supports_tools`` = whether the model accepts a Converse ``toolConfig`` and
+# actually emits ``toolUse`` (i.e. can drive an AGENTIC, tool-using loop).
+# Probed on the account in use (us-east-1, bearer-token auth) 2026-07-30.
+# --------------------------------------------------------------------------- #
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class BedrockModel:
+    """A Bedrock model: its inference-profile id, provider, and whether it can
+    drive an agentic (tool-using) loop via the Converse API."""
+
+    id: str
+    provider: str
+    supports_tools: bool
+    notes: str = ""
+
+
+MODELS: Dict[str, "BedrockModel"] = {
+    # Anthropic (Claude Code CLI via bedrock_model_env, or chia BedrockLLM).
+    "opus": BedrockModel(DEFAULT_OPUS_MODEL, "Anthropic", True),
+    "sonnet": BedrockModel(DEFAULT_SONNET_MODEL, "Anthropic", True),
+    "haiku": BedrockModel(DEFAULT_HAIKU_MODEL, "Anthropic", True),
+    # Non-Anthropic (chia BedrockLLM / Converse ONLY — not the Claude Code CLI).
+    "glm5": BedrockModel("zai.glm-5", "Z.AI", True),
+    "glm4.7": BedrockModel("zai.glm-4.7", "Z.AI", True),
+    "nemotron": BedrockModel("nvidia.nemotron-super-3-120b", "NVIDIA", True),
+    "kimi": BedrockModel("moonshotai.kimi-k2.5", "Moonshot AI", True),
+    "deepseek": BedrockModel("deepseek.v3.2", "DeepSeek", True),
+    "deepseek-r1": BedrockModel(
+        "deepseek.r1-v1:0", "DeepSeek", False,
+        "reasoning model; Converse rejects toolConfig -> NO agentic tool use",
+    ),
+    "qwen-coder": BedrockModel("qwen.qwen3-coder-next", "Qwen", True),
+    "nova-pro": BedrockModel("us.amazon.nova-pro-v1:0", "Amazon", True),
+    "nova-lite": BedrockModel("us.amazon.nova-lite-v1:0", "Amazon", True),
+}
+
+
+def resolve_model(name: str) -> str:
+    """Resolve a short alias (``"glm5"``) or a raw Bedrock id to the concrete
+    inference-profile id. Unknown names pass through unchanged, so a caller may
+    always hand a full id."""
+    m = MODELS.get(name)
+    return m.id if m is not None else name
+
+
+@dataclass(frozen=True)
+class ModelTier:
+    """A provider-agnostic orchestrator/delegate/background tier mix, by alias or
+    id. For Anthropic tiers, feed the resolved ids to :func:`bedrock_model_env`
+    (Claude Code CLI). For non-Anthropic tiers, hand each resolved id to chia's
+    ``BedrockLLM`` — the CLI cannot drive them. ``background``/``subagent`` may be
+    ``None`` to leave that tier on the primary."""
+
+    primary: str
+    subagent: Optional[str] = None
+    background: Optional[str] = None
+
+    def resolved(self) -> Dict[str, Optional[str]]:
+        """The tier as concrete Bedrock ids (``None`` tiers stay ``None``)."""
+        return {
+            "primary": resolve_model(self.primary),
+            "subagent": resolve_model(self.subagent) if self.subagent else None,
+            "background": resolve_model(self.background) if self.background else None,
+        }
+
+
+# The canonical Anthropic tier (Opus orchestrates -> Sonnet subagents -> Haiku
+# background) and a sensible non-Anthropic default (GLM-5 orchestrates, delegates
+# to Qwen-coder, background on Nova-lite) — both just presets; every id overrides.
+ANTHROPIC_TIER = ModelTier(primary="opus", subagent="sonnet", background="haiku")
+NON_ANTHROPIC_TIER = ModelTier(primary="glm5", subagent="qwen-coder", background="nova-lite")
+
+
 def bedrock_model_env(
     *,
     primary: str,
