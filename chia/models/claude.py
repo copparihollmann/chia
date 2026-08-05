@@ -17,6 +17,7 @@ import ray
 from chia.base.ChiaFunction import ChiaFunction, ObjectRefCallback
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
 from chia.base.redact import redact, secret_values
+from chia.base.usage import BillingMode
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
@@ -349,6 +350,18 @@ class ClaudeCodeLLM(LLMCallBase):
     # it's left out for now rather than shoehorned in.
     supports_dangerously_skip_permissions = True
 
+    # Env vars whose presence means the CLI is authenticating against a metered
+    # endpoint rather than spending a subscription seat's quota. Checked in the
+    # process that actually runs the CLI (a Ray worker), which is why this is a
+    # property and not decided in __init__ on the driver.
+    _METERED_AUTH_ENV_VARS = (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    )
+
     def __init__(
         self,
         model: str = "claude-sonnet-4-6",
@@ -446,6 +459,26 @@ class ClaudeCodeLLM(LLMCallBase):
     # Public API
     # ------------------------------------------------------------------
 
+    @property
+    def billing_mode(self) -> BillingMode:
+        """Whether this call's cost is metered spend or subscription quota.
+
+        :rtype: str
+
+        The CLI reports ``total_cost_usd`` on every run regardless of how it
+        authenticated, so the figure alone cannot tell the two apart. Under a
+        subscription seat it is the *metered-equivalent* of the quota consumed, not
+        money — hence ``"subscription"``, which
+        :meth:`chia.base.usage.TokenUsage.__add__` then refuses to add to real
+        charges. The ``api`` backend and any of :data:`_METERED_AUTH_ENV_VARS` in the
+        worker's environment mean genuine per-token billing.
+        """
+        if self.backend == "api" or self.api_key:
+            return "per_token"
+        if any(os.environ.get(var) for var in self._METERED_AUTH_ENV_VARS):
+            return "per_token"
+        return "subscription"
+
     @_session_tracked
     @ChiaFunction(resources={"claude_creds": 0.01})
     def prompt(
@@ -497,6 +530,9 @@ class ClaudeCodeLLM(LLMCallBase):
                     for t in tools
                 ]
 
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled and self._last_metadata:
                     profiler.add_info(self._last_metadata)
 

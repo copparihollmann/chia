@@ -265,6 +265,9 @@ class AntigravityLLM(LLMCallBase):
                         for t in tool_list
                     ],
                 })
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled:
                     profiler.add_info(self._last_metadata)
                 self._classify_error(cli)

@@ -636,6 +636,20 @@ def test_prompt_run_then_export_success(monkeypatch):
     assert llm._last_metadata["model"] == "anthropic/claude-sonnet-4-6"
     assert llm._last_metadata["num_turns"] == 1
 
+    # opencode's short cache keys are renamed on the way out of _run_opencode, so
+    # the profiler log and the aet sink see the same vocabulary as every other
+    # backend — `cache_read` never escapes this module.
+    assert llm._last_metadata["cache_read_input_tokens"] == 8280
+    assert "cache_read" not in llm._last_metadata
+
+    # ...and the same counts reach the caller on the public result.
+    assert cli.usage.cache_read_input_tokens == 8280
+    assert cli.usage.output_tokens == 6
+    assert cli.usage.model == "anthropic/claude-sonnet-4-6"
+    # opencode reports a real per-message cost from its provider pricing.
+    assert cli.usage.cost_source == "billed"
+    assert cli.usage.cost_usd == pytest.approx(0.0026, abs=1e-4)
+
 
 def test_prompt_log_write_failure_is_non_fatal(monkeypatch, tmp_path):
     """Regression: prompt() may run on a remote worker whose filesystem lacks

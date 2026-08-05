@@ -260,6 +260,9 @@ class BedrockLLM(LLMCallBase):
                      "node_id": getattr(t, "node_id", None)}
                     for t in tools
                 ]
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled and self._last_metadata:
                     profiler.add_info(self._last_metadata)
 
@@ -409,7 +412,8 @@ class BedrockLLM(LLMCallBase):
             messages: list[dict] = [
                 {"role": "user", "content": [{"text": user_message}]}
             ]
-            meta = {"input_tokens": 0, "output_tokens": 0, "num_turns": 0}
+            meta = {"input_tokens": 0, "output_tokens": 0, "num_turns": 0,
+                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
             final_text = ""
 
             for _ in range(self.max_tool_iterations):
@@ -436,6 +440,12 @@ class BedrockLLM(LLMCallBase):
                 usage = resp.get("usage", {})
                 meta["input_tokens"] += usage.get("inputTokens", 0) or 0
                 meta["output_tokens"] += usage.get("outputTokens", 0) or 0
+                # Converse reports cache hits/writes only when prompt caching is in
+                # play, and Bedrock counts them *outside* inputTokens — so leaving
+                # them unread both loses the counts and misprices the call, since
+                # the three input classes carry different rates.
+                meta["cache_read_input_tokens"] += usage.get("cacheReadInputTokens", 0) or 0
+                meta["cache_creation_input_tokens"] += usage.get("cacheWriteInputTokens", 0) or 0
 
                 out_message = resp["output"]["message"]
                 stop_reason = resp.get("stopReason")
