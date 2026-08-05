@@ -72,6 +72,7 @@ Originally CHIA stood for:
    :caption: API Reference
 
    api/base
+   api/trace
    api/chipyard
    api/models
    api/firesim
