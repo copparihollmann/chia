@@ -219,6 +219,26 @@ def test_trajectory_is_cumulative_and_time_relative():
     assert points[1]["provisional_cost"] is False
 
 
+def test_trajectory_reports_the_cache_split_not_only_the_sum():
+    """A cache read is billed at 0.1x the input rate and a write at 1.25x -- 12.5x
+    apart -- so two runs with the same ``cum_cache`` can differ that much in what the
+    cache actually cost. The cold/warm shape below is the case: the first call writes
+    the cache, the second reads it.
+    """
+    run = aet_sink.collect_run_usage([
+        _call_event("cold", 100.0, input_tokens=10, cache_creation=4000),
+        _call_event("warm", 101.0, input_tokens=10, cache_read=4000),
+    ])
+
+    points = run.trajectory()
+
+    assert [p["cum_cache_creation"] for p in points] == [4000, 4000]
+    assert [p["cum_cache_read"] for p in points] == [0, 4000]
+    assert [p["cum_cache"] for p in points] == [4000, 8000]
+    # the split is structure, not the sum duplicated
+    assert points[1]["cum_cache_read"] != points[1]["cum_cache"]
+
+
 def test_trajectory_flags_an_estimated_cost_as_provisional():
     """aet already has a provisional_cost flag for a point whose cost is not
     authoritative; an estimate is exactly that."""
@@ -298,6 +318,17 @@ def _final_metrics(run_dir) -> dict:
     return final
 
 
+def _step_series(run_dir) -> dict:
+    """Step-metric name -> values ordered by step. The trajectory as aet reads it back."""
+    path = run_dir / "logs" / "metrics.jsonl"
+    rows: dict = {}
+    for line in path.read_text().strip().splitlines():
+        record = json.loads(line)
+        if record.get("step") is not None:
+            rows.setdefault(record["name"], []).append((record["step"], record["value"]))
+    return {name: [v for _, v in sorted(pairs)] for name, pairs in rows.items()}
+
+
 def _step_metric_names(run_dir) -> set:
     path = run_dir / "logs" / "metrics.jsonl"
     return {
@@ -362,6 +393,110 @@ def test_trajectory_points_are_written(tmp_path):
     assert "aet.traj.cum_input_tokens" in names
     assert "aet.traj.cum_cost_usd" in names
     assert "aet.traj.t_s" in names
+
+
+def test_the_cache_split_reaches_the_step_metrics(tmp_path):
+    """``aet plot --split-cache`` reads these two families; without them it draws two
+    lines flat at zero for a run that plainly used the cache.
+
+    Asserted on the *values*, not on the metric names: aet's logger emits both families
+    unconditionally now that its parameters default to 0.0, so a name-only assertion
+    would pass against a sink that never sent the split.
+    """
+    events = [
+        _call_event("cold", 100.0, input_tokens=10, cache_creation=4000,
+                    cost_usd=0.01, cost_source="billed"),
+        _call_event("warm", 102.0, input_tokens=10, cache_read=4000,
+                    cost_usd=0.002, cost_source="billed"),
+    ]
+
+    aet_sink.record_run(events, run_dir=tmp_path, enabled=True)
+
+    series = _step_series(tmp_path)
+    assert series["aet.traj.cum_cache_creation_tokens"] == [4000, 4000]
+    assert series["aet.traj.cum_cache_read_tokens"] == [0, 4000]
+    assert series["aet.traj.cum_cache_tokens"] == [4000, 8000]
+
+
+def test_a_run_is_recorded_as_one_round_with_a_real_duration(tmp_path):
+    """Without a round boundary and a summary param, aet's log reader reports
+    ``num_rounds=0, duration_s=0`` and the figure titles itself "0 rounds ... 0 min"
+    for a run that took as long as it took."""
+    events = [
+        _call_event("c1", 100.0, input_tokens=10, cost_usd=0.01, cost_source="billed"),
+        _call_event("c2", 130.0, input_tokens=20, cost_usd=0.02, cost_source="billed"),
+    ]
+
+    aet_sink.record_run(events, run_dir=tmp_path, run_id="r-round", enabled=True)
+
+    events_out = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "events.jsonl").read_text().strip().splitlines()
+    ]
+    rounds = [e for e in events_out if e.get("event") == "aet.traj.round"]
+    assert len(rounds) == 1
+    assert rounds[0]["payload"]["t_end_s"] == pytest.approx(30.0)
+    # the verdict fields stay unset: chia does not run the oracle, and n_passed=0
+    # would render as a failing run rather than as an unjudged one
+    assert rounds[0]["payload"]["n_passed"] is None
+
+    params = json.loads((tmp_path / "logs" / "params.json").read_text())
+    summary = params["aet.traj.summary"]
+    assert summary["run_id"] == "r-round"
+    assert summary["num_rounds"] == 1
+    assert summary["duration_s"] == pytest.approx(30.0)
+
+
+def test_the_run_dir_reconstructs_to_the_same_totals_aet_sees(tmp_path):
+    """The interchange contract, asserted rather than assumed.
+
+    The claim the sink makes is that a chia run directory *is* an aet run: whatever
+    ``collect_run_usage`` folded, ``RunTrajectory.from_run_dir`` must give back. This
+    goes through the logs/ reconstruction path, because a chia run has no
+    ``metrics/trajectory.json`` fast path.
+    """
+    from aet.trajectory.model import RunTrajectory
+
+    events = [
+        _call_event("cold", 100.0, input_tokens=1000, output_tokens=100,
+                    cache_creation=4000, cost_usd=0.10, cost_source="billed"),
+        _call_event("warm", 110.0, input_tokens=1500, output_tokens=200,
+                    cache_read=4000, cost_usd=0.02, cost_source="billed"),
+    ]
+    run = aet_sink.collect_run_usage(events)
+    assert aet_sink.record_run(events, run_dir=tmp_path, run_id="rt", enabled=True)
+
+    back = RunTrajectory.from_run_dir(tmp_path)
+    metered = run.metered
+
+    assert len(back.points) == len(run.calls)
+    last = back.points[-1]
+    assert last.cum_input_tokens == metered.input_tokens
+    assert last.cum_output_tokens == metered.output_tokens
+    assert last.cum_cache_read_tokens == metered.cache_read_input_tokens
+    assert last.cum_cache_creation_tokens == metered.cache_creation_input_tokens
+    assert last.cum_cost_usd == pytest.approx(float(metered.cost_usd))
+    assert back.num_rounds == 1
+    assert back.duration_s == pytest.approx(10.0)
+
+
+def test_a_trajectory_still_lands_on_an_aet_without_the_cache_split(tmp_path):
+    """``chia[aet]`` tracks aet's default branch, not a release, so the installed copy
+    may predate ``log_trajectory_point``'s split parameters. Degrade to the sum rather
+    than lose the whole curve to a TypeError."""
+    recorded = []
+
+    class _OldLogger:
+        def log_trajectory_point(self, index, t_s, cum_input, cum_output, cum_cache,
+                                 cum_cost, round_index=0, provisional_cost=False):
+            recorded.append((index, cum_cache))
+
+    for point in aet_sink.collect_run_usage([
+        _call_event("c1", 1.0, input_tokens=10, cache_read=50),
+    ]).trajectory():
+        aet_sink._log_point(_OldLogger(), point)
+
+    assert recorded == [(0, 50)]
 
 
 def test_subscription_cost_is_never_written_as_money(tmp_path):
