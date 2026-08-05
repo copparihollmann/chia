@@ -63,3 +63,17 @@ vLLM
 ----
 
 .. automodule:: chia.models.vllm
+
+Bedrock Converse proxy
+----------------------
+
+A local Bedrock-shaped endpoint that lets the Claude Code CLI drive **any** Bedrock
+model, not only the Anthropic ones. Requests for Anthropic models are forwarded
+verbatim; everything else is translated to Converse and streamed back as Anthropic SSE.
+Because ``ANTHROPIC_MODEL``, ``CLAUDE_CODE_SUBAGENT_MODEL`` and
+``ANTHROPIC_SMALL_FAST_MODEL`` are separate levers, one proxy can route each tier to a
+different provider.
+
+.. automodule:: chia.models.proxy.server
+
+.. automodule:: chia.models.proxy.translate
