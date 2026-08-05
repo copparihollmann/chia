@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from chia.models.proxy.translate import (
+    max_output_tokens,
     is_anthropic_model,
     to_anthropic_message,
     to_anthropic_sse,
@@ -507,3 +508,48 @@ def test_the_recorded_request_pins_the_measured_shape():
     assert "messages" in body and "system" in body and "tools" in body
     assert "inferenceConfig" not in body   # i.e. it is not Converse
     assert "modelId" not in body           # the id is in the path
+
+
+# ---------------------------------------------------------------------------
+# max_tokens is not portable
+#
+# Found by running the grid rather than by reading the docs: every Nova cell failed with
+# "The maximum tokens you requested exceeds the model limit of 10000", because the CLI
+# sends one max_tokens for every model and each Converse family enforces its own.
+# ---------------------------------------------------------------------------
+
+
+def test_max_tokens_is_clamped_to_the_family_ceiling():
+    """The bug the live grid found. Forwarding the CLI's 32000 to Nova makes Bedrock
+    reject the request, the CLI retries, and the run reads as a provider outage rather
+    than a translation bug."""
+    kwargs = to_converse({"messages": [], "max_tokens": 32_000}, NOVA)
+
+    assert kwargs["inferenceConfig"]["maxTokens"] == 10_000
+
+
+def test_a_family_with_a_higher_ceiling_is_not_clamped():
+    kwargs = to_converse({"messages": [], "max_tokens": 32_000}, GLM)
+
+    assert kwargs["inferenceConfig"]["maxTokens"] == 32_000
+
+
+def test_a_smaller_request_is_never_inflated():
+    """min(), not "set to the ceiling": the CLI's value is the upper bound the caller
+    asked for, and granting more output than was requested would change the call."""
+    kwargs = to_converse({"messages": [], "max_tokens": 256}, NOVA)
+
+    assert kwargs["inferenceConfig"]["maxTokens"] == 256
+
+
+@pytest.mark.parametrize("model_id,ceiling", [
+    ("us.amazon.nova-lite-v1:0", 10_000),
+    ("us.amazon.nova-pro-v1:0", 10_000),
+    ("meta.llama3-1-70b-instruct-v1:0", 8_192),
+    ("mistral.mistral-large-2407-v1:0", 8_192),
+    ("cohere.command-r-plus-v1:0", 4_096),
+    ("zai.glm-5", 32_000),
+    ("us.anthropic.claude-sonnet-4-6", 32_000),
+])
+def test_the_ceiling_resolves_longest_key_wins(model_id, ceiling):
+    assert max_output_tokens(model_id) == ceiling
