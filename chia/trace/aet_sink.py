@@ -202,6 +202,12 @@ class RunUsage:
         This is the series aet's ``log_trajectory_point`` consumes, and emitting it
         is what makes ``aet plot`` work for a chia run at all — a scalars-only run
         has no curve to draw.
+
+        Cache tokens are reported three ways: the ``cum_cache`` sum aet's cost model
+        bills as one class, plus the read and creation halves separately. The halves
+        are not redundant — a read is billed at 0.1× the input rate and a write at
+        1.25×, so two runs with the same ``cum_cache`` can differ 12.5-fold in what
+        that cache cost, and the sum alone cannot tell a warm run from a cold one.
         """
         calls = [c for c in self.calls if c.usage.billing_mode == mode]
         if not calls:
@@ -221,6 +227,8 @@ class RunUsage:
                 "cum_output": running.output_tokens,
                 "cum_cache": (running.cache_read_input_tokens
                               + running.cache_creation_input_tokens),
+                "cum_cache_read": running.cache_read_input_tokens,
+                "cum_cache_creation": running.cache_creation_input_tokens,
                 # An unknown running cost is reported as 0.0 with the point flagged
                 # provisional, because the curve needs a number; `provisional_cost`
                 # is how aet already marks a point whose cost is not authoritative.
@@ -440,7 +448,7 @@ def record_run(
             run_path=run_path,
             tracking_mode="local",
         )
-        _write_run(run_logger, run, model=model, extra=extra)
+        _write_run(run_logger, run, model=model, extra=extra, run_id=run_id)
         run_logger.finish("completed")
         return True
     except Exception as exc:  # never let telemetry break a run
@@ -448,7 +456,8 @@ def record_run(
         return False
 
 
-def _write_run(run_logger, run: RunUsage, *, model: str, extra: Optional[dict]) -> None:
+def _write_run(run_logger, run: RunUsage, *, model: str, extra: Optional[dict],
+               run_id: str = "") -> None:
     """Emit one folded :class:`RunUsage` through an already-started aet logger."""
     metered = run.metered
     subscription = run.subscription
@@ -492,7 +501,7 @@ def _write_run(run_logger, run: RunUsage, *, model: str, extra: Optional[dict]) 
     run_logger.log_metric(RETRIES_METRIC, run.retries)
 
     _write_per_model(run_logger, run)
-    _write_trajectory(run_logger, run)
+    _write_trajectory(run_logger, run, model=model, run_id=run_id)
 
 
 def _write_per_model(run_logger, run: RunUsage) -> None:
@@ -515,15 +524,89 @@ def _write_per_model(run_logger, run: RunUsage) -> None:
             logger.debug("per-model usage for %s not recorded: %s", model_id, exc)
 
 
-def _write_trajectory(run_logger, run: RunUsage) -> None:
-    """Record the cumulative per-call series, which is what ``aet plot`` draws."""
-    for point in run.trajectory():
+def _write_trajectory(run_logger, run: RunUsage, *, model: str = "",
+                      run_id: str = "") -> None:
+    """Record the cumulative per-call series, which is what ``aet plot`` draws.
+
+    Three things go out, not one, because aet's reader needs all three to reconstruct a
+    trajectory that renders truthfully:
+
+    * the per-call points, including the cache read/creation split;
+    * one ``aet.traj.round`` boundary spanning the run. Without a round, the reader's
+      ``duration_s`` and ``num_rounds`` both fall back to 0 and the figure titles itself
+      "0 rounds · $X · 0 min" — a run that plainly took minutes described as taking none;
+    * the ``aet.traj.summary`` param holding the run-level totals, which is where the
+      reader looks before falling back to the last point.
+
+    A chia run is emitted as a single round: the unit of work chia schedules is the run,
+    and inventing per-call rounds would draw dividers that correspond to nothing an agent
+    did. The verdict fields are left unset rather than defaulted to a pass — chia does not
+    run the oracle, and ``n_passed=0`` would render as a failing run.
+    """
+    points = run.trajectory()
+    if not points:
+        return
+
+    for point in points:
+        _log_point(run_logger, point)
+
+    metered = run.metered
+    last = points[-1]
+    summary = {
+        "run_id": run_id,
+        "source": "chia",
+        "model": model,
+        "duration_s": last["t_s"],
+        "num_rounds": 1,
+        "final_cost_usd": last["cum_cost"],
+        "final_input_tokens": last["cum_input"],
+        "final_output_tokens": last["cum_output"],
+        "final_cache_tokens": last["cum_cache"],
+        "final_cache_read_tokens": last["cum_cache_read"],
+        "final_cache_creation_tokens": last["cum_cache_creation"],
+    }
+    try:
+        from aet.trajectory.model import RoundBoundary
+
+        run_logger.log_round_boundary(RoundBoundary(
+            index=0,
+            t_start_s=0.0,
+            t_end_s=last["t_s"],
+            cost_usd=last["cum_cost"],
+            input_tokens=int(metered.input_tokens),
+            output_tokens=int(metered.output_tokens),
+            cache_tokens=int(last["cum_cache"]),
+        ))
+    except Exception as exc:
+        logger.debug("aet round boundary not recorded: %s", exc)
+    try:
+        run_logger.log_param("aet.traj.summary", summary)
+    except Exception as exc:
+        logger.debug("aet trajectory summary not recorded: %s", exc)
+
+
+def _log_point(run_logger, point: dict) -> None:
+    """One trajectory point, degrading to the pre-split signature on an older aet.
+
+    ``chia[aet]`` tracks aet's default branch rather than a release, so the installed
+    copy may predate the cache-split parameters. Losing the split is acceptable — the
+    sum is still recorded and the curve still draws — but losing the whole trajectory to
+    a ``TypeError`` is not.
+    """
+    common = dict(
+        index=point["index"],
+        t_s=point["t_s"],
+        cum_input=point["cum_input"],
+        cum_output=point["cum_output"],
+        cum_cache=point["cum_cache"],
+        cum_cost=point["cum_cost"],
+        provisional_cost=point["provisional_cost"],
+    )
+    try:
         run_logger.log_trajectory_point(
-            index=point["index"],
-            t_s=point["t_s"],
-            cum_input=point["cum_input"],
-            cum_output=point["cum_output"],
-            cum_cache=point["cum_cache"],
-            cum_cost=point["cum_cost"],
-            provisional_cost=point["provisional_cost"],
+            **common,
+            cum_cache_read=point["cum_cache_read"],
+            cum_cache_creation=point["cum_cache_creation"],
         )
+    except TypeError:
+        run_logger.log_trajectory_point(**common)
