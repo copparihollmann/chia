@@ -32,6 +32,7 @@ import ray
 
 from chia.base.ChiaFunction import ChiaFunction
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
+from chia.base.redact import redact, secret_values
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
@@ -400,13 +401,17 @@ class AntigravityLLM(LLMCallBase):
             cwd=self.work_dir or None,
             env=os.environ.copy(),
         )
-        final_text = result.stdout.strip()
-        stream = self._build_stream(user_message, final_text, result.stderr, tools)
+        # Masked at the boundary, before the transcript is built, logged or truncated:
+        # the auth-failure path is where a provider echoes the credential it refused.
+        secrets = secret_values()
+        final_text = (redact(result.stdout, values=secrets) or "").strip()
+        stderr = redact(result.stderr, values=secrets) or ""
+        stream = self._build_stream(user_message, final_text, stderr, tools)
         if self._log_prefix is not None:
             self._write_log(user_message, stream)
         if result.returncode != 0:
-            self.logger.warning("agy exited %d: %s", result.returncode, result.stderr[:500])
-        return QueryResult(final_text, result.returncode, result.stderr, stream)
+            self.logger.warning("agy exited %d: %s", result.returncode, stderr[:500])
+        return QueryResult(final_text, result.returncode, stderr, stream)
 
     def _build_stream(
         self, user_message: str, final_text: str, stderr: str, tools: list[ChiaTool]

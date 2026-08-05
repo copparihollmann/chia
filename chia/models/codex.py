@@ -24,6 +24,7 @@ import ray
 
 from chia.base.ChiaFunction import ChiaFunction, ObjectRefCallback
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
+from chia.base.redact import redact, secret_values
 from chia.models import codex_events
 from chia.models.codex_capture import stream_codex
 from chia.models.codex_records import (
@@ -709,8 +710,13 @@ class CodexLLM(LLMCallBase):
             parsed = codex_events.parse_events(capture.events)
             parsed.unparsed_lines.extend(capture.unparsed_lines)
 
+            # Mask at the boundary, before parsing, logging or truncation: on the
+            # auth-failure path the CLI echoes the credential it was refused, and
+            # everything below this line is durable (QueryResult, logs, typed errors).
+            secrets = secret_values()
+            stderr_text = redact(capture.stderr_text, values=secrets) or ""
             with open(output_path) as f:
-                final_text = f.read()
+                final_text = redact(f.read(), values=secrets) or ""
             final_text = final_text or parsed.final_text
 
             thread_id = parsed.thread_id
@@ -737,7 +743,7 @@ class CodexLLM(LLMCallBase):
             self._run_result.active_wall_s += capture.active_wall_s
             self._last_metadata = self._canonical_usage()
 
-            raw_text = self._read_text(raw_path)
+            raw_text = redact(self._read_text(raw_path), values=secrets) or ""
             if self._log_prefix is not None:
                 self._write_log(user_message, final_text, raw_text)
 
@@ -747,11 +753,11 @@ class CodexLLM(LLMCallBase):
                                     self.timeout_seconds, raw_path)
                 raise subprocess.TimeoutExpired(cmd, self.timeout_seconds)
             if returncode != 0:
-                self.logger.warning("codex exited %d: %s", returncode, capture.stderr_text[:500])
+                self.logger.warning("codex exited %d: %s", returncode, stderr_text[:500])
             return CodexQueryResult(
                 final_text,
                 returncode,
-                capture.stderr_text,
+                stderr_text,
                 raw_text,
                 session_id=self._session_id,
                 run_result=self._run_result,

@@ -18,6 +18,7 @@ import ray
 from chia.base.ChiaFunction import ChiaFunction, ObjectRefCallback
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
 from chia.base.usage import BillingMode
+from chia.base.redact import redact, secret_values
 from chia.base.ratelimit import (
     CLAUDE_SESSION_RESOURCE, RateLimitPolicy, RateLimitWaiter,
     RateLimitWaitExhausted,
@@ -1031,6 +1032,21 @@ class ClaudeCodeLLM(LLMCallBase):
             kwargs["haiku"] = self.haiku_model
         return bedrock_model_env(**kwargs)
 
+    def _secrets(self, env: Optional[dict] = None):
+        """The ``(name, value)`` pairs to mask out of this backend's output.
+
+        :param env: Environment the subprocess will see. Defaults to :data:`os.environ`.
+        :type env: Optional[dict]
+        :returns: Pairs as returned by :func:`chia.base.redact.secret_values`.
+        :rtype: Tuple[Tuple[str, str], ...]
+
+        Computed per run rather than cached on the instance: a ``ClaudeCodeLLM`` is
+        pickled to a Ray worker whose environment is not the driver's, so a cached set
+        would be the wrong set. ``api_key`` is passed explicitly because it reaches the
+        backend as a constructor argument and need not be in the environment at all.
+        """
+        return secret_values(env, extra=(self.api_key,) if self.api_key else ())
+
     def _run_claude(
         self,
         user_message: str,
@@ -1040,6 +1056,7 @@ class ClaudeCodeLLM(LLMCallBase):
         cmd = self.sandbox_argv(self._build_cmd(tools))
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
         env = self._child_env()
+        secrets = self._secrets(env)
 
         result = subprocess.run(
             cmd,
@@ -1050,8 +1067,16 @@ class ClaudeCodeLLM(LLMCallBase):
             env=env,
         )
 
+        # Scrubbed here, at the one point where the subprocess's own bytes enter chia,
+        # rather than at each of the eight places they later leave it (QueryResult.stderr,
+        # six ``raw_message=...[:300]`` slices, the WARNING below, the on-disk log). Doing
+        # it here also means every truncation downstream happens on already-masked text,
+        # so no slice can emit half a token.
+        stdout = redact(result.stdout, values=secrets) or ""
+        stderr = redact(result.stderr, values=secrets) or ""
+
         if result.returncode != 0:
-            self.logger.warning("claude exited %d: %s", result.returncode, result.stderr[:500])
+            self.logger.warning("claude exited %d: %s", result.returncode, stderr[:500])
 
         if self._log_prefix is not None:
             truncated = user_message[:500] + ("..." if len(user_message) > 500 else "")
@@ -1060,13 +1085,13 @@ class ClaudeCodeLLM(LLMCallBase):
                 f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Prompt #{self._call_counter}\n")
                 f.write("=" * 80 + "\n\n")
                 f.write(f"[User Message]\n{truncated}\n\n")
-                f.write(f"[Response]\n{result.stdout}\n\n")
+                f.write(f"[Response]\n{stdout}\n\n")
                 f.write("-" * 80 + "\n\n")
 
         return ClaudeCodeQueryResult(
-            result=result.stdout,
+            result=stdout,
             returncode=result.returncode,
-            stderr=result.stderr,
+            stderr=stderr,
             stream_result="",
         )
 
@@ -1094,6 +1119,7 @@ class ClaudeCodeLLM(LLMCallBase):
         cmd = self.sandbox_argv(self._build_cmd(tools))
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
         env = self._child_env()
+        secrets = self._secrets(env)
 
         result_text_parts: list[str] = []
         stderr_parts: list[str] = []
@@ -1146,9 +1172,12 @@ class ClaudeCodeLLM(LLMCallBase):
         log_file.write(f"[User Message]\n{truncated}\n\n")
         log_file.flush()
 
+        # Masked per line rather than once at the end: ``drain_stderr`` writes each line
+        # to ``<prefix>.log`` as it arrives, so by the time the run finishes an unmasked
+        # credential is already on disk.
         def drain_stdout():
             for line in proc.stdout:
-                line = line.strip()
+                line = (redact(line, values=secrets) or "").strip()
                 if line:
                     with lock:
                         # Keep the raw event next to the rendered one. This is the whole of the
@@ -1163,6 +1192,7 @@ class ClaudeCodeLLM(LLMCallBase):
 
         def drain_stderr():
             for line in proc.stderr:
+                line = redact(line, values=secrets) or ""
                 with lock:
                     stderr_parts.append(line)
                     log_file.write(f"[stderr] {line}")
@@ -1570,15 +1600,18 @@ class ClaudeCodeLLM(LLMCallBase):
         self._last_metadata = {k: v for k, v in meta.items() if v}
 
         stream_parts.append("-" * 80 + "\n\n")
+        # The API path has no stderr, but its transcript carries MCP tool results — a tool
+        # that shells out and echoes its environment puts a credential in here.
+        stream_result = redact("".join(stream_parts), values=self._secrets()) or ""
         if self._log_prefix is not None:
             with open(f"{self._log_prefix}.log", "a") as f:
-                f.write("".join(stream_parts))
+                f.write(stream_result)
 
         return ClaudeCodeQueryResult(
             result=final_text,
             returncode=0,
             stderr="",
-            stream_result="".join(stream_parts),
+            stream_result=stream_result,
         )
 
     @staticmethod
