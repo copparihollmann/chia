@@ -16,6 +16,10 @@ import ray
 
 from chia.base.ChiaFunction import ChiaFunction, ObjectRefCallback
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
+from chia.base.ratelimit import (
+    CLAUDE_SESSION_RESOURCE, RateLimitPolicy, RateLimitWaiter,
+    RateLimitWaitExhausted,
+)
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
@@ -369,6 +373,7 @@ class ClaudeCodeLLM(LLMCallBase):
         max_tool_iterations: int = 100,
         dangerously_skip_permissions: bool = True,
         config=UNSET,
+        rate_limit_policy: Optional[RateLimitPolicy] = None,
     ):
         super().__init__(system_message=system_message,
                          dangerously_skip_permissions=dangerously_skip_permissions,
@@ -423,6 +428,11 @@ class ClaudeCodeLLM(LLMCallBase):
                 "exercised by unit tests so far, not validated in production."
             )
 
+        # How (and whether) to wait out a usage limit. None keeps the historical
+        # behaviour: RateLimitError propagates immediately, which is right for an
+        # interactive call and wrong for a grid (see chia.base.ratelimit).
+        self.rate_limit_policy = rate_limit_policy
+
         self._call_counter = 0
         self._session_id = str(uuid4()) if resume_session else None
         self._last_metadata: dict = {}  # populated by _process_event_line
@@ -460,7 +470,11 @@ class ClaudeCodeLLM(LLMCallBase):
             case ``result`` is empty and ``returncode`` is ``-1``).
 
         Raises:
-            RateLimitError: Usage limit hit — propagates immediately.
+            RateLimitError: Usage limit hit, and no ``rate_limit_policy`` was
+                configured (the default). With a policy, the call instead waits for the
+                window to reset and resumes — see :mod:`chia.base.ratelimit`.
+            RateLimitWaitExhausted: A policy was configured but its wait budget ran
+                out before the window reset. Chains the original ``RateLimitError``.
             AuthenticationError: Auth failure — propagates immediately.
             BillingError: Billing/payment issue — propagates immediately.
             InvalidRequestError: Malformed request — propagates immediately.
@@ -472,8 +486,17 @@ class ClaudeCodeLLM(LLMCallBase):
         from chia.trace.profiler import get_profiler
 
         profiler = get_profiler()
+        # One waiter per call: the wait budget is per call, so a long-running driver does
+        # not accumulate a debt that starves a later one.
+        waiter = (RateLimitWaiter(self.rate_limit_policy)
+                  if self.rate_limit_policy is not None
+                  and self.rate_limit_policy.enabled else None)
 
-        for attempt in range(self.retries):
+        attempt = -1
+        while True:
+            attempt += 1
+            if attempt >= self.retries:
+                break
             try:
                 self._last_metadata = {}
                 self._rate_limit_event = None
@@ -509,8 +532,26 @@ class ClaudeCodeLLM(LLMCallBase):
                 cli.success = True
                 return cli
 
+            # -- Usage limit: wait for the window when a policy says to, else propagate --
+            except RateLimitError as exc:
+                if waiter is None:
+                    raise
+                try:
+                    waiter.wait(exc, getattr(exc, "reset_time", None))
+                except RateLimitWaitExhausted:
+                    # Chain, so the operator sees both the provider's message and which
+                    # bound stopped the wait — "waited 3 times" and "waited 5 hours" are
+                    # different situations with different fixes.
+                    raise
+                # A waited-out limit does not consume a retry attempt: the call did not
+                # fail on its merits, it was deferred. Counting it would let three
+                # windows exhaust a three-attempt budget without ever reaching the model.
+                # The waiter's own max_waits is what bounds this, not self.retries.
+                attempt -= 1
+                continue
+
             # -- Never retry: propagate immediately --
-            except (RateLimitError, AuthenticationError, BillingError, InvalidRequestError):
+            except (AuthenticationError, BillingError, InvalidRequestError):
                 raise
 
             # -- Retry once: stochastic generation may produce shorter output --
