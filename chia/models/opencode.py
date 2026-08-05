@@ -28,6 +28,7 @@ import ray
 
 from chia.base.ChiaFunction import ChiaFunction
 from chia.base.llm_call import QueryResult, LLMCallBase
+from chia.base.usage import normalize_usage_keys
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
@@ -409,6 +410,9 @@ class OpenCodeLLM(LLMCallBase):
                      "node_id": getattr(t, "node_id", None)}
                     for t in tools
                 ]
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled and self._last_metadata:
                     profiler.add_info(self._last_metadata)
 
@@ -685,7 +689,10 @@ class OpenCodeLLM(LLMCallBase):
 
         export = self._run_export(session_id, env)
         final_text, meta, stream, export_error = self._extract_from_export(export)
-        self._last_metadata = meta
+        # opencode spells the cache counters `cache.read` / `cache.write`; rename
+        # them to the canonical vocabulary so the profiler log and the aet sink see
+        # the same key names here as from every other backend.
+        self._last_metadata = normalize_usage_keys(meta)
         # Prefer the export's error (richer — full responseHeaders); fall back to
         # the run-stream error for pre-request failures the export never records.
         self._last_export_error = export_error or run_error

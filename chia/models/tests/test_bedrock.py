@@ -54,15 +54,24 @@ def _cv_tool_use(tool_use_id, name, tool_input):
     return {"toolUse": {"toolUseId": tool_use_id, "name": name, "input": tool_input}}
 
 
-def _cv_response(blocks, stop_reason, in_tok=0, out_tok=0):
+def _cv_response(blocks, stop_reason, in_tok=0, out_tok=0,
+                 cache_read=None, cache_write=None):
+    """A Converse response. ``cache_read``/``cache_write`` are left out of the
+    usage block when None, matching Bedrock: the cache keys are absent entirely
+    unless prompt caching was in play."""
+    usage = {
+        "inputTokens": in_tok,
+        "outputTokens": out_tok,
+        "totalTokens": in_tok + out_tok,
+    }
+    if cache_read is not None:
+        usage["cacheReadInputTokens"] = cache_read
+    if cache_write is not None:
+        usage["cacheWriteInputTokens"] = cache_write
     return {
         "output": {"message": {"role": "assistant", "content": blocks}},
         "stopReason": stop_reason,
-        "usage": {
-            "inputTokens": in_tok,
-            "outputTokens": out_tok,
-            "totalTokens": in_tok + out_tok,
-        },
+        "usage": usage,
     }
 
 
@@ -212,6 +221,93 @@ def test_converse_no_tools_request_shaping_and_result(monkeypatch):
     assert llm._last_metadata["output_tokens"] == 5
     assert llm._last_metadata["num_turns"] == 1
     assert llm._last_metadata["model"] == "amazon.nova-lite-v1:0"
+
+
+def test_converse_captures_cache_tokens(monkeypatch):
+    """Bedrock counts cache hits/writes outside ``inputTokens``, so reading only
+    ``inputTokens`` both loses the counts and misprices the call."""
+    capture = {"calls": []}
+    _install_fake_boto3(
+        monkeypatch,
+        [_cv_response([_cv_text("PONG")], "end_turn", in_tok=10, out_tok=5,
+                      cache_read=15_345, cache_write=900)],
+        capture,
+    )
+
+    llm = BedrockLLM(model="amazon.nova-lite-v1:0", region="us-east-1")
+    cli = llm.prompt("ping", tools=[])
+
+    assert llm._last_metadata["cache_read_input_tokens"] == 15_345
+    assert llm._last_metadata["cache_creation_input_tokens"] == 900
+    assert cli.usage.cache_read_input_tokens == 15_345
+    assert cli.usage.cache_creation_input_tokens == 900
+    # The classes stay separate; inputTokens is unchanged by the cache counters.
+    assert cli.usage.input_tokens == 10
+    assert cli.usage.billed_input_tokens == 10 + 15_345 + 900
+
+
+def test_converse_attaches_usage_to_the_result(monkeypatch):
+    """The public accounting surface: the caller reads ``cli.usage``, not the
+    backend's private ``_last_metadata``."""
+    capture = {"calls": []}
+    _install_fake_boto3(
+        monkeypatch,
+        [_cv_response([_cv_text("PONG")], "end_turn", in_tok=10, out_tok=5)],
+        capture,
+    )
+
+    llm = BedrockLLM(model="amazon.nova-lite-v1:0", region="us-east-1")
+    cli = llm.prompt("ping", tools=[])
+
+    assert cli.usage.input_tokens == 10
+    assert cli.usage.output_tokens == 5
+    assert cli.usage.num_turns == 1
+    assert cli.usage.model == "amazon.nova-lite-v1:0"
+    # Bedrock is metered, so its cost may be summed into a bill.
+    assert cli.usage.billing_mode == "per_token"
+    assert cli.usage.is_metered is True
+
+
+def test_converse_multi_turn_usage_accumulates_across_the_tool_loop(monkeypatch):
+    """Each Converse round trip is billed, so the result's usage must be the sum
+    over the loop and not just the final turn."""
+    capture = {"calls": [], "urls": [], "tool_calls": []}
+    _install_fake_boto3(
+        monkeypatch,
+        [
+            _cv_response([_cv_tool_use("tu1", "calc__run", {"x": 21})],
+                         "tool_use", in_tok=10, out_tok=5, cache_read=100),
+            _cv_response([_cv_text("done")], "end_turn",
+                         in_tok=20, out_tok=7, cache_read=200),
+        ],
+        capture,
+    )
+    _install_fake_mcp(monkeypatch, capture)
+
+    tool = SimpleNamespace(name="calc", hostname="localhost", port=9001)
+    llm = BedrockLLM(model="amazon.nova-lite-v1:0", region="us-east-1")
+    cli = llm.prompt("run it", tools=[tool])
+
+    assert cli.usage.num_turns == 2
+    assert cli.usage.input_tokens == 30
+    assert cli.usage.output_tokens == 12
+    assert cli.usage.cache_read_input_tokens == 300
+
+
+def test_converse_unpriced_model_reports_no_cost_rather_than_zero(monkeypatch):
+    """An unknown price must be distinguishable from a free call once summed."""
+    capture = {"calls": []}
+    _install_fake_boto3(
+        monkeypatch,
+        [_cv_response([_cv_text("PONG")], "end_turn", in_tok=10, out_tok=5)],
+        capture,
+    )
+
+    llm = BedrockLLM(model="chia-test-model-with-no-price-9e3f", region="us-east-1")
+    cli = llm.prompt("ping", tools=[])
+
+    assert cli.usage.cost_usd is None
+    assert cli.usage.cost_source == "unavailable"
 
 
 def test_converse_tool_loop_executes_mcp_and_feeds_results(monkeypatch):
