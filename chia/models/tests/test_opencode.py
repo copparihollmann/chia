@@ -1084,3 +1084,165 @@ def test_live_remote_opencode_skip_permissions_and_block(remote_prompt):
     cli = remote_prompt(llm, "Reply with exactly: PONG", "opencode_creds")
     assert cli.success is True
     assert "PONG" in cli.result.upper()
+
+
+# ---------------------------------------------------------------------------
+# Diagnosing an error opencode declined to explain
+#
+# opencode returns the same opaque payload for a wrong model id, an unconfigured provider
+# and a genuine internal fault:
+#   {"name":"UnknownError","data":{"message":"Unexpected server error. Check server logs
+#    for details.","ref":"err_..."}}
+# and the real cause is not recoverable — the ref is absent from opencode's own log file,
+# and --print-logs deadlocks when stdout is redirected (both checked against 1.18.10).
+# So the cause is inferred from the catalogue, which is free to ask for.
+#
+# The stake is not ergonomics. Reported as-is, a configuration mistake is
+# indistinguishable from an outage, and an experiment records "harness unavailable" where
+# the truth was "that id does not exist here". This is the regression test for exactly
+# that mistake, which examples/harness_study made.
+# ---------------------------------------------------------------------------
+
+_MASKED = "Unexpected server error. Check server logs for details."
+
+#: A real `opencode models` excerpt (1.18.10, amazon-bedrock configured). Note the Nova id
+#: carries no cross-region prefix while the Anthropic ones do — which is the trap.
+_CATALOGUE = [
+    "amazon-bedrock/amazon.nova-lite-v1:0",
+    "amazon-bedrock/amazon.nova-micro-v1:0",
+    "amazon-bedrock/us.anthropic.claude-sonnet-4-6",
+    "amazon-bedrock/zai.glm-5",
+    "opencode/big-pickle",
+]
+
+
+def _fake_models(monkeypatch, lines, rc=0):
+    """Make `opencode models` return *lines*, leaving every other subprocess alone."""
+    real_run = oc_mod.subprocess.run
+
+    def fake_run(cmd, **kwargs):
+        if len(cmd) > 1 and cmd[1] == "models":
+            return SimpleNamespace(returncode=rc, stdout="\n".join(lines) + "\n",
+                                   stderr="")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(oc_mod.subprocess, "run", fake_run)
+
+
+def test_available_models_parses_the_catalogue(monkeypatch):
+    from chia.models.opencode import available_models
+
+    _fake_models(monkeypatch, _CATALOGUE)
+    assert available_models() == _CATALOGUE
+
+
+def test_an_unreadable_catalogue_is_empty_not_an_exception(monkeypatch):
+    """A diagnosis helper must never be able to fail a call."""
+    from chia.models.opencode import available_models
+
+    def boom(cmd, **kwargs):
+        raise OSError("no such binary")
+
+    monkeypatch.setattr(oc_mod.subprocess, "run", boom)
+    assert available_models() == []
+
+    _fake_models(monkeypatch, [], rc=1)
+    assert available_models() == []
+
+
+def test_a_prefixed_bedrock_id_is_diagnosed_with_its_unprefixed_neighbour(monkeypatch):
+    """The exact mistake this exists for: opencode's catalogue does not use the
+    cross-region prefix for Nova, so a Bedrock id copied from chia's own registry is not
+    routable — and reads as a typo only once both ids are on screen together."""
+    from chia.models.opencode import diagnose_model
+
+    _fake_models(monkeypatch, _CATALOGUE)
+
+    diagnosis = diagnose_model("amazon-bedrock/us.amazon.nova-lite-v1:0")
+
+    assert diagnosis is not None
+    assert "amazon-bedrock/amazon.nova-lite-v1:0" in diagnosis
+    assert "5 models" in diagnosis
+
+
+def test_a_model_that_is_in_the_catalogue_gets_no_diagnosis(monkeypatch):
+    """None means "nothing to say", so it must not be returned for a routable id — the
+    caller would then blame the model for an unrelated failure."""
+    from chia.models.opencode import diagnose_model
+
+    _fake_models(monkeypatch, _CATALOGUE)
+    assert diagnose_model("amazon-bedrock/zai.glm-5") is None
+
+
+def test_an_unreadable_catalogue_yields_no_diagnosis(monkeypatch):
+    """Not knowing is reported as not knowing, never as "the model is fine"."""
+    from chia.models.opencode import diagnose_model
+
+    _fake_models(monkeypatch, [], rc=1)
+    assert diagnose_model("amazon-bedrock/anything") is None
+
+
+def test_an_unconfigured_provider_is_named_as_such(monkeypatch):
+    """Distinct from a typo: no amount of id-fixing helps if the provider is absent, so
+    the message says which providers there are instead of suggesting near-misses."""
+    from chia.models.opencode import diagnose_model
+
+    _fake_models(monkeypatch, ["opencode/big-pickle"])
+
+    diagnosis = diagnose_model("anthropic/claude-sonnet-4-6")
+
+    assert "no provider 'anthropic' configured" in diagnosis
+    assert "opencode" in diagnosis
+
+
+def test_a_masked_error_with_a_bad_model_becomes_invalid_request(monkeypatch):
+    """The behaviour that matters: InvalidRequestError, which is on the never-retry list.
+    A model id opencode does not have cannot start working, so retrying it three times
+    and then reporting an unavailable harness is wrong twice over."""
+    capture = {"calls": []}
+    _install_fake_subprocess(
+        monkeypatch,
+        run_stdout=json.dumps({
+            "type": "error", "sessionID": "ses_x",
+            "error": {"name": "UnknownError",
+                      "data": {"message": _MASKED, "ref": "err_19dcabf5"}},
+        }) + "\n",
+        export_obj={},
+        run_rc=1,
+        capture=capture,
+    )
+    monkeypatch.setattr(oc_mod, "available_models", lambda *a, **k: _CATALOGUE)
+
+    llm = OpenCodeLLM(model="amazon-bedrock/us.amazon.nova-lite-v1:0", retries=3)
+    with pytest.raises(InvalidRequestError) as excinfo:
+        llm.prompt("hi", tools=[])
+
+    assert "amazon-bedrock/amazon.nova-lite-v1:0" in str(excinfo.value)
+    # Never retried: one run call, not three.
+    assert sum(1 for c in capture["calls"] if c["sub"] == "run") == 1
+
+
+def test_a_masked_error_with_a_good_model_stays_unknown(monkeypatch):
+    """The guard must not turn every opaque failure into a model complaint — with a
+    routable id the honest answer is still "unknown"."""
+    capture = {"calls": []}
+    _install_fake_subprocess(
+        monkeypatch,
+        run_stdout=json.dumps({
+            "type": "error", "sessionID": "ses_x",
+            "error": {"name": "UnknownError",
+                      "data": {"message": _MASKED, "ref": "err_19dcabf5"}},
+        }) + "\n",
+        export_obj={},
+        run_rc=1,
+        capture=capture,
+    )
+    monkeypatch.setattr(oc_mod, "available_models", lambda *a, **k: _CATALOGUE)
+
+    llm = OpenCodeLLM(model="amazon-bedrock/zai.glm-5", retries=2)
+    result = llm.prompt("hi", tools=[])
+
+    assert result.success is False
+    # And the reason survives retry exhaustion, which it previously did not: this method
+    # returned stderr="" and the caller learned only that something failed N times.
+    assert _MASKED in result.stderr
