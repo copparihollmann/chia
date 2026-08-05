@@ -1,8 +1,0 @@
-harness,model,n,passed,mean_cost_usd
-converse,glm5,2,2,0.000436
-converse,nova-lite,2,2,3.8e-05
-converse,sonnet,2,2,0.002685
-cli_native,sonnet,2,2,0.00956
-cli_proxy,glm5,2,2,0.160535
-cli_proxy,nova-lite,2,2,0.085618
-cli_proxy,sonnet,2,2,0.00956

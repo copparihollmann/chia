@@ -1,0 +1,4 @@
+model,n,reported_usd,measured_usd,ratio
+glm5,5,0.325065,0.039319,8.27
+nova-lite,5,0.040618,0.001231,33.0
+sonnet,5,0.009751,0.009751,1.0

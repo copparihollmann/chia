@@ -18,9 +18,12 @@ that model is a harness difference and nothing else. A non-Anthropic model can o
 ``cli_native``'s column as a hole, and the hole is the finding — that column is exactly
 what the proxy fills.
 
-**This plot is allowed to come out against the proxy.** If the CLI harness adds nothing
-over opencode at equal model, the honest contribution is a documented negative result and
-a recommendation to use opencode — which still makes you the person who settled it.
+**This plot was allowed to come out against the proxy, and it did.** At equal model
+opencode sends ~14.4k prompt tokens against the CLI's ~23.7k and costs less per task, and
+it reaches every model here through its own ``amazon-bedrock`` provider. So the proxy
+cannot be justified on cost or on reach; what it uniquely gives is the *Claude Code
+harness* — subagents, hooks, skills, session resume — on a non-Anthropic model. See
+``README.md``.
 
 The task
 --------
@@ -54,8 +57,10 @@ import csv
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,19 +75,27 @@ from chia.base.usage import TokenUsage  # noqa: E402
 
 HARNESSES = ("converse", "cli_native", "cli_proxy", "opencode")
 
-#: ``(alias, bedrock_id, opencode_id)``. ``opencode_id`` is ``None`` where opencode has
-#: no route to that model, which is itself a cell of the grid rather than an omission.
+#: ``alias -> (bedrock_id, opencode_id)``.
+#:
+#: The opencode ids route through its ``amazon-bedrock`` provider, on the same credentials
+#: chia uses. An earlier version of this file used ``anthropic/claude-sonnet-4-6`` (no
+#: Anthropic key exists on this host) and ``None`` for the other two, and recorded the
+#: resulting failures as "opencode has no route to this model" and "harness unavailable".
+#: Both were wrong: opencode reaches all three. Note that its catalogue carries no
+#: cross-region prefix for Nova while it does for the Anthropic ids — copying a Bedrock id
+#: across verbatim is exactly the mistake that produced the false skip.
 MODELS = {
-    "sonnet": ("us.anthropic.claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"),
-    "nova-lite": ("us.amazon.nova-lite-v1:0", None),
-    "glm5": ("zai.glm-5", None),
+    "sonnet": ("us.anthropic.claude-sonnet-4-6",
+               "amazon-bedrock/us.anthropic.claude-sonnet-4-6"),
+    "nova-lite": ("us.amazon.nova-lite-v1:0", "amazon-bedrock/amazon.nova-lite-v1:0"),
+    "glm5": ("zai.glm-5", "amazon-bedrock/zai.glm-5"),
 }
 
 COLUMNS = (
     "harness", "model", "repeat", "passed", "wall_s", "cost_usd", "cost_source",
     "billing_mode", "input_tokens", "output_tokens", "cache_read_tokens",
     "cache_creation_tokens", "num_turns", "retries", "harness_failed",
-    "skipped_reason", "error",
+    "reported_usd", "provider_calls", "skipped_reason", "error",
 )
 
 
@@ -152,12 +165,24 @@ def grade(response: str) -> bool:
 
 @dataclass
 class Row:
+    """One cell.
+
+    Two cost fields, deliberately. ``usage.cost_usd`` is the defensible one — for a
+    proxied model it is computed from the token counts the *provider* reported, priced
+    against that model's own rates. ``reported_usd`` is what the harness claimed. For a
+    proxied non-Anthropic model those disagree, because the CLI prices what it believes it
+    called, and recording only one of them would either hide the discrepancy or throw away
+    the evidence for it.
+    """
+
     harness: str
     model: str
     repeat: int
     passed: Optional[bool] = None
     wall_s: float = 0.0
     usage: TokenUsage = field(default_factory=TokenUsage)
+    reported_usd: Optional[float] = None
+    provider_calls: int = 0
     skipped_reason: str = ""
     error: str = ""
     harness_failed: bool = False
@@ -175,6 +200,9 @@ class Row:
             "cache_creation_tokens": u.cache_creation_input_tokens,
             "num_turns": u.num_turns, "retries": len(getattr(self, "_retries", ())),
             "harness_failed": int(self.harness_failed),
+            "reported_usd": ("" if self.reported_usd is None
+                             else round(self.reported_usd, 6)),
+            "provider_calls": self.provider_calls,
             "skipped_reason": self.skipped_reason, "error": self.error[:300],
         }
 
@@ -186,6 +214,80 @@ def _run_converse(model_id: str, region: str) -> tuple[str, TokenUsage]:
     llm = BedrockLLM(model=model_id, region=region, max_tokens=2048, retries=2)
     result = llm.prompt(PROMPT, tools=[])
     return result.result, result.usage
+
+
+def provider_usage_for(usage_log: Optional[Path], offset: int, model_id: str,
+                       ) -> tuple[Optional[TokenUsage], int]:
+    """What the *provider* actually charged for the calls after *offset*.
+
+    :param usage_log: The proxy's JSONL usage log, or ``None`` when not recording.
+    :param offset: Line count taken before the row was dispatched.
+    :param model_id: The real model, for pricing.
+    :type usage_log: Optional[pathlib.Path]
+    :type offset: int
+    :type model_id: str
+    :rtype: tuple[Optional[TokenUsage], int]
+
+    Returns the summed usage priced against *model_id*'s own rates, and the number of
+    provider calls the harness made. ``(None, 0)`` when nothing was recorded.
+
+    This is the only trustworthy cost for a proxied non-Anthropic model. It is marked
+    ``estimated`` rather than ``billed``: the token counts are the provider's, but the
+    rates are a local table, and calling a computed figure "billed" is exactly the error
+    on the other side of this comparison.
+    """
+    from chia.models.proxy.server import read_usage_log
+
+    from pricing import Counts, price_four_class
+
+    if usage_log is None:
+        return None, 0
+    lines = read_usage_log(usage_log, offset=offset)
+    if not lines:
+        return None, 0
+
+    counts = Counts(
+        input_tokens=sum(int(line.get("input_tokens") or 0) for line in lines),
+        output_tokens=sum(int(line.get("output_tokens") or 0) for line in lines),
+        cache_read_tokens=sum(int(line.get("cache_read_input_tokens") or 0)
+                              for line in lines),
+        cache_creation_tokens=sum(int(line.get("cache_creation_input_tokens") or 0)
+                                  for line in lines),
+    )
+
+    # Priced per call at *its own* model's rates, not all of them at the row's model. The
+    # CLI makes more than one provider call per task — it sends a separate haiku request
+    # for the session title — and pricing that at the primary model's rate inflates the
+    # row. It showed up as an Anthropic control coming out at 1.13x instead of 1.0, which
+    # is the whole reason to have a control.
+    cost: Optional[float] = 0.0
+    for line in lines:
+        per_call = price_four_class(
+            Counts(
+                input_tokens=int(line.get("input_tokens") or 0),
+                output_tokens=int(line.get("output_tokens") or 0),
+                cache_read_tokens=int(line.get("cache_read_input_tokens") or 0),
+                cache_creation_tokens=int(line.get("cache_creation_input_tokens") or 0),
+            ),
+            str(line.get("model_id") or model_id),
+        )
+        if per_call is None:
+            # One unpriceable call makes the row's total unknown. A partial sum presented
+            # as a total is worse than no number, because it looks like one.
+            cost = None
+            break
+        cost += per_call
+
+    return TokenUsage(
+        input_tokens=counts.input_tokens,
+        output_tokens=counts.output_tokens,
+        cache_read_input_tokens=counts.cache_read_tokens,
+        cache_creation_input_tokens=counts.cache_creation_tokens,
+        num_turns=len(lines),
+        cost_usd=cost,
+        cost_source="estimated" if cost is not None else "unavailable",
+        model=model_id,
+    ), len(lines)
 
 
 def _run_claude_cli(model_id: str, region: str, proxy_url: Optional[str],
@@ -227,8 +329,15 @@ def _run_opencode(model_id: str, region: str, proxy_url: Optional[str],
 
 
 def run_row(harness: str, model_alias: str, repeat: int, *, region: str,
-            proxy_url: Optional[str]) -> Row:
-    """Run one cell. Never raises: a failed cell is a recorded row, not a lost grid."""
+            proxy_url: Optional[str], usage_log: Optional[Path] = None) -> Row:
+    """Run one cell. Never raises: a failed cell is a recorded row, not a lost grid.
+
+    Each cell runs in a fresh temporary directory. The agent harnesses have file-writing
+    tools and the prompt asks for code, so at least one of them writes the answer to disk
+    rather than only returning it — a run of this grid left a ``collapse.py`` in the
+    repository root. Beyond the mess, a shared working directory means cell N can read what
+    cell N-1 wrote, which would make the harnesses look better than they are.
+    """
     row = Row(harness=harness, model=model_alias, repeat=repeat)
     bedrock_id, opencode_id = MODELS[model_alias]
 
@@ -241,8 +350,16 @@ def run_row(harness: str, model_alias: str, repeat: int, *, region: str,
         row.skipped_reason = "the CLI's native Bedrock transport cannot speak Converse"
         return row
 
+    # Taken before dispatch: everything the proxy records after this line belongs to this
+    # row. A line count is exact where a timestamp is not — the CLI opens concurrent
+    # streams, and a subagent turn overlaps its parent's.
+    mark = _usage_mark(usage_log) if harness == "cli_proxy" else 0
+
     started = time.perf_counter()
+    workspace = tempfile.mkdtemp(prefix=f"harness_grid_{harness}_{model_alias}_")
+    previous_cwd = os.getcwd()
     try:
+        os.chdir(workspace)
         if harness == "converse":
             text, usage = _run_converse(bedrock_id, region)
         elif harness == "cli_native":
@@ -253,6 +370,17 @@ def run_row(harness: str, model_alias: str, repeat: int, *, region: str,
             text, usage = _run_opencode(opencode_id, region, proxy_url)
         row.wall_s = time.perf_counter() - started
         row.usage = usage
+        if harness == "cli_proxy":
+            # The harness's own figure is kept, but it is not the one plotted: for a
+            # non-Anthropic model the CLI prices a Claude call it did not make.
+            row.reported_usd = usage.cost_usd
+            measured, calls = provider_usage_for(usage_log, mark, bedrock_id)
+            row.provider_calls = calls
+            if measured is not None:
+                row.usage = measured
+        else:
+            row.reported_usd = usage.cost_usd
+            row.provider_calls = usage.num_turns
         if not (text or "").strip():
             # A harness that produced nothing did not answer wrongly — it did not answer.
             # Grading an empty string as a failure would report an auth or config problem
@@ -266,6 +394,9 @@ def run_row(harness: str, model_alias: str, repeat: int, *, region: str,
         row.wall_s = time.perf_counter() - started
         row.error = f"{type(exc).__name__}: {exc}"
         row.harness_failed = True
+    finally:
+        os.chdir(previous_cwd)
+        shutil.rmtree(workspace, ignore_errors=True)
     return row
 
 
@@ -273,6 +404,15 @@ def _is_anthropic(model_id: str) -> bool:
     from chia.models.proxy.translate import is_anthropic_model
 
     return is_anthropic_model(model_id)
+
+
+def _usage_mark(usage_log: Optional[Path]) -> int:
+    """How many usage lines the proxy has written so far."""
+    if usage_log is None:
+        return 0
+    from chia.models.proxy.server import count_usage_lines
+
+    return count_usage_lines(usage_log)
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +441,13 @@ def main(argv=None) -> int:
                         help="override the projection's per-call estimate; needed for "
                              "the first run, which has no history")
     parser.add_argument("--out", type=Path, default=HERE / "data" / "harness_grid.csv")
+    parser.add_argument("--usage-log", type=Path,
+                        default=HERE / "data" / "proxy_usage.jsonl",
+                        help="the proxy's per-call usage log (start the proxy with the "
+                             "same path). This is where a proxied call's real token "
+                             "counts come from; without it the cli_proxy cost is only "
+                             "what the CLI claimed, which for a non-Anthropic model is "
+                             "the wrong model's rates.")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the plan and the projected cost; call nothing")
     args = parser.parse_args(argv)
@@ -334,7 +481,7 @@ def main(argv=None) -> int:
     rows: List[Row] = []
     for index, (harness, model, repeat) in enumerate(cells, 1):
         row = run_row(harness, model, repeat, region=args.region,
-                      proxy_url=args.proxy_url)
+                      proxy_url=args.proxy_url, usage_log=args.usage_log)
         rows.append(row)
         verdict = ("skip" if row.skipped_reason
                    else "HARNESS-FAILED" if row.harness_failed
@@ -377,7 +524,7 @@ def _write(rows: List[Row], path: Path) -> None:
 
 
 def _summarise(rows: List[Row]) -> None:
-    print("\nharness      model      n  pass  $/task    med wall")
+    print("\nharness      model      n  pass  $/task    reported   med wall")
     groups: Dict[tuple, List[Row]] = {}
     for row in rows:
         if row.skipped_reason or row.harness_failed:
@@ -388,10 +535,14 @@ def _summarise(rows: List[Row]) -> None:
         passed = sum(1 for r in items if r.passed)
         costs = [r.usage.cost_usd for r in items if r.usage.cost_usd is not None]
         cost = f"${sum(costs) / len(costs):.4f}" if costs else "n/a"
+        claimed = [r.reported_usd for r in items if r.reported_usd is not None]
+        reported = f"${sum(claimed) / len(claimed):.4f}" if claimed else "n/a"
         walls = sorted(r.wall_s for r in items)
         print(f"{harness:12} {model:10} {len(items):<2} {passed}/{len(items):<4} "
-              f"{cost:9} {walls[len(walls) // 2]:.1f}s")
-    print("\nproportions above are over the n in the same row; a rate over 3 trials is "
+              f"{cost:9} {reported:10} {walls[len(walls) // 2]:.1f}s")
+    print("\n$/task is priced from the provider's own token counts; `reported` is what "
+          "the harness claimed.")
+    print("proportions above are over the n in the same row; a rate over 3 trials is "
           "not a rate over 300.")
 
 

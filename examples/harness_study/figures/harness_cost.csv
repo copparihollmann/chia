@@ -1,0 +1,11 @@
+harness,model,n,passed,median_cost_usd,mean_cost_usd,median_billed_input_tokens
+converse,glm5,5,5,0.000494,0.0004768,137
+converse,nova-lite,5,5,3.8e-05,3.9e-05,134
+converse,sonnet,5,5,0.002685,0.002685,145
+opencode,glm5,5,5,0.012989,0.0130436,12587
+opencode,nova-lite,5,5,0.00085,0.0010224,13327
+opencode,sonnet,5,5,0.00659,0.0165246,14440
+cli_native,sonnet,5,5,0.009751,0.0261208,23726
+cli_proxy,glm5,5,5,0.039319,0.034226,63973
+cli_proxy,nova-lite,5,4,0.001231,0.0015154,22245
+cli_proxy,sonnet,5,4,0.009751,0.009749,24241

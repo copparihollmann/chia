@@ -37,10 +37,30 @@ def test_rate_resolution_is_longest_key_wins():
 
 
 def test_an_unknown_model_is_unpriceable_not_cheap():
-    assert rate_for("zai.glm-5") is None
-    assert price_four_class(Counts(input_tokens=1000), "zai.glm-5") is None
-    assert price_two_class(Counts(input_tokens=1000), "zai.glm-5") is None
-    assert error_ratio(Counts(input_tokens=1000), "zai.glm-5") is None
+    """The policy that matters: no rate yields None, never 0.0. A model priced at zero
+    looks free, and free is the one answer that is never true."""
+    assert rate_for("some.model-nobody-has-priced") is None
+    unknown = "some.model-nobody-has-priced"
+    assert price_four_class(Counts(input_tokens=1000), unknown) is None
+    assert price_two_class(Counts(input_tokens=1000), unknown) is None
+    assert error_ratio(Counts(input_tokens=1000), unknown) is None
+
+
+def test_an_estimated_rate_is_flagged_as_one():
+    """GLM's tuple is unconfirmed and Nova's cache rates are approximated, so a figure
+    that prices either has to be able to say so rather than presenting every number with
+    the same authority."""
+    from pricing import rate_is_estimated
+
+    assert rate_is_estimated("zai.glm-5") is True
+    assert rate_is_estimated("us.amazon.nova-lite-v1:0") is True
+    assert rate_is_estimated("us.anthropic.claude-sonnet-4-6") is False
+
+
+def test_glm_prices_from_the_one_table_that_defines_it():
+    """Sourced from oscar-merlin's bedrock_prices.yaml — the same table aet reads via
+    AET_PRICE_TABLE — so a GLM cost here and there cannot disagree."""
+    assert rate_for("zai.glm-5") == (0.60, 2.20, 0.06, 0.75)
 
 
 def test_four_class_prices_each_class_at_its_own_rate():

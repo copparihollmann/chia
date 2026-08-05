@@ -339,10 +339,15 @@ def bedrock_model_env(
 
         proxy_url: Base URL of a running :mod:`chia.models.proxy.server`. Required
             whenever any tier is a Converse-only model, since the CLI cannot speak
-            that schema itself. When given, also sets the two flags the proxy needs:
-            ``CLAUDE_CODE_SKIP_BEDROCK_AUTH`` (the proxy verifies no signature) and
-            ``CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD`` (the proxy answers in
-            plain SSE rather than AWS binary event-stream framing).
+            that schema itself. When given, also sets
+            ``CLAUDE_CODE_SKIP_BEDROCK_AUTH`` (the proxy verifies no signature).
+
+            It deliberately does **not** set
+            ``CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD``. That flag was needed
+            while the proxy replied in plain SSE, and setting it hid a real defect:
+            the CLI could not parse the SSE stream and silently retried every turn
+            non-streaming, so each turn reached Bedrock twice. The proxy now answers
+            in AWS event-stream framing and the flag must stay unset.
         require_tools: Forwarded to :meth:`ModelTier.validate`. Leave ``True`` for
             anything agentic.
 
@@ -383,7 +388,6 @@ def bedrock_model_env(
         # cli_native tiers are unaffected by passing through it.
         env["ANTHROPIC_BEDROCK_BASE_URL"] = proxy_url
         env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] = "1"
-        env["CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD"] = "1"
 
     # Bearer-token auth only when explicitly supplied; otherwise leave auth to
     # the ambient AWS credential chain.

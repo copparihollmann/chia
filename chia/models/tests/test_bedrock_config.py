@@ -298,16 +298,25 @@ def test_a_converse_only_tier_is_refused_without_a_proxy_url():
     assert "proxy_url" in message
 
 
-def test_a_proxy_url_sets_the_two_flags_the_proxy_needs():
-    """Without both of these the CLI either signs a request nobody verifies or rejects
-    the proxy's SSE reply by content type. Setting them here means a caller cannot get
-    a working tier mix and a broken transport at the same time."""
+def test_a_proxy_url_sets_the_flag_the_proxy_needs():
+    """The proxy verifies no signature, so the CLI must be told not to sign. Setting it
+    here means a caller cannot get a working tier mix and a broken transport at the same
+    time."""
     env = bedrock_model_env(primary="glm5", background="nova-lite",
                             proxy_url="http://127.0.0.1:8123")
 
     assert env["ANTHROPIC_BEDROCK_BASE_URL"] == "http://127.0.0.1:8123"
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
-    assert env["CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD"] == "1"
+
+
+def test_the_content_type_guard_is_never_disabled():
+    """It must stay on. While the proxy answered in SSE this flag was required, and it hid
+    a defect: the CLI could not parse the stream and silently retried every turn
+    non-streaming, so each turn reached Bedrock twice and the client reported one. The
+    proxy now answers in AWS event-stream framing, so the guard is satisfied honestly."""
+    env = bedrock_model_env(primary="glm5", proxy_url="http://127.0.0.1:8123")
+
+    assert "CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD" not in env
 
 
 def test_a_proxy_routed_alias_is_resolved_to_a_concrete_id():

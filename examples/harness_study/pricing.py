@@ -42,7 +42,33 @@ RATES_USD_PER_MTOK: Dict[str, Tuple[float, float, float, float]] = {
     "nova-micro": (0.035, 0.14, 0.035 * 0.25, 0.035),
     "nova-lite":  (0.06, 0.24, 0.06 * 0.25, 0.06),
     "nova-pro":   (0.80, 3.20, 0.80 * 0.25, 0.80),
+    # GLM-5 (Z.ai) on Bedrock. An ESTIMATE, not a verified rate: taken from
+    # oscar-merlin/merlin/experiments/capsule_bench/bedrock_prices.yaml, which says so
+    # itself and is the one place that project prices non-Anthropic Bedrock models. aet
+    # deliberately leaves these unpriced rather than guess. Any GLM figure downstream
+    # inherits that uncertainty and must be labelled an estimate.
+    "glm-5":      (0.60, 2.20, 0.06, 0.75),
+    "glm":        (0.60, 2.20, 0.06, 0.75),
 }
+
+#: Model keys whose rates are unconfirmed estimates rather than published, verified list
+#: prices. A figure that prices one of these has to say so.
+ESTIMATED_RATE_KEYS = frozenset({"glm-5", "glm", "nova-micro", "nova-lite", "nova-pro"})
+
+
+def rate_is_estimated(model: str) -> bool:
+    """Whether *model*'s rate is an unconfirmed estimate.
+
+    :param model: A provider model id.
+    :type model: str
+    :rtype: bool
+
+    Nova's cache rates are approximated and GLM's whole tuple is unconfirmed, so a cost
+    computed for either is an estimate of an estimate. Callers use this to label a figure
+    instead of presenting every number with the same authority.
+    """
+    lowered = (model or "").lower()
+    return any(key in lowered for key in ESTIMATED_RATE_KEYS)
 
 
 def rate_for(model: str) -> Optional[Tuple[float, float, float, float]]:

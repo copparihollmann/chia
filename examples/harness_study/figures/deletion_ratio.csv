@@ -1,9 +1,0 @@
-pr,branch,upstream_src_added,upstream_tests_added,upstream_docs_added,downstream_deleted,downstream_sites,downstream_detail
-PR1,feat/metrics-register-backend,31,60,43,14,1,oscar-merlin merlin/python/merlin/benchharness/chia_bridge.py:139-152 _register_backend() monkeypatch of the private _BACKENDS
-PR2,fix/profiled-result-batched-get,10,51,0,23,1,oscar-merlin merlin/python/merlin/benchharness/chia_bridge.py:79-101 chia_get() re-unwrapping shim
-PR3,fix/claude-nested-session-env,49,27,0,5,1,spec specir/nl2spec/chia_provider.py:205-209 hand-rolled nested-session env pop
-PR4,feat/container-engine-config,43,100,22,0,0,no downstream workaround; the engine key was simply unreachable from YAML
-PR5,feat/queryresult-usage,549,578,12,21,1,spec specir/nl2spec/_chia_bridge.py:137-157 _usage() reaching into the private _last_metadata
-PR6,fix/retry-token-accounting,301,334,0,0,0,no downstream workaround existed; the tokens were unrecoverable from outside chia
-PR7,feat/compat-vertex-usage,92,201,0,0,0,no downstream workaround existed; the counts were never emitted at all
-PR8,fix/aet-sink-run-scoped,567,501,0,0,0,replaces chia's own defective sink rather than a downstream workaround

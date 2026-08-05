@@ -1,0 +1,5 @@
+harness,n,median_billed_input_tokens,input_tokens,cache_creation_tokens,cache_read_tokens
+converse,5,145,145,0,0
+opencode,5,14440,3,0,14437
+cli_native,5,23726,3,0,23723
+cli_proxy,5,24241,518,0,23723
