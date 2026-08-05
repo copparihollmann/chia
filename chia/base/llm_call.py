@@ -148,6 +148,14 @@ class LLMCallBase(ABC):
         )
         result.usage = sum_usages([usage] + self._billable_retry_usages())
         result.retry_attempts = self.retry_attempts
+        # Mirror the two resolved annotations back onto the raw metadata, which is
+        # what the profiler writes to its trace. Without them a reader of the trace
+        # cannot tell subscription quota from metered spend, nor a billed figure
+        # from an estimate — exactly the two distinctions the accounting turns on,
+        # and both are decided here rather than being present in the raw counts.
+        if isinstance(meta, dict) and meta:
+            meta.setdefault("cost_source", result.usage.cost_source)
+            meta.setdefault("billing_mode", result.usage.billing_mode)
         return result
 
     # ------------------------------------------------------------------
