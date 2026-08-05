@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import os
 
+import pytest
+
+from chia.models import bedrock_config as bc
 from chia.models.bedrock_config import (
     DEFAULT_HAIKU_MODEL,
     DEFAULT_OPUS_MODEL,
     DEFAULT_REGION,
     DEFAULT_SONNET_MODEL,
+    MODELS,
+    ModelTier,
     apply_to_env,
     bedrock_model_env,
 )
@@ -222,3 +227,159 @@ def test_llm_bedrock_defaults_region_when_unset():
     env = llm._subprocess_env()
     assert env["AWS_REGION"] == DEFAULT_REGION
     assert "AWS_BEARER_TOKEN_BEDROCK" not in env
+
+
+# ---------------------------------------------------------------------------
+# Mixed-provider tiers
+#
+# `via` records how the Claude Code CLI reaches a model. Before
+# chia.models.proxy.server existed, non-Anthropic Bedrock models were
+# CLI-unreachable and this registry's comments said so. They are reachable now, and
+# these tests pin the two things that makes newly possible — and the two impossible
+# combinations that must be refused before a grid spends money discovering them.
+# ---------------------------------------------------------------------------
+
+
+def test_anthropic_models_are_cli_native():
+    for alias in ("opus", "sonnet", "haiku"):
+        assert MODELS[alias].via == "cli_native"
+        assert bc.model_via(alias) == "cli_native"
+
+
+def test_non_anthropic_models_route_through_the_proxy():
+    for alias in ("glm5", "nova-pro", "qwen-coder", "kimi", "deepseek"):
+        assert MODELS[alias].via == "proxy"
+        assert bc.model_via(alias) == "proxy"
+
+
+def test_every_registry_entry_declares_a_valid_transport():
+    for alias, model in MODELS.items():
+        assert model.via in bc.VIA_CHOICES, alias
+
+
+def test_an_unlisted_id_is_classified_by_its_vendor_prefix():
+    """A model the registry has never heard of still routes to the right transport
+    rather than defaulting to the wrong one."""
+    assert bc.model_via("us.anthropic.claude-opus-5-v1:0") == "cli_native"
+    assert bc.model_via("some.new-vendor-model") == "proxy"
+
+
+def test_an_unlisted_id_is_classified_but_never_refused():
+    """Refusal needs certainty, classification only a best guess: a newly-released
+    Anthropic profile this table has not learned yet must not be rejected for a reason
+    that is not true."""
+    assert bc.model_via("some.new-vendor-model") == "proxy"
+    assert bc.requires_proxy("some.new-vendor-model") is False
+    assert bc.requires_proxy("glm5") is True
+
+
+def test_a_mixed_tier_reports_its_transports():
+    tier = ModelTier(primary="glm5", subagent="sonnet", background="nova-lite")
+
+    assert bc.tier_transports(tier) == {
+        "primary": "proxy", "subagent": "cli_native", "background": "proxy",
+    }
+    assert tier.needs_proxy() is True
+
+
+def test_an_all_anthropic_tier_needs_no_proxy():
+    assert ModelTier(primary="opus", subagent="sonnet",
+                     background="haiku").needs_proxy() is False
+
+
+def test_a_converse_only_tier_is_refused_without_a_proxy_url():
+    """The plan's requirement: refuse an impossible combination up front instead of
+    failing at call time. A grid that finds out on row 200 has already spent 199 rows."""
+    with pytest.raises(bc.TierError) as exc:
+        bedrock_model_env(primary="glm5", subagent="nova-pro")
+
+    message = str(exc.value)
+    assert "primary" in message and "subagent" in message
+    assert "proxy_url" in message
+
+
+def test_a_proxy_url_sets_the_two_flags_the_proxy_needs():
+    """Without both of these the CLI either signs a request nobody verifies or rejects
+    the proxy's SSE reply by content type. Setting them here means a caller cannot get
+    a working tier mix and a broken transport at the same time."""
+    env = bedrock_model_env(primary="glm5", background="nova-lite",
+                            proxy_url="http://127.0.0.1:8123")
+
+    assert env["ANTHROPIC_BEDROCK_BASE_URL"] == "http://127.0.0.1:8123"
+    assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+    assert env["CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD"] == "1"
+
+
+def test_a_proxy_routed_alias_is_resolved_to_a_concrete_id():
+    """opus/sonnet/haiku are resolved by the CLI's own ANTHROPIC_DEFAULT_*_MODEL pins;
+    a proxy-routed alias has no such pin, so leaving it unresolved would send Bedrock
+    the literal string "glm5"."""
+    env = bedrock_model_env(primary="glm5", subagent="nova-pro",
+                            background="nova-lite",
+                            proxy_url="http://127.0.0.1:8123")
+
+    assert env["ANTHROPIC_MODEL"] == "zai.glm-5"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "us.amazon.nova-pro-v1:0"
+    assert env["ANTHROPIC_SMALL_FAST_MODEL"] == "us.amazon.nova-lite-v1:0"
+
+
+def test_anthropic_aliases_stay_aliases():
+    """The CLI resolves them through the pins; rewriting them here would bypass the
+    mechanism the pins exist for."""
+    env = bedrock_model_env(primary="opus", subagent="sonnet", background="haiku")
+
+    assert env["ANTHROPIC_MODEL"] == "opus"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "sonnet"
+
+
+def test_a_mixed_tier_routes_every_tier_through_the_proxy():
+    """The CLI has one ANTHROPIC_BEDROCK_BASE_URL, so one Converse-only tier sends all
+    of them through — which is harmless, because the proxy forwards Anthropic requests
+    verbatim."""
+    env = bedrock_model_env(primary="glm5", subagent="sonnet",
+                            proxy_url="http://127.0.0.1:8123")
+
+    assert env["ANTHROPIC_BEDROCK_BASE_URL"] == "http://127.0.0.1:8123"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "sonnet"
+
+
+def test_a_tool_incapable_model_is_refused_in_an_agentic_tier():
+    """deepseek-r1's Converse endpoint rejects toolConfig outright, so as a subagent
+    every delegated task fails and as primary the whole run does."""
+    with pytest.raises(bc.TierError) as exc:
+        bedrock_model_env(primary="deepseek-r1", proxy_url="http://127.0.0.1:8123")
+
+    assert "tool-using loop" in str(exc.value)
+    assert "deepseek-r1" in str(exc.value)
+
+
+def test_a_tool_incapable_model_is_allowed_when_tools_are_not_required():
+    """A single-turn text task genuinely does not need them, so the check is opt-out
+    rather than absolute."""
+    env = bedrock_model_env(primary="deepseek-r1", require_tools=False,
+                            proxy_url="http://127.0.0.1:8123")
+
+    assert env["ANTHROPIC_MODEL"] == "deepseek.r1-v1:0"
+
+
+def test_validate_names_the_offending_tier():
+    with pytest.raises(bc.TierError) as exc:
+        ModelTier(primary="glm5", subagent="deepseek-r1").validate()
+
+    assert "'subagent'" in str(exc.value)
+
+
+def test_the_non_anthropic_preset_is_now_actually_drivable():
+    """NON_ANTHROPIC_TIER used to be documentation: the CLI could not drive any of it.
+    With the proxy it is a working configuration, which is what makes ModelTier more
+    than a comment."""
+    env = bedrock_model_env(
+        primary=bc.NON_ANTHROPIC_TIER.primary,
+        subagent=bc.NON_ANTHROPIC_TIER.subagent,
+        background=bc.NON_ANTHROPIC_TIER.background,
+        proxy_url="http://127.0.0.1:8123",
+    )
+
+    assert env["ANTHROPIC_MODEL"] == "zai.glm-5"
+    assert env["CLAUDE_CODE_SUBAGENT_MODEL"] == "qwen.qwen3-coder-next"
+    assert env["ANTHROPIC_SMALL_FAST_MODEL"] == "us.amazon.nova-lite-v1:0"

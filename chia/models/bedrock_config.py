@@ -52,15 +52,19 @@ DEFAULT_REGION = "us-east-1"
 # --------------------------------------------------------------------------- #
 # Verified Bedrock model registry (provider-agnostic).
 #
-# Two integration paths, because Claude Code the CLI only speaks the Anthropic
-# Messages API:
-#   * Anthropic models  -> drive Claude Code via :func:`bedrock_model_env`
-#     (``CLAUDE_CODE_USE_BEDROCK`` + ``ANTHROPIC_MODEL`` ...), which gives the
-#     native orchestrator / Task-subagent / background tiering.
-#   * Non-Anthropic models -> the CLI CANNOT drive them; run them through chia's
-#     own ``BedrockLLM`` (the Converse API), which normalises tool use across
-#     providers. The orchestrator/delegate/background pattern is then expressed
-#     by picking a model per tier from this registry (see :class:`ModelTier`).
+# Claude Code the CLI only speaks the Anthropic Messages API on the wire, so a model's
+# `via` records how the CLI reaches it:
+#   * `cli_native` (Anthropic models) -> driven directly by :func:`bedrock_model_env`
+#     (``CLAUDE_CODE_USE_BEDROCK`` + ``ANTHROPIC_MODEL`` ...), giving the native
+#     orchestrator / Task-subagent / background tiering.
+#   * `proxy` (everything else) -> reached through :mod:`chia.models.proxy.server`,
+#     which translates Anthropic Messages to Converse. Verified end to end against
+#     claude-cli 2.1.222. Before that proxy existed these models were CLI-unreachable
+#     and this registry said so; they are not any more, which is the whole point of
+#     mixed-provider tiers.
+#
+# Either way chia's own ``BedrockLLM`` (Converse) can talk to all of them directly —
+# that is the second harness in the study, not a fallback.
 #
 # ``supports_tools`` = whether the model accepts a Converse ``toolConfig`` and
 # actually emits ``toolUse`` (i.e. can drive an AGENTIC, tool-using loop).
@@ -69,30 +73,58 @@ DEFAULT_REGION = "us-east-1"
 from dataclasses import dataclass
 
 
+#: How the Claude Code CLI reaches a model.
+#:
+#: ``cli_native`` — the CLI's Bedrock transport speaks this model's schema directly
+#: (Anthropic Messages), so no translation is involved.
+#: ``proxy`` — the model speaks Converse, so the CLI can only reach it through
+#: :mod:`chia.models.proxy.server`. Verified working end to end against claude-cli
+#: 2.1.222; before that proxy existed these models were CLI-unreachable, which is what
+#: this field records.
+VIA_CHOICES = ("cli_native", "proxy")
+
+
 @dataclass(frozen=True)
 class BedrockModel:
-    """A Bedrock model: its inference-profile id, provider, and whether it can
-    drive an agentic (tool-using) loop via the Converse API."""
+    """A Bedrock model: its inference-profile id, provider, how the CLI reaches it,
+    and whether it can drive an agentic (tool-using) loop via the Converse API.
+
+    :param id: Bedrock model or inference-profile id.
+    :param provider: Vendor name, for reporting.
+    :param supports_tools: Whether Converse accepts a ``toolConfig`` for it *and* it
+        emits ``toolUse``. ``False`` means it cannot drive an agentic loop at all —
+        not merely that it is worse at it.
+    :param via: One of :data:`VIA_CHOICES`.
+    :param notes: Anything a caller needs to know before picking it.
+    :type id: str
+    :type provider: str
+    :type supports_tools: bool
+    :type via: str
+    :type notes: str
+    """
 
     id: str
     provider: str
     supports_tools: bool
+    via: str = "proxy"
     notes: str = ""
 
 
 MODELS: Dict[str, "BedrockModel"] = {
     # Anthropic (Claude Code CLI via bedrock_model_env, or chia BedrockLLM).
-    "opus": BedrockModel(DEFAULT_OPUS_MODEL, "Anthropic", True),
-    "sonnet": BedrockModel(DEFAULT_SONNET_MODEL, "Anthropic", True),
-    "haiku": BedrockModel(DEFAULT_HAIKU_MODEL, "Anthropic", True),
-    # Non-Anthropic (chia BedrockLLM / Converse ONLY — not the Claude Code CLI).
+    "opus": BedrockModel(DEFAULT_OPUS_MODEL, "Anthropic", True, "cli_native"),
+    "sonnet": BedrockModel(DEFAULT_SONNET_MODEL, "Anthropic", True, "cli_native"),
+    "haiku": BedrockModel(DEFAULT_HAIKU_MODEL, "Anthropic", True, "cli_native"),
+    # Non-Anthropic: Converse-only on the wire, so the Claude Code CLI reaches them
+    # only through chia.models.proxy.server. chia's own BedrockLLM talks to them
+    # directly either way.
     "glm5": BedrockModel("zai.glm-5", "Z.AI", True),
     "glm4.7": BedrockModel("zai.glm-4.7", "Z.AI", True),
     "nemotron": BedrockModel("nvidia.nemotron-super-3-120b", "NVIDIA", True),
     "kimi": BedrockModel("moonshotai.kimi-k2.5", "Moonshot AI", True),
     "deepseek": BedrockModel("deepseek.v3.2", "DeepSeek", True),
     "deepseek-r1": BedrockModel(
-        "deepseek.r1-v1:0", "DeepSeek", False,
+        "deepseek.r1-v1:0", "DeepSeek", False, "proxy",
         "reasoning model; Converse rejects toolConfig -> NO agentic tool use",
     ),
     "qwen-coder": BedrockModel("qwen.qwen3-coder-next", "Qwen", True),
@@ -101,12 +133,74 @@ MODELS: Dict[str, "BedrockModel"] = {
 }
 
 
+class TierError(ValueError):
+    """A requested tier mix cannot be driven as configured.
+
+    Raised at configuration time rather than left to surface as a provider error
+    mid-run. A grid that discovers its model choice was impossible on row 200 has
+    already spent 199 rows' worth of budget finding out.
+    """
+
+
 def resolve_model(name: str) -> str:
     """Resolve a short alias (``"glm5"``) or a raw Bedrock id to the concrete
     inference-profile id. Unknown names pass through unchanged, so a caller may
     always hand a full id."""
     m = MODELS.get(name)
     return m.id if m is not None else name
+
+
+def model_via(name: str) -> str:
+    """How the Claude Code CLI reaches *name*: one of :data:`VIA_CHOICES`.
+
+    :param name: A registry alias or a raw Bedrock id.
+    :type name: str
+    :rtype: str
+
+    An id absent from the registry is classified by its vendor prefix, so a model this
+    registry has never heard of still routes correctly rather than defaulting to the
+    wrong transport.
+    """
+    known = MODELS.get(name)
+    if known is not None:
+        return known.via
+    from chia.models.proxy.translate import is_anthropic_model
+
+    return "cli_native" if is_anthropic_model(name) else "proxy"
+
+
+def requires_proxy(name: str) -> bool:
+    """Whether *name* is **known** to need the Converse translator.
+
+    :param name: A registry alias or a raw Bedrock id.
+    :type name: str
+    :rtype: bool
+
+    Deliberately narrower than ``model_via(name) == "proxy"``: only a model this
+    registry lists as Converse-only counts. An unknown raw id is *not* refused, for the
+    same reason :meth:`ModelTier.validate` lets one through — the registry cannot
+    enumerate every Bedrock profile, and a newly-released Anthropic id that this table
+    has not learned yet would otherwise be rejected for a reason that is not true.
+    Refusal needs certainty; classification only needs a best guess.
+    """
+    known = MODELS.get(name)
+    return known is not None and known.via == "proxy"
+
+
+def tier_transports(tier: "ModelTier") -> Dict[str, str]:
+    """``{tier_name: via}`` for each populated tier of *tier*.
+
+    :param tier: The mix to classify.
+    :type tier: ModelTier
+    :rtype: Dict[str, str]
+    """
+    return {
+        name: model_via(value)
+        for name, value in (("primary", tier.primary),
+                            ("subagent", tier.subagent),
+                            ("background", tier.background))
+        if value
+    }
 
 
 @dataclass(frozen=True)
@@ -129,6 +223,53 @@ class ModelTier:
             "background": resolve_model(self.background) if self.background else None,
         }
 
+    def needs_proxy(self) -> bool:
+        """Whether any populated tier can only be reached through the proxy.
+
+        :rtype: bool
+
+        A *mixed* mix needs it too: the CLI has one ``ANTHROPIC_BEDROCK_BASE_URL``, so
+        as soon as one tier is Converse-only every tier goes through the proxy — which
+        is fine, because the proxy forwards Anthropic requests verbatim.
+        """
+        return "proxy" in tier_transports(self).values()
+
+    def validate(self, *, require_tools: bool = True) -> None:
+        """Raise :class:`TierError` if this mix cannot work as configured.
+
+        :param require_tools: Refuse a model that cannot drive a tool-using loop.
+            Leave ``True`` for anything agentic; set ``False`` only for a
+            single-turn text task.
+        :type require_tools: bool
+        :raises TierError: The mix is impossible, with the reason and the offending
+            tier named.
+
+        Two failures are caught here rather than at call time, because both are
+        knowable from the registry alone:
+
+        * A tier whose model has ``supports_tools=False`` cannot run an agent loop.
+          Assigned to ``subagent``, every delegated task fails; assigned to
+          ``primary``, the whole run does.
+        * A registry alias that resolves to nothing usable.
+        """
+        for name, value in (("primary", self.primary), ("subagent", self.subagent),
+                            ("background", self.background)):
+            if not value:
+                continue
+            known = MODELS.get(value)
+            if known is None:
+                # A raw id is allowed through — the registry cannot enumerate every
+                # Bedrock model, and refusing an unlisted id would be worse than
+                # letting the provider judge it.
+                continue
+            if require_tools and not known.supports_tools:
+                raise TierError(
+                    f"tier {name!r} is {value!r} ({known.provider}), which cannot "
+                    f"drive a tool-using loop"
+                    + (f": {known.notes}" if known.notes else "")
+                    + ". Pass require_tools=False only if this task needs no tools."
+                )
+
 
 # The canonical Anthropic tier (Opus orchestrates -> Sonnet subagents -> Haiku
 # background) and a sensible non-Anthropic default (GLM-5 orchestrates, delegates
@@ -148,6 +289,8 @@ def bedrock_model_env(
     sonnet: Optional[str] = None,
     haiku: Optional[str] = None,
     base_env: Optional[Mapping[str, str]] = None,
+    proxy_url: Optional[str] = None,
+    require_tools: bool = True,
 ) -> Dict[str, str]:
     """Build the env-var dict that points Claude Code at a Bedrock tier mix.
 
@@ -194,15 +337,53 @@ def bedrock_model_env(
             on top; the passed mapping is never mutated. Handy for building a
             subprocess environment in one call.
 
+        proxy_url: Base URL of a running :mod:`chia.models.proxy.server`. Required
+            whenever any tier is a Converse-only model, since the CLI cannot speak
+            that schema itself. When given, also sets the two flags the proxy needs:
+            ``CLAUDE_CODE_SKIP_BEDROCK_AUTH`` (the proxy verifies no signature) and
+            ``CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD`` (the proxy answers in
+            plain SSE rather than AWS binary event-stream framing).
+        require_tools: Forwarded to :meth:`ModelTier.validate`. Leave ``True`` for
+            anything agentic.
+
     Returns:
         A ``dict[str, str]`` of environment variables to set.
+
+    Raises:
+        TierError: The mix cannot work as configured — a tool-incapable model in an
+            agentic tier, or a Converse-only model with no ``proxy_url``. Refused here
+            rather than at call time: a grid that discovers its model choice was
+            impossible on row 200 has already spent 199 rows finding out.
     """
+    tier = ModelTier(primary=primary, subagent=subagent, background=background)
+    tier.validate(require_tools=require_tools)
+
+    proxied = [name for name, value in (("primary", primary), ("subagent", subagent),
+                                        ("background", background))
+               if value and requires_proxy(value)]
+    if proxied and not proxy_url:
+        raise TierError(
+            f"tier(s) {', '.join(sorted(proxied))} need a Converse translator "
+            f"(models: {', '.join(sorted(set(str(v) for v in (primary, subagent, background) if v)))}), "
+            f"which the Claude Code CLI cannot speak directly. Start "
+            f"chia.models.proxy.server and pass proxy_url=..., or choose Anthropic "
+            f"models for every tier."
+        )
+
     env: Dict[str, str] = dict(base_env) if base_env is not None else {}
 
     # Always: route to Bedrock + region.
     env["CLAUDE_CODE_USE_BEDROCK"] = "1"
     env["AWS_REGION"] = region
     env["AWS_DEFAULT_REGION"] = region
+
+    if proxy_url:
+        # One base URL for every tier, which is exactly why a mixed mix routes all of
+        # them through the proxy: it forwards Anthropic requests verbatim, so the
+        # cli_native tiers are unaffected by passing through it.
+        env["ANTHROPIC_BEDROCK_BASE_URL"] = proxy_url
+        env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] = "1"
+        env["CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD"] = "1"
 
     # Bearer-token auth only when explicitly supplied; otherwise leave auth to
     # the ambient AWS credential chain.
@@ -218,18 +399,29 @@ def bedrock_model_env(
         haiku if haiku is not None else DEFAULT_HAIKU_MODEL
     )
 
+    def _wire(name: str) -> str:
+        """The value to put in an env var for tier model *name*.
+
+        An Anthropic alias (``opus``/``sonnet``/``haiku``) is left as the alias, because
+        the ``ANTHROPIC_DEFAULT_*_MODEL`` pins above are what resolve it — that is the
+        CLI's own mechanism. A proxy-routed alias has no such pin, so it must be
+        resolved here or the CLI would send the literal string ``"glm5"`` as a model id
+        and Bedrock would reject it.
+        """
+        return resolve_model(name) if model_via(name) == "proxy" else name
+
     # Primary / orchestrator (the "Opus" role).
-    env["ANTHROPIC_MODEL"] = primary
+    env["ANTHROPIC_MODEL"] = _wire(primary)
 
     # Delegate tier: all Task-tool subagents (the "Sonnet" role).
     if subagent is not None:
-        env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent
+        env["CLAUDE_CODE_SUBAGENT_MODEL"] = _wire(subagent)
 
     # Background chores (the "Haiku" role). Sets the small/fast lever and, since
     # background chores are the Haiku tier, overrides the Haiku pin too.
     if background is not None:
-        env["ANTHROPIC_SMALL_FAST_MODEL"] = background
-        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = background
+        env["ANTHROPIC_SMALL_FAST_MODEL"] = _wire(background)
+        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = _wire(background)
 
     return env
 
