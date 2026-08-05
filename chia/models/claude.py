@@ -505,6 +505,9 @@ class ClaudeCodeLLM(LLMCallBase):
         from chia.trace.profiler import get_profiler
 
         profiler = get_profiler()
+        # Per-attempt metadata is cleared at the top of each attempt below, so the
+        # tokens a failed attempt burned have to be banked before that happens.
+        self.begin_retry_ledger()
 
         for attempt in range(self.retries):
             try:
@@ -550,8 +553,9 @@ class ClaudeCodeLLM(LLMCallBase):
                 raise
 
             # -- Retry once: stochastic generation may produce shorter output --
-            except MaxOutputTokensError:
+            except MaxOutputTokensError as exc:
                 if attempt == 0:
+                    self.note_retry(attempt, exc)
                     self.logger.warning(
                         "Max output tokens on attempt %d/%d, retrying once",
                         attempt + 1, self.retries,
@@ -560,8 +564,9 @@ class ClaudeCodeLLM(LLMCallBase):
                 raise
 
             # -- Retry with exponential backoff: transient API issue --
-            except ServerError:
+            except ServerError as exc:
                 backoff = min(5 * 2 ** attempt, 60)
+                self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning(
                     "Server error on attempt %d/%d, backing off %ds",
                     attempt + 1, self.retries, backoff,
@@ -570,26 +575,36 @@ class ClaudeCodeLLM(LLMCallBase):
 
             # -- Standard retry for unknown errors --
             except UnknownClaudeError as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unknown error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
 
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
                 # A timeout means the session was likely created;
                 # switch to --resume for subsequent attempts.
                 if self._session_id is not None and self._call_counter == 0:
                     self._call_counter = 1
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Timeout on attempt %d/%d", attempt + 1, self.retries,
                 )
 
             except Exception as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unexpected error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
-        return ClaudeCodeQueryResult(result="", returncode=-1, stderr="", stream_result="", success=False)
+        # Every attempt failed. The result carries no text, but it must still carry
+        # the accounting: the attempts were billed, and a caller summing spend over
+        # a grid would otherwise record the failures as free.
+        return self.attach_usage(
+            ClaudeCodeQueryResult(result="", returncode=-1, stderr="",
+                                  stream_result="", success=False),
+            meta={},
+        )
 
     def _sync_transcript(self, cli: ClaudeCodeQueryResult) -> ClaudeCodeQueryResult:
         """Copy a worker-captured transcript off *cli* onto this instance.

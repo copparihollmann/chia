@@ -410,6 +410,64 @@ def _merge_model(left: str, right: str) -> str:
     return ""
 
 
+@dataclass(frozen=True)
+class RetryAttempt:
+    """One failed attempt inside a backend's retry loop.
+
+    :param attempt: 1-based attempt number.
+    :param error_type: Exception class name (``"ServerError"``, ``"TimeoutExpired"``).
+    :param error: The exception rendered to a string, truncated.
+    :param backoff_s: Seconds slept before the next attempt; ``0.0`` for an
+        immediate retry.
+    :param usage: What the failed attempt itself consumed. Often all zeros — a
+        call that died before the provider returned a usage block burned nothing
+        chia can see — but non-zero whenever the provider billed the attempt.
+    :type attempt: int
+    :type error_type: str
+    :type error: str
+    :type backoff_s: float
+    :type usage: TokenUsage
+
+    A retry is charged like any other call, so an attempt that produced tokens and
+    then raised is real spend that the successful attempt's own counts do not
+    include. Backends record these through
+    :meth:`~chia.base.llm_call.LLMCallBase.note_retry`.
+    """
+
+    attempt: int
+    error_type: str
+    error: str
+    backoff_s: float = 0.0
+    usage: TokenUsage = None  # type: ignore[assignment]  # see __post_init__
+
+    #: Longest ``error`` string kept. A provider error body can be arbitrarily
+    #: large (an HTML error page, a full request echo), and this is destined for a
+    #: profiler event, not a debug log.
+    ERROR_MAX_CHARS = 500
+
+    def __post_init__(self):
+        if self.usage is None:
+            object.__setattr__(self, "usage", TokenUsage())
+        if len(self.error) > self.ERROR_MAX_CHARS:
+            object.__setattr__(
+                self, "error", self.error[: self.ERROR_MAX_CHARS] + "... [truncated]"
+            )
+
+    def as_event(self) -> dict:
+        """Render to a flat dict for :meth:`chia.trace.profiler.ChiaProfiler.log_event`.
+
+        :rtype: dict
+        """
+        event = {
+            "attempt": self.attempt,
+            "error_type": self.error_type,
+            "error": self.error,
+            "backoff_s": self.backoff_s,
+        }
+        event.update(self.usage.as_metadata())
+        return event
+
+
 def sum_usages(usages: Iterable[TokenUsage]) -> TokenUsage:
     """Accumulate *usages* into one, or an all-zero usage when empty.
 

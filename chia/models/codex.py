@@ -378,6 +378,10 @@ class CodexLLM(LLMCallBase):
 
         profiler = get_profiler()
         last_error = ""
+        # Per-attempt metadata is cleared at the top of each attempt below, so the
+        # tokens a failed attempt burned have to be banked before that happens.
+        self.begin_retry_ledger()
+
         for attempt in range(self.retries):
             try:
                 tool_list = tools or []
@@ -404,8 +408,9 @@ class CodexLLM(LLMCallBase):
                 return cli
             except (RateLimitError, AuthenticationError, BillingError, InvalidRequestError):
                 raise
-            except MaxOutputTokensError:
+            except MaxOutputTokensError as exc:
                 if attempt == 0:
+                    self.note_retry(attempt, exc)
                     self.logger.warning("Max output tokens on attempt %d/%d, retrying once",
                                         attempt + 1, self.retries)
                     continue
@@ -413,18 +418,24 @@ class CodexLLM(LLMCallBase):
             except ServerError as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 backoff = min(5 * 2 ** attempt, 60)
+                self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning("Server error on attempt %d/%d, backing off %ds",
                                     attempt + 1, self.retries, backoff)
                 _time.sleep(backoff)
             except (UnknownCodexError, subprocess.TimeoutExpired) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                self.note_retry(attempt, exc)
                 self.logger.warning("Codex attempt %d/%d failed: %s",
                                     attempt + 1, self.retries, exc)
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                self.note_retry(attempt, exc)
                 self.logger.warning("Unexpected Codex error on attempt %d/%d: %s",
                                     attempt + 1, self.retries, exc)
-        return CodexQueryResult(
+        # Every attempt failed. The result carries no text, but it must still
+        # carry the accounting: the attempts were billed, and a caller summing
+        # spend over a grid would otherwise record the failures as free.
+        return self.attach_usage(CodexQueryResult(
             result="",
             returncode=-1,
             stderr=last_error,
@@ -433,7 +444,7 @@ class CodexLLM(LLMCallBase):
             session_id=self._session_id,
             session_state=self._session_state,
             session_state_paths=self._session_state_paths,
-        )
+        ), meta={})
 
     def _sync_session(self, cli: CodexQueryResult) -> CodexQueryResult:
         """Copy worker-captured Codex session state onto this instance."""

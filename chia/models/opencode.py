@@ -398,6 +398,10 @@ class OpenCodeLLM(LLMCallBase):
 
         profiler = get_profiler()
 
+        # Per-attempt metadata is cleared at the top of each attempt below, so the
+        # tokens a failed attempt burned have to be banked before that happens.
+        self.begin_retry_ledger()
+
         for attempt in range(self.retries):
             try:
                 self._last_metadata = {}
@@ -428,8 +432,9 @@ class OpenCodeLLM(LLMCallBase):
                 raise
 
             # -- Retry once: stochastic generation may produce shorter output --
-            except MaxOutputTokensError:
+            except MaxOutputTokensError as exc:
                 if attempt == 0:
+                    self.note_retry(attempt, exc)
                     self.logger.warning(
                         "Max output tokens on attempt %d/%d, retrying once",
                         attempt + 1, self.retries,
@@ -438,8 +443,9 @@ class OpenCodeLLM(LLMCallBase):
                 raise
 
             # -- Retry with exponential backoff: transient service issue --
-            except ServerError:
+            except ServerError as exc:
                 backoff = min(5 * 2 ** attempt, 60)
+                self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning(
                     "Server error on attempt %d/%d, backing off %ds",
                     attempt + 1, self.retries, backoff,
@@ -447,22 +453,32 @@ class OpenCodeLLM(LLMCallBase):
                 _time.sleep(backoff)
 
             except UnknownOpenCodeError as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unknown error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
 
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Timeout on attempt %d/%d", attempt + 1, self.retries,
                 )
 
             except Exception as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unexpected error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
-        return QueryResult(result="", returncode=-1, stderr="", stream_result="", success=False)
+        # Every attempt failed. The result carries no text, but it must still
+        # carry the accounting: the attempts were billed, and a caller summing
+        # spend over a grid would otherwise record the failures as free.
+        return self.attach_usage(
+            QueryResult(result="", returncode=-1, stderr="",
+                        stream_result="", success=False),
+            meta={},
+        )
 
     def _get_node_id(self) -> str:
         try:
