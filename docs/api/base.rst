@@ -50,6 +50,16 @@ LLM Call
 
 .. automodule:: chia.base.llm_call
 
+Budget
+------
+
+A pre-flight spend ceiling. :func:`~chia.base.budget.check_budget` refuses a fan-out
+*before* it is dispatched, projecting the grid's cost from the run's own recorded
+per-call spend rather than from a price table. Subscription quota is reported beside the
+metered figure and never counted against a dollar cap.
+
+.. automodule:: chia.base.budget
+
 Token Usage
 -----------
 
