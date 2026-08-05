@@ -61,17 +61,30 @@ def _fc_part(name, args):
     return types.Part(function_call=types.FunctionCall(name=name, args=args))
 
 
-def _resp(parts, finish="STOP", in_tok=0, out_tok=0):
+def _resp(parts, finish="STOP", in_tok=0, out_tok=0,
+          cached_tok=None, thoughts_tok=None):
+    """A generate_content response.
+
+    ``cached_tok`` / ``thoughts_tok`` default to *absent*: Gemini populates
+    ``cached_content_token_count`` only with context caching and
+    ``thoughts_token_count`` only on thinking models, and ``in_tok`` follows the
+    real API in being the whole prompt, cached content included.
+    """
+    usage_kwargs = {
+        "prompt_token_count": in_tok,
+        "candidates_token_count": out_tok,
+        "total_token_count": in_tok + out_tok + (thoughts_tok or 0),
+    }
+    if cached_tok is not None:
+        usage_kwargs["cached_content_token_count"] = cached_tok
+    if thoughts_tok is not None:
+        usage_kwargs["thoughts_token_count"] = thoughts_tok
     return types.GenerateContentResponse(
         candidates=[types.Candidate(
             content=types.Content(role="model", parts=parts),
             finish_reason=getattr(types.FinishReason, finish),
         )],
-        usage_metadata=types.GenerateContentResponseUsageMetadata(
-            prompt_token_count=in_tok,
-            candidates_token_count=out_tok,
-            total_token_count=in_tok + out_tok,
-        ),
+        usage_metadata=types.GenerateContentResponseUsageMetadata(**usage_kwargs),
     )
 
 
@@ -267,6 +280,67 @@ def test_generate_no_tools_request_shaping_and_result(monkeypatch):
     assert llm._last_metadata["output_tokens"] == 5
     assert llm._last_metadata["num_turns"] == 1
     assert llm._last_metadata["model"] == "gemini-2.0-flash-001"
+
+
+def test_generate_splits_cached_content_out_of_fresh_input(monkeypatch):
+    """Gemini's ``prompt_token_count`` is the *whole* prompt, cached content
+    included. Recording it all as fresh input prices the cached part at up to 4x
+    its real rate, and dropping ``cached_content_token_count`` leaves the run
+    unpriced."""
+    capture = {"calls": []}
+    _install_fake_genai(
+        monkeypatch,
+        [_resp([_text_part("PONG")], "STOP", in_tok=16_255, out_tok=5,
+               cached_tok=15_345)],
+        capture,
+    )
+
+    llm = VertexGeminiLLM(model="gemini-2.5-pro", project="p", location="us-central1")
+    cli = llm.prompt("ping", tools=[])
+
+    assert cli.usage.cache_read_input_tokens == 15_345
+    assert cli.usage.input_tokens == 910            # fresh only
+    assert cli.usage.billed_input_tokens == 16_255  # nothing lost
+
+
+def test_generate_counts_thinking_tokens_as_billed_output(monkeypatch):
+    """``thoughts_token_count`` is billed at the output rate but reported *outside*
+    ``candidates_token_count``, so leaving it out under-counts output. It is folded
+    into output_tokens and also kept as a breakdown."""
+    capture = {"calls": []}
+    _install_fake_genai(
+        monkeypatch,
+        [_resp([_text_part("PONG")], "STOP", in_tok=10, out_tok=50,
+               thoughts_tok=450)],
+        capture,
+    )
+
+    llm = VertexGeminiLLM(model="gemini-2.5-pro", project="p", location="us-central1")
+    cli = llm.prompt("ping", tools=[])
+
+    assert cli.usage.output_tokens == 500
+    assert cli.usage.reasoning_tokens == 450
+    # Consistent with every other backend: reasoning is inside output, so it is
+    # not double-counted in the total.
+    assert cli.usage.total_tokens == 510
+
+
+def test_generate_usage_is_absent_field_tolerant(monkeypatch):
+    """A non-thinking model with no context cache reports neither field."""
+    capture = {"calls": []}
+    _install_fake_genai(
+        monkeypatch,
+        [_resp([_text_part("PONG")], "STOP", in_tok=10, out_tok=5)],
+        capture,
+    )
+
+    llm = VertexGeminiLLM(model="gemini-2.0-flash-001", project="p",
+                          location="us-central1")
+    cli = llm.prompt("ping", tools=[])
+
+    assert cli.usage.input_tokens == 10
+    assert cli.usage.cache_read_input_tokens == 0
+    assert cli.usage.reasoning_tokens == 0
 
 
 def test_generate_tool_loop_executes_mcp_and_feeds_results(monkeypatch):

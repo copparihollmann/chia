@@ -461,7 +461,8 @@ class VertexGeminiLLM(LLMCallBase):
             contents = [types.Content(
                 role="user", parts=[types.Part.from_text(text=user_message)]
             )]
-            meta = {"input_tokens": 0, "output_tokens": 0, "num_turns": 0}
+            meta = {"input_tokens": 0, "output_tokens": 0, "num_turns": 0,
+                    "cache_read_input_tokens": 0, "reasoning_tokens": 0}
             final_text = ""
 
             for _ in range(self.max_tool_iterations):
@@ -481,8 +482,7 @@ class VertexGeminiLLM(LLMCallBase):
                 meta["num_turns"] += 1
                 usage = getattr(resp, "usage_metadata", None)
                 if usage is not None:
-                    meta["input_tokens"] += getattr(usage, "prompt_token_count", 0) or 0
-                    meta["output_tokens"] += getattr(usage, "candidates_token_count", 0) or 0
+                    self._record_usage(usage, meta)
 
                 candidate = (resp.candidates or [None])[0]
                 if candidate is None or candidate.content is None:
@@ -592,6 +592,44 @@ class VertexGeminiLLM(LLMCallBase):
             stderr="",
             stream_result="".join(stream_parts),
         )
+
+    @staticmethod
+    def _record_usage(usage, meta: dict) -> None:
+        """Accumulate one ``generate_content`` response's usage into *meta*.
+
+        :param usage: A response's ``usage_metadata``. Fields are read via
+            ``getattr`` because which ones are populated depends on the model —
+            ``cached_content_token_count`` only appears with context caching, and
+            ``thoughts_token_count`` only on thinking models.
+        :param meta: The call's canonical usage dict, updated in place.
+        :type usage: Any
+        :type meta: dict
+
+        Two Gemini-specific conventions have to be translated, and getting either
+        wrong misstates the call:
+
+        * ``prompt_token_count`` is the *whole* prompt, cached content included.
+          ``cached_content_token_count`` is subtracted out so ``input_tokens`` means
+          fresh input, matching every other backend — otherwise a cached prompt is
+          priced entirely at the fresh-input rate.
+        * ``thoughts_token_count`` is billed at the output rate but reported
+          *outside* ``candidates_token_count``. It is therefore added into
+          ``output_tokens`` and also recorded on its own as ``reasoning_tokens``,
+          which keeps chia's invariant that reasoning tokens are a breakdown of
+          output rather than a fourth billable class.
+        """
+        def _int(name: str) -> int:
+            value = getattr(usage, name, 0) or 0
+            return int(value) if isinstance(value, (int, float)) else 0
+
+        prompt_tokens = _int("prompt_token_count")
+        cached = min(_int("cached_content_token_count"), prompt_tokens)
+        thoughts = _int("thoughts_token_count")
+
+        meta["input_tokens"] += prompt_tokens - cached
+        meta["cache_read_input_tokens"] += cached
+        meta["output_tokens"] += _int("candidates_token_count") + thoughts
+        meta["reasoning_tokens"] += thoughts
 
     @staticmethod
     def _sanitize_schema(schema):
