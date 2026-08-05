@@ -256,6 +256,111 @@ Live spend: $0.32 for all ten cells.
 
 ---
 
+## 10. The same token count, billed 2.45x apart — and a chia run drawn by aet
+
+The sharpest version of claims 1–3, and the one artifact that shows chia's telemetry
+travelling all the way into a figure. Full method, data and the $0 replay route are in
+[`../aet_trajectory/README.md`](../aet_trajectory/README.md).
+
+Two live arms, eight `ClaudeCodeLLM.prompt` calls each, same prompts and model
+(`us.anthropic.claude-haiku-4-5-20251001-v1:0`), run back to back. The only difference is
+whether the run started against a cold provider cache or inherited a warm one.
+
+| arm | input | output | cache **written** | cache **read** | total tokens | cost |
+|-----|------:|-------:|------------------:|---------------:|-------------:|-----:|
+| cold | 80 | 616 | 28,156 | 123,236 | **152,088** | **$0.0541** |
+| warm | 80 | 603 | 0 | 151,392 | **152,075** | **$0.0221** |
+
+**The token counts agree to within 0.01%. The cost differs by 2.45x.** Every bit of the gap
+is which cache class the tokens landed in — a write bills at 1.25x the input rate, a read at
+0.1x. A two-class (input/output) model prices these two runs identically, and so does any
+model recording only `input + output + cache_total`. This is the four-class argument as a
+measured number rather than an assertion.
+
+![cumulative spend for both arms, endpoint-labelled with total cost and tokens](../aet_trajectory/figures/cost_vs_time.png)
+
+The endpoint labels are the figure: `$0.05 · 152k` against `$0.02 · 152k`. Rendered by
+`aet plot --kind cost-vs-time` directly from the chia run directories, with no chia code in
+the rendering path — chia's venv has aet but no matplotlib, aet's has matplotlib but no chia,
+and the two processes share nothing but the directory. A figure coming out of the far side is
+the claim being tested, which is why that split is documented as evidence rather than hidden
+behind a wrapper.
+
+![cumulative tokens and spend for the cold arm, cache reads and writes drawn separately](../aet_trajectory/figures/trajectory.png)
+
+The same run under `--split-cache`. Reads run about 4.4x the writes in token count while the
+spend line climbs at a rate the writes dominate. Both figures ship the CSV subset they drew
+(`../aet_trajectory/figures/trajectory.csv`, `trajectory_warm.csv`), and replaying the
+committed per-call log reproduces that CSV byte for byte — asserted by a test, not by prose.
+
+This also found two defects one layer down, in aet itself: `log_trajectory_point` recorded
+only the cache *sum*, so `--split-cache` drew two lines flat at zero for every
+log-reconstructed run, and the flag did not exist on `aet plot` at all. Both fixed on
+`fix/trajectory-cache-split`.
+
+---
+
+## Running a non-Anthropic model: the two routes for GLM-5
+
+Both routes are measured above (figures 4–6); this collects them in one place, because "how
+do I run GLM" is the question the proxy exists to answer.
+
+| route | what runs | mean $/call | input tok | provider calls | cost source |
+|-------|-----------|------------:|----------:|---------------:|-------------|
+| **opencode** | `OpenCodeLLM(model="amazon-bedrock/zai.glm-5")` | **$0.01304** | 12,588 | 1.0 | billed |
+| **Claude Code + proxy** | CLI via `chia.models.proxy` | $0.03423 | 55,495 | 3.6 | estimated |
+| Claude Code, native | — | **impossible** | — | — | the CLI's Bedrock transport cannot speak Converse |
+| `BedrockLLM` direct | Converse API, no agent loop | $0.00048 | 137 | 1.0 | estimated |
+
+n=5 each, all 5/5 passed.
+
+**With opencode** — the cheaper agent harness, and the simpler one. Nothing to start, no
+sidecar:
+
+```python
+from chia.models.opencode import OpenCodeLLM
+llm = OpenCodeLLM(model="amazon-bedrock/zai.glm-5")     # provider/model, via opencode's own
+result = llm.prompt("...", tools=[])                     # amazon-bedrock provider
+```
+
+At equal model it is **2.62x cheaper than the proxied CLI** and sends a quarter of the prompt
+tokens, because opencode's own loop is leaner than Claude Code's. Its cost is `billed` — the
+figure opencode reports is the figure. Implementation: [`chia/models/opencode.py`](../../chia/models/opencode.py).
+Note opencode's catalogue carries no cross-region prefix for some ids where Bedrock does;
+copying a Bedrock id across verbatim is what produced a false "no route to this model" skip in
+an earlier run of this grid. `available_models()` and `diagnose_model()` exist for that.
+
+**With Claude Code** — [`chia/models/proxy/`](../../chia/models/proxy/), a local
+Bedrock-shaped sidecar that translates Anthropic-Messages to Converse and streams back in AWS
+event-stream framing:
+
+```bash
+python -m chia.models.proxy.server --port 8123 \
+    --usage-log examples/harness_study/data/proxy_usage.jsonl &
+```
+```python
+from chia.models.bedrock_config import bedrock_model_env
+env = bedrock_model_env(primary="glm5", subagent="nova-pro",
+                        proxy_url="http://127.0.0.1:8123")
+```
+
+`translate.py` does the conversion, `eventstream.py` the framing, `server.py` the endpoint.
+The registry entry is `chia/models/bedrock_config.py:121` (`"glm5" → zai.glm-5`), and
+`NON_ANTHROPIC_TIER` there is a worked GLM-5 tier mix.
+
+**So why use the proxy at all, when opencode is cheaper?** Not for cost or for reach —
+opencode wins on both, and this study says so in figure 5. The proxy buys exactly one thing:
+the *Claude Code harness* — subagents, hooks, skills, session resume — on a model Claude Code
+cannot otherwise reach. If you do not need those, use opencode.
+
+**Two cautions if you do use it.** Start the proxy with `--usage-log`: without it the only
+cost figure available is the CLI's own, and for a non-Anthropic model the CLI prices a Claude
+call it did not make — it over-reported by **8.26x** here ($0.283 claimed against $0.034
+measured), and marked it authoritative. And never pass `--framing sse`: it is kept only for
+compatibility and doubles provider spend (figure 7).
+
+---
+
 ## Three figures that were cut, and why
 
 Drawn, looked at, removed. What they said is kept here as text, which is the form it
