@@ -1,0 +1,12 @@
+run_id,source,model,retries,retry_tokens_recoverable
+atlas-npu_b1_r1_vpu_r1.8c069e26,results_jsonl,,2,no
+atlas-npu_b1_r2_whole_r2.c7ac0f03,results_jsonl,,2,no
+atlas-npu_b2_r1_lsu_r1.76f660aa,results_jsonl,,2,no
+atlas-npu_b2_r1_lsu_r2.69ba8b4d,results_jsonl,,2,no
+atlas-npu_b2_r1_mxu_r1.f1f3f670,results_jsonl,,2,no
+atlas-npu_b2_r1_mxu_r2.18c95e49,results_jsonl,,2,no
+atlas-npu_b2_r1_vpu_r1.b12aae47,results_jsonl,,2,no
+atlas-npu_b2_r1_vpu_r2.7602d6f3,results_jsonl,,2,no
+atlas-npu_b2_r2_whole_r1.545aaa73,results_jsonl,,2,no
+atlas-npu_b2_r2_whole_r2.22f884a1,results_jsonl,,2,no
+atlas-npu_b2r_r1_mxu_r3_opus.0c335472,results_jsonl,,2,no
