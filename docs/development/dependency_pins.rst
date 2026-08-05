@@ -74,7 +74,7 @@ Offline suite results:
 Suite                                        3.13 + exact pins           3.12 + relaxed
 ===========================================  ==========================  ==========================
 ``chia/models/tests`` + ``chia/trace/test``  (not re-run under pins)     331 passed, 125 skipped
-``chia/base/test``                           8 failed, 39 passed, 1 err  8 failed, 39 passed, 1 err
+``chia/base/test``                           9 failed, 43 passed, 1 err  9 failed, 43 passed, 1 err
 ``chia/cluster/test``                        73 passed, 27 errors        73 passed, 27 errors
 ===========================================  ==========================  ==========================
 
@@ -93,7 +93,7 @@ That is necessary but not sufficient. What it does *not* show:
 Pre-existing failures, correctly attributed
 -------------------------------------------
 
-The 8 failures and 1 error above are **not** version-related, and it would be easy to
+The 9 failures and 1 error above are **not** version-related, and it would be easy to
 misread them as evidence for or against a pin change. They reproduce identically under
 both environments, and in isolation:
 
@@ -110,6 +110,14 @@ both environments, and in isolation:
    the single test is run alone, so it is not test-ordering. A real defect in cache-actor
    discovery from a worker, or a missing fixture that starts the cache — either way,
    unrelated to pins.
+
+``chia/base/test/test_colocated_live.py::test_unsatisfiable_dispatch_raises``
+   Fails in a full-directory run and **passes on its own**, so this one *is*
+   test-ordering: the files in this directory share a single Ray instance and this test
+   depends on the cluster's resource state. A test-isolation problem rather than a code
+   defect, and also unrelated to pins. Counted here because an earlier version of this
+   page said "8 failures" and omitted it — a dossier arguing for a dependency change has
+   to get its own baseline right, or every number after it is suspect.
 
 ``chia/cluster/test`` (27 errors)
    Cloud-tunnel tests that need AWS/GCP credentials. Environment, not code.
