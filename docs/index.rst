@@ -41,6 +41,12 @@ Originally CHIA stood for:
 
 .. toctree::
    :maxdepth: 2
+   :caption: Development
+
+   development/dependency_pins
+
+.. toctree::
+   :maxdepth: 2
    :caption: User Guides
 
    user_guides/reference
