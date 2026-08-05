@@ -201,6 +201,61 @@ by being run, are in [`../sandbox_overhead/README.md`](../sandbox_overhead/READM
 
 ---
 
+## 9. The cheap tier saves less than the rate card says, and costs latency
+
+No figure: n=5 per arm over two arms is five small integers, which rule 4 says is a table.
+
+One factor, two levels. Same harness (`cli_native`), same task and oracle as figure 4, same
+region, fresh temp cwd per cell. Only `ModelTier(primary=...)` changes. Warm-cache rows only —
+`haiku` rep0 paid a cold cache write and is excluded from the means and named below, because
+averaging one cold call into four warm ones reports neither state.
+
+| arm | n (warm) | passed | mean $/call | mean output tok | mean wall |
+|-----|---------:|-------:|------------:|----------------:|----------:|
+| sonnet | 5 | **5/5** | $0.042388 | 134 | 5.31 s |
+| haiku | 4 | **5/5** | $0.018593 | 924 | 9.66 s |
+
+Three things, and the first is the one worth the run:
+
+**The realized saving is 2.28x where the rate card says 3.0x.** Haiku is billed at exactly one
+third of Sonnet's per-token rate in every class. It came out 2.28x cheaper, because it emitted
+**6.9x more output tokens** — 924 against 134 — for the same task, under a prompt that says
+"Reply with ONLY the function in a single ```python code block. No explanation." A tier-mix
+cost projection built from a rate table overstates the saving by about a quarter here, and the
+error is in the direction that flatters the decision to switch.
+
+**It costs 1.8x wall-clock.** 9.66 s against 5.31 s, which follows from the token count: the
+cheap tier's advantage is per token and it spends more of them.
+
+**Quality is not measured.** Both arms are 5/5, so this task cannot distinguish them — it is
+saturated, not tied, and n=5 could not resolve a small difference even on a task that
+discriminated. The cost and token figures are mechanical and low-variance; the pass rate here
+is a floor on "neither arm is broken" and nothing more.
+
+### What this does not measure, and why not
+
+`ModelTier` has three levers and this measures **one**. `subagent` and `background` set
+`CLAUDE_CODE_SUBAGENT_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL`, and measuring them would need
+two things that are not true here:
+
+- **The task would have to delegate.** This one is a single-turn code question with no tools,
+  so a subagent model is never invoked. Varying it would be inert by construction, and the
+  null result would measure the task rather than the feature.
+- **chia would have to record per-model usage.** It does not.
+  `ClaudeCodeLLM._last_metadata` carries one `model` field and one set of token counts, folded
+  across every model the CLI called — and the CLI *does* call more than one, sending a separate
+  cheap request for the session title. So even on a delegating task, chia's own telemetry
+  cannot say which tier served which call. `aet.tracking.claude_stream.ModelUsage` exists for
+  precisely this shape and chia does not populate it. **That gap is the finding here**: the
+  subagent and background levers are currently unfalsifiable through chia's telemetry, which
+  is a stronger reason to fix the telemetry than to run an arm that could not have failed.
+
+Running a tier-mix arm anyway and reporting "no detectable effect" would have been true and
+worthless. Script: [`tier_ablation.py`](tier_ablation.py). Source: `data/tier_ablation.csv`.
+Live spend: $0.32 for all ten cells.
+
+---
+
 ## Three figures that were cut, and why
 
 Drawn, looked at, removed. What they said is kept here as text, which is the form it
@@ -241,9 +296,10 @@ number, not on lines saved. Source: `data/deletion_ratio.csv`.
 - **Quality.** n=5 per cell establishes cost, which is mechanical and low-variance. It
   establishes nothing about success rates, and no figure here claims to. 48 of 50 live
   cells passed; the 2 failures were on the two non-Anthropic models.
-- **The tier-mix ablation.** Whether delegating subagent turns to a cheap model degrades
-  the outcome is the measurement that would make `ModelTier` more than configuration.
-  Not run.
+- **The tier-mix ablation's other two levers.** Figure 9 measures `ModelTier(primary=...)`.
+  Whether delegating *subagent* turns to a cheap model degrades the outcome is still not
+  measured, and cannot be until chia records per-model usage from the CLI stream — see
+  figure 9 for why that is the blocking gap rather than a scope choice.
 - **Leakage.** Whether a sandbox changes an experiment's score, and how often an agent
   reaches a denied path, is the validity claim behind the per-call sandbox. The mechanism
   is covered by tests that run real `bwrap`; the *rate* is not measured.
@@ -273,6 +329,10 @@ python examples/harness_study/collect.py \
 python -m chia.models.proxy.server --port 8123 \
     --usage-log examples/harness_study/data/proxy_usage.jsonl &
 python examples/harness_study/grid.py --repeats 5 --cap-usd 15
+
+# The tier ablation (figure 9). No proxy needed: both arms are Anthropic, on the CLI's
+# native Bedrock transport. --dry-run resolves and validates the arms without calling.
+python examples/harness_study/tier_ablation.py --repeats 5 --cap-usd 5
 ```
 
 The last live run: 60 cells, 50 of them live, **$0.53** of metered spend. `check_budget`
