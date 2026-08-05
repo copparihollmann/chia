@@ -1,9 +1,10 @@
 
 import warnings
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
 from chia.base.tools.ChiaTool import ChiaTool
+from chia.base.sandbox import SandboxSpec, wrap_argv
 from chia.base.usage import BillingMode, RetryAttempt, TokenUsage, sum_usages
 
 
@@ -76,11 +77,19 @@ class LLMCallBase(ABC):
     # found). See :mod:`chia.base.usage` for why the distinction is tracked.
     billing_mode: BillingMode = "per_token"
 
+    # Whether this backend spawns a subprocess that a per-call sandbox can wrap.
+    # False for the raw-API backends (bedrock, vertex, openai_compat, the claude
+    # "api" backend): there is no child process, the request goes out over HTTP from
+    # this one, and pretending otherwise would report isolation that does not exist.
+    supports_sandbox: bool = False
+
     def __init__(
         self,
         system_message: str,
         dangerously_skip_permissions=UNSET,
         config=UNSET,
+        sandbox_spec=UNSET,
+        sandbox_backend: str = "none",
     ):
         self.system_message = system_message
         cls = type(self).__name__
@@ -108,6 +117,38 @@ class LLMCallBase(ABC):
         # object). ``None`` means "allow all". Honored only where
         # supports_config is True.
         self.config = None if config is UNSET else config
+
+        if sandbox_spec is not UNSET and not self.supports_sandbox:
+            warnings.warn(
+                f"{cls} does not support a per-call sandbox; 'sandbox_spec' is "
+                f"ignored. This backend issues its request from this process rather "
+                f"than spawning an agent, so there is no child to isolate.",
+                stacklevel=2,
+            )
+        # What one call may see, and how to enforce it. ``None`` plus
+        # sandbox_backend="none" is the default: unisolated, and recorded as such.
+        self.sandbox_spec: Optional[SandboxSpec] = (
+            None if sandbox_spec is UNSET else sandbox_spec)
+        self.sandbox_backend = sandbox_backend
+
+    def sandbox_argv(self, argv: Sequence[str]) -> List[str]:
+        """Return *argv* wrapped for this instance's sandbox.
+
+        :param argv: The command a backend is about to spawn.
+        :type argv: Sequence[str]
+        :rtype: List[str]
+        :raises chia.base.sandbox.SandboxError: The configured backend is unusable
+            on this host. Deliberately fatal: silently running unisolated would
+            invalidate every number the run produces, and a run whose isolation
+            claim is wrong is worse than one that failed.
+
+        Every CLI backend calls this immediately before spawning. It also resolves
+        ``argv[0]`` to an absolute path even with no sandbox configured, because a
+        bare program name resolves against the *sandbox's* ``PATH`` once wrapped —
+        and a not-found binary surfaces as an empty response, indistinguishable from
+        a model that declined to answer.
+        """
+        return wrap_argv(argv, self.sandbox_spec, self.sandbox_backend)
 
     def attach_usage(
         self,

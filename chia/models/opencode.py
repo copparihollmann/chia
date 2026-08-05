@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Union
 import ray
 
 from chia.base.ChiaFunction import ChiaFunction
-from chia.base.llm_call import QueryResult, LLMCallBase
+from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
 from chia.base.usage import normalize_usage_keys
 
 if TYPE_CHECKING:
@@ -313,6 +313,10 @@ class OpenCodeLLM(LLMCallBase):
 
     # Honors both --dangerously-skip-permissions and a `permission` config block.
     supports_dangerously_skip_permissions = True
+
+    # A per-call sandbox can wrap the ``opencode`` subprocess, so `sandbox=` is honored
+    # (see chia.base.sandbox).
+    supports_sandbox = True
     supports_config = True
 
     def __init__(
@@ -331,10 +335,14 @@ class OpenCodeLLM(LLMCallBase):
         additional_providers: Optional[List[AdditionalModelProvider]] = None,
         dangerously_skip_permissions: bool = True,
         config: Optional[dict] = None,
+        sandbox_spec=UNSET,
+        sandbox_backend: str = "none",
     ):
         super().__init__(system_message=system_message,
                          dangerously_skip_permissions=dangerously_skip_permissions,
-                         config=config)
+                         config=config,
+                         sandbox_spec=sandbox_spec,
+                         sandbox_backend=sandbox_backend)
         self.logging_level = logging_level
         self.logging_name = logging_name
         self.retries = retries
@@ -667,7 +675,11 @@ class OpenCodeLLM(LLMCallBase):
         env["OPENCODE_CONFIG"] = cfg_path
         env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
 
-        run_cmd = self._build_run_cmd(user_message)
+        # Only the agent invocation is sandboxed, not the follow-up `export`: the
+        # export is chia reading opencode's own session store (outside the workspace)
+        # to recover the answer, so isolating it would break bookkeeping without
+        # withholding anything from the agent, which has already exited.
+        run_cmd = self.sandbox_argv(self._build_run_cmd(user_message))
         self.logger.info("Running: %s ...", " ".join(run_cmd[:6]))
 
         try:

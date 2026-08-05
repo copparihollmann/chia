@@ -349,6 +349,10 @@ class ClaudeCodeLLM(LLMCallBase):
     # it's left out for now rather than shoehorned in.
     supports_dangerously_skip_permissions = True
 
+    # A per-call sandbox can wrap the ``claude`` subprocess, so `sandbox_spec=` is
+    # honored (see chia.base.sandbox).
+    supports_sandbox = True
+
     # Env vars whose presence means the CLI is authenticating against a metered
     # endpoint rather than spending a subscription seat's quota. Checked in the
     # process that actually runs the CLI (a Ray worker), which is why this is a
@@ -390,10 +394,14 @@ class ClaudeCodeLLM(LLMCallBase):
         sonnet_model: Optional[str] = None,
         haiku_model: Optional[str] = None,
         config=UNSET,
+        sandbox_spec=UNSET,
+        sandbox_backend: str = "none",
     ):
         super().__init__(system_message=system_message,
                          dangerously_skip_permissions=dangerously_skip_permissions,
-                         config=config)
+                         config=config,
+                         sandbox_spec=sandbox_spec,
+                         sandbox_backend=sandbox_backend)
         self.logging_level = logging_level
         self.logging_name = logging_name
         self.retries = retries
@@ -929,7 +937,7 @@ class ClaudeCodeLLM(LLMCallBase):
         tools: Optional[List[ChiaTool]] = None,
     ) -> ClaudeCodeQueryResult:
         """Run claude with simple capture (no event streaming)."""
-        cmd = self._build_cmd(tools)
+        cmd = self.sandbox_argv(self._build_cmd(tools))
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
         env = self._subprocess_env()
 
@@ -983,7 +991,7 @@ class ClaudeCodeLLM(LLMCallBase):
         ``log_dir`` was set on the constructor, the same entries are
         also mirrored to ``<prefix>.log`` on disk.
         """
-        cmd = self._build_cmd(tools)
+        cmd = self.sandbox_argv(self._build_cmd(tools))
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
         env = self._subprocess_env()
 
