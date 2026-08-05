@@ -60,6 +60,33 @@ THINKING_CAPABLE = ("claude", "anthropic.", "deepseek", "qwen3", "glm")
 #: Model families with Bedrock prompt caching, i.e. where a ``cachePoint`` is honored.
 CACHE_CAPABLE = ("claude", "anthropic.", "nova")
 
+#: Per-family ``maxTokens`` ceilings, longest-key-wins like the model registry.
+#:
+#: ``max_tokens`` is **not portable**. The Claude Code CLI sends one value for every
+#: model — 32000, observed — and each Converse family enforces its own limit. Passing the
+#: CLI's value straight through makes Bedrock reject the request with a
+#: ``ValidationException``, the CLI retries, and the run fails in a way that looks like a
+#: provider outage rather than a translation bug. This was found by running the grid, not
+#: by reading the docs: every Nova cell failed with "The maximum tokens you requested
+#: exceeds the model limit of 10000".
+#:
+#: Clamping is the faithful translation. A request the target cannot serve is not a
+#: faithful rendering of a request the source could, and refusing instead would make a
+#: whole model family unusable over a parameter the caller never chose.
+MAX_OUTPUT_TOKENS = {
+    "nova-micro": 10_000,
+    "nova-lite": 10_000,
+    "nova-pro": 10_000,
+    "nova": 10_000,
+    "llama": 8_192,
+    "mistral": 8_192,
+    "command": 4_096,
+}
+
+#: Ceiling applied when no family entry matches — the CLI's own observed request, so a
+#: family with a higher real limit loses nothing it was going to use.
+DEFAULT_MAX_OUTPUT_TOKENS = 32_000
+
 
 def is_anthropic_model(model_id: str) -> bool:
     """Whether *model_id* speaks Anthropic Messages natively.
@@ -79,6 +106,25 @@ def is_anthropic_model(model_id: str) -> bool:
 def _family_supports(model_id: str, families: Iterable[str]) -> bool:
     lowered = (model_id or "").lower()
     return any(token in lowered for token in families)
+
+
+def max_output_tokens(model_id: str) -> int:
+    """The ``maxTokens`` ceiling for *model_id*.
+
+    :param model_id: A Bedrock model or inference-profile id.
+    :type model_id: str
+    :rtype: int
+
+    Resolved longest-key-wins over :data:`MAX_OUTPUT_TOKENS`, falling back to
+    :data:`DEFAULT_MAX_OUTPUT_TOKENS`. See that constant for why clamping rather than
+    forwarding is the faithful translation.
+    """
+    lowered = (model_id or "").lower()
+    best: Optional[str] = None
+    for key in MAX_OUTPUT_TOKENS:
+        if key in lowered and (best is None or (len(key), key) > (len(best), best)):
+            best = key
+    return MAX_OUTPUT_TOKENS[best] if best else DEFAULT_MAX_OUTPUT_TOKENS
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +304,9 @@ def to_converse(body: dict, model_id: str) -> dict:
 
     inference: Dict[str, Any] = {}
     if isinstance(body.get("max_tokens"), int):
-        inference["maxTokens"] = body["max_tokens"]
+        # Clamped, not forwarded: see MAX_OUTPUT_TOKENS. The CLI's value is the upper
+        # bound the caller asked for, so min() never grants more than was requested.
+        inference["maxTokens"] = min(body["max_tokens"], max_output_tokens(model_id))
     for source, dest in (("temperature", "temperature"), ("top_p", "topP")):
         if isinstance(body.get(source), (int, float)):
             inference[dest] = body[source]

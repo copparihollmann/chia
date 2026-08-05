@@ -132,3 +132,70 @@ these zeros are reported as they came out.
   artifact that recorded only a merged cache figure carry it in
   `cache_unsplit_tokens` rather than being guessed into one of the two classes, and
   the figures that need the split exclude them and say so.
+
+## The harness × model study (`grid.py`, live)
+
+Run 2026-08-05, 24 cells (2 repeats × 3 models × 4 harnesses), **$0.54 of metered
+spend** against a `--cap-usd 15` ceiling. `check_budget` ran before dispatch and, on a
+second invocation, correctly reported `~$0.1189/call from 16 recorded` — the projection
+learning from the run's own history, which is the whole design.
+
+| harness | model | n | pass | $/task | median wall |
+|---|---|---:|---:|---:|---:|
+| `converse` | nova-lite | 2 | 2/2 | $0.00004 | 4.4 s |
+| `converse` | glm5 | 2 | 2/2 | $0.0004 | 24.1 s |
+| `converse` | sonnet | 2 | 2/2 | $0.0027 | 9.4 s |
+| `cli_native` | sonnet | 2 | 2/2 | $0.0096 | 5.5 s |
+| `cli_proxy` | sonnet | 2 | 2/2 | $0.0096 | 8.3 s |
+| `cli_proxy` | nova-lite | 2 | 2/2 | $0.0856\* | 9.9 s |
+| `cli_proxy` | glm5 | 2 | 2/2 | $0.1605\* | 15.8 s |
+| `cli_native` | nova-lite, glm5 | — | — | — | structurally impossible |
+| `opencode` | sonnet | 2 | — | — | harness failed on this host |
+
+### What it shows
+
+**The proxy works, live.** `cli_proxy` × `glm5` and `cli_proxy` × `nova-lite` are 2/2 on
+a graded task, driven by the real Claude Code CLI. Those are the two cells `cli_native`
+cannot reach at all — the skip rows are not missing data, they *are* the finding.
+
+**The proxy costs nothing at the same model.** `cli_native` and `cli_proxy` both come to
+$0.0096/task on sonnet. Translation is free; what is not free is the harness.
+
+**The harness dominates cost at fixed model.** Sonnet costs $0.0027/task through raw
+Converse and $0.0096 through the CLI — **3.6×** — because the CLI sends a ~23 KB system
+prompt plus ten tool definitions before the task even starts. The right-hand panel is
+that difference: ~275 billed input tokens for Converse against ~23,000 for the CLI. In
+the very first (cold-cache) call the CLI cost **$0.089**, nine times its warm figure,
+because those 23 k tokens were cache *writes* at a 25% premium; every later call reads
+them at a tenth of the fresh rate. A two-class accounting cannot see either effect,
+which is the point of `chia.base.usage`.
+
+**So: why not just use opencode?** This run cannot answer that. opencode is installed on
+this host but `opencode run` exits 1 with *"Unexpected server error"* and an empty
+response, so its two cells are recorded as `harness_failed`, excluded from the figure, and
+**not** reported as 0/2. A harness that never answered has not answered wrongly; plotting
+an environment failure as a quality result is exactly the misleading claim this study
+exists to avoid. The comparison against opencode remains open.
+
+### Two caveats that are part of the result
+
+\* **The CLI's self-reported cost for a proxied non-Anthropic model is wrong, and it is
+marked `billed`.** The CLI prices what it thinks is a Claude call, so it reports $0.16 for
+a GLM-5 task that raw Converse shows really costs $0.0004 — an overstatement of roughly
+**400×**. `cost_source="billed"` then marks that figure as authoritative. For a proxied
+model the honest cost has to come from the proxy's own Converse usage priced against the
+real model's rates, not from the CLI. The `converse` rows are the trustworthy ones for
+non-Anthropic models, and until that is fixed the starred figures should be read as
+"Anthropic-equivalent", not as spend.
+
+**`cli_proxy` reports no token counts.** Its billed-input bar is empty because the
+proxy's SSE re-framing carries the CLI's cost but not its token breakdown back into
+`QueryResult.usage`. The bar means "not recorded", not "sends nothing" — the request is
+byte-identical to `cli_native`'s, whose 23 k tokens are measured.
+
+### What was not run
+
+The plan's confirmatory tier (spec's nl2spec grid, replayed from cassettes) and the
+tier-mix ablation were not run. n=2 per cell is enough to establish the harness *cost*
+effect, which is large and mechanical, and nowhere near enough for a quality comparison —
+every proportion above is over 2 trials and is labelled as such.

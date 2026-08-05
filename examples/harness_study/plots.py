@@ -467,6 +467,8 @@ FIGURE_FUNCS: Dict[str, Callable[[], None]] = {
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # `choices` is read at call time, not at module definition time, so a figure
+    # registered further down the file (harness_effect) is still selectable.
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("figures", nargs="*", choices=sorted(FIGURE_FUNCS) or None,
                        help="figures to draw (default: all)")
@@ -474,6 +476,125 @@ def main(argv: Optional[List[str]] = None) -> int:
     for name in args.figures or sorted(FIGURE_FUNCS):
         FIGURE_FUNCS[name]()
     return 0
+
+
+# ---------------------------------------------------------------------------
+# 6 — the harness effect at fixed model
+# ---------------------------------------------------------------------------
+
+
+def fig_harness_effect() -> None:
+    """Cost and pass rate per harness, at a fixed model. The plot that justifies — or
+    fails to justify — the Converse proxy.
+
+    Reads ``data/harness_grid.csv`` (produced by ``grid.py``). Skipped cells are drawn
+    as absent rather than as zeros: an empty ``cli_native`` column for a Converse-only
+    model is the hole the proxy exists to fill, and drawing it as a zero would read as
+    "free and never passes".
+    """
+    plt = _require_matplotlib()
+    path = DATA / "harness_grid.csv"
+    if not path.is_file():
+        print(f"skipping harness_effect: {path} not found (run grid.py first)")
+        return
+    with path.open(newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+    # Three categories, and conflating any two would misreport the comparison:
+    #   live    — the harness ran and answered; a quality datum.
+    #   skipped — structurally impossible (no route from that harness to that model).
+    #   failed  — the harness never produced an answer (auth, config, provider outage).
+    # A failed harness plotted as 0/n would report an environment problem as a quality
+    # result, which is precisely the misleading claim this study exists to avoid.
+    failed = [r for r in rows if r.get("harness_failed") == "1"]
+    live = [r for r in rows
+            if not r["skipped_reason"] and r.get("harness_failed") != "1"]
+    skipped = [r for r in rows if r["skipped_reason"]]
+    if not live:
+        print("skipping harness_effect: no live rows")
+        return
+
+    harness_order = [h for h in ("converse", "cli_native", "cli_proxy", "opencode")
+                     if any(r["harness"] == h for r in live)]
+    model_order = sorted({r["model"] for r in live})
+    palette = {"converse": C_CORRECT, "cli_native": C_NEUTRAL,
+               "cli_proxy": C_ACCENT, "opencode": "#805ad5"}
+
+    fig, (left, right) = plt.subplots(1, 2, figsize=(9.6, 3.5),
+                                      gridspec_kw={"wspace": 0.3})
+
+    width = 0.8 / max(len(harness_order), 1)
+    drawn = []
+    for h_index, harness in enumerate(harness_order):
+        xs, ys, labels = [], [], []
+        for m_index, model in enumerate(model_order):
+            cells = [r for r in live
+                     if r["harness"] == harness and r["model"] == model
+                     and r["cost_usd"]]
+            if not cells:
+                continue
+            costs = [float(r["cost_usd"]) for r in cells]
+            mean_cost = sum(costs) / len(costs)
+            xs.append(m_index + h_index * width - 0.4 + width / 2)
+            ys.append(mean_cost)
+            passed = sum(1 for r in cells if r["passed"] == "1")
+            labels.append(f"{passed}/{len(cells)}")
+            drawn.append({"harness": harness, "model": model, "n": len(cells),
+                          "passed": passed, "mean_cost_usd": round(mean_cost, 6)})
+        if not xs:
+            continue
+        left.bar(xs, ys, width=width, color=palette.get(harness, C_NEUTRAL),
+                 label=harness)
+        for x, y, label in zip(xs, ys, labels):
+            left.text(x, y, f" {label}", ha="center", va="bottom", fontsize=6.5,
+                      rotation=90)
+
+    left.set_xticks(range(len(model_order)))
+    left.set_xticklabels(model_order)
+    left.set_yscale("log")
+    left.set_ylabel("mean $ per task (log)")
+    left.set_xlabel("model (bars annotated pass/n)")
+    left.set_title("Cost per task at fixed model, by harness", loc="left",
+                   fontsize=9.5)
+    left.legend(frameon=False, fontsize=7.5, ncol=2)
+
+    # The prompt each harness sends, which is what the cost difference is made of.
+    for h_index, harness in enumerate(harness_order):
+        cells = [r for r in live if r["harness"] == harness]
+        if not cells:
+            continue
+        billed_in = [int(r["input_tokens"] or 0) + int(r["cache_read_tokens"] or 0)
+                     + int(r["cache_creation_tokens"] or 0) for r in cells]
+        right.bar(h_index, sum(billed_in) / len(billed_in),
+                  color=palette.get(harness, C_NEUTRAL), width=0.6)
+    right.set_xticks(range(len(harness_order)))
+    right.set_xticklabels(harness_order, rotation=20, ha="right", fontsize=8)
+    right.set_yscale("log")
+    right.set_ylabel("mean billed input tokens (log)")
+    right.set_title("What each harness sends per task", loc="left", fontsize=9.5)
+
+    n_live = len(live)
+    fig.suptitle(
+        "At the same model, the harness — not the model — dominates cost per task",
+        fontsize=10, y=1.04,
+    )
+    failed_note = ""
+    if failed:
+        harnesses = sorted({r["harness"] for r in failed})
+        failed_note = (f"; {len(failed)} cell(s) excluded because the harness itself "
+                       f"never answered ({', '.join(harnesses)} — see the error column, "
+                       f"an environment failure, NOT a wrong answer)")
+    fig.text(0.5, -0.18,
+             f"{n_live} live cell(s), {len(skipped)} structurally impossible and drawn "
+             f"as absent rather than as zero{failed_note}. Every rate is over the n in "
+             f"its own bar.",
+             ha="center", fontsize=7.5, color=C_NEUTRAL, wrap=True)
+    _save(fig, "harness_effect", drawn,
+          ["harness", "model", "n", "passed", "mean_cost_usd"])
+    plt.close(fig)
+
+
+FIGURE_FUNCS["harness_effect"] = fig_harness_effect
 
 
 if __name__ == "__main__":
