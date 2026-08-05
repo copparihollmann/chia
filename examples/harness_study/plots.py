@@ -425,9 +425,12 @@ def fig_harness_cost() -> None:
         for m_index, model in enumerate(models):
             if any(e["harness"] == harness and e["model"] == model for e in drawn):
                 continue
-            ax.text(m_index + h_index * width - 0.4 + width / 2, ax.get_ylim()[0],
-                    " no route ", rotation=90, ha="center", va="bottom", fontsize=6.5,
-                    color=C_NEUTRAL)
+            # y in *axes* coordinates via get_xaxis_transform, not data coordinates. On a
+            # log axis the lower data limit is not yet settled when this runs, and placing
+            # text there once produced a 108,000-pixel-tall PNG.
+            ax.text(m_index + h_index * width - 0.4 + width / 2, 0.02,
+                    "no route", rotation=90, ha="center", va="bottom", fontsize=6.5,
+                    color=C_NEUTRAL, transform=ax.get_xaxis_transform())
 
     ax.set_xticks(range(len(models)))
     ax.set_xticklabels(models)
@@ -458,11 +461,14 @@ def fig_harness_cost() -> None:
     total_passed = sum(p for p, _ in passes)
     total_n = sum(n for _, n in passes)
     fig.text(0.5, -0.30,
-             f"{total_n} live cells, n={total_n // max(len(drawn), 1)} per cell, median of "
-             f"each cell. Task solved in {total_passed}/{total_n} — too few trials to rank "
-             f"the harnesses on quality, which is why only cost is drawn. Nova and GLM "
-             f"costs use estimated rates (see pricing.py).",
-             ha="center", fontsize=7.5, color=C_NEUTRAL, wrap=True)
+             f"{total_n} live cells, n={total_n // max(len(drawn), 1)}, median per cell. "
+             f"Solved in {total_passed}/{total_n} — too few trials to rank quality, which "
+             f"is why only cost is drawn. Bars absent where the harness has no route.\n"
+             f"The widest gaps mix two causes: prompt overhead (see prompt_overhead) and "
+             f"extra turns — cli_proxy x glm5 took 4 provider calls per task where the "
+             f"others took 1-2.\nNova and GLM use estimated rates (pricing.py); the "
+             f"Anthropic figures use published ones.",
+             ha="center", fontsize=7.5, color=C_NEUTRAL)
     _save(fig, "harness_cost", drawn,
           ["harness", "model", "n", "passed", "median_cost_usd", "mean_cost_usd",
            "median_billed_input_tokens"])
@@ -874,14 +880,25 @@ def fig_cold_start() -> None:
         f"{entry['harness']} at run {entry['repeat']}"
         for entry in drawn if entry["cache_creation_tokens"]
     )
-    flat = sorted({entry["harness"] for entry in drawn
-                   if not any(e["cache_creation_tokens"] for e in drawn
-                              if e["harness"] == entry["harness"])})
+    # Two different reasons a series can be flat, and they must not be conflated: a
+    # harness that sends no cacheable prompt at all, and one whose cache was already warm
+    # for every run in this grid.
+    harnesses = sorted({entry["harness"] for entry in drawn})
+    uncached, already_warm = [], []
+    for harness in harnesses:
+        own = [e for e in drawn if e["harness"] == harness]
+        if any(e["cache_creation_tokens"] for e in own):
+            continue
+        (already_warm if any(e["cache_read_tokens"] for e in own)
+         else uncached).append(harness)
     note = (f"Left: five consecutive runs of one task per harness. Cache write observed "
             f"in: {', '.join(cold_runs) if cold_runs else 'none'}. Which run is the cold "
             f"one depends on cache TTL, not on position.")
-    if flat:
-        note += (f" {', '.join(flat)} sends no cacheable prompt at all, so it is flat.")
+    if uncached:
+        note += f" {', '.join(uncached)} sends no cacheable prompt at all."
+    if already_warm:
+        note += (f" {', '.join(already_warm)} is flat because its cache was already warm "
+                 f"for every run here, not because it has none.")
     fig.text(0.5, -0.18, note, ha="center", fontsize=7.5, color=C_NEUTRAL, wrap=True)
     _save(fig, "cold_start", drawn,
           ["harness", "repeat", "cost_usd", "cache_creation_tokens",
