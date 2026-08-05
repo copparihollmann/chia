@@ -5,7 +5,7 @@ from chia.trace.profiler import (
 )
 
 __all__ = [
-    "get_tracer", "MetricsLogger", "MetricsBackend", "register_backend",
+    "MetricsLogger", "MetricsBackend", "register_backend",
     "get_profiler", "ChiaProfiler",
     "start_collector", "get_collector",
 ]
