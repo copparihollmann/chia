@@ -99,6 +99,86 @@ class LLMCallBase(ABC):
         # object). ``None`` means "allow all". Honored only where
         # supports_config is True.
         self.config = None if config is UNSET else config
+        # Optional record/replay store; see :meth:`recorded_prompt`. None means no
+        # recording, which is the default: a cassette that intercepted every call
+        # implicitly would be a surprising thing for a framework to do.
+        self.cassette = None
+
+    # ------------------------------------------------------------------
+    # Record / replay
+    # ------------------------------------------------------------------
+
+    @property
+    def provider_id(self) -> str:
+        """Backend identity for a cassette key — the class name.
+
+        The same prompt through a subprocess CLI and through an API is not the same call, so
+        ``ClaudeCodeLLM`` and ``BedrockLLM`` must never share a recording even on an identical
+        model id. Overridable by a backend that fronts more than one transport.
+        """
+        return type(self).__name__
+
+    def recorded_prompt(
+        self,
+        user_message: str,
+        tools: Optional[List[ChiaTool]] = None,
+        *,
+        variant: str = "",
+    ) -> QueryResult:
+        """:meth:`prompt`, served from ``self.cassette`` when it has this call recorded.
+
+        :param user_message: The prompt.
+        :param tools: Passed through to :meth:`prompt`.
+        :param variant: Discriminator for two calls that send identical bytes — in practice the
+            repetition index. **Pass it for every repetition of a grid cell.** Without it,
+            repetition 2 of a condition is a cache hit on repetition 1, and a run that looks
+            like N samples per cell is one sample reported N times.
+        :type user_message: str
+        :type tools: Optional[List[ChiaTool]]
+        :type variant: str
+        :rtype: QueryResult
+        :raises chia.base.cassette.CassetteMiss: In ``replay_only`` mode with nothing recorded.
+
+        Defined here rather than in each backend so every backend inherits it, and calls
+        ``self.prompt`` polymorphically so a backend needs no changes to become recordable.
+        With no cassette set this is exactly :meth:`prompt`, minus the ``@ChiaFunction``
+        dispatch — a caller wanting remote execution *and* recording should set the cassette on
+        the driver and call this from the driver, because a per-worker cassette would shard the
+        store by worker and lose most of its hits.
+        """
+        import time
+
+        cassette = self.cassette
+        if cassette is None:
+            return self.prompt(user_message, tools if tools is not None else [])
+
+        from chia.base.cassette import CassetteEntry
+
+        model_version = getattr(self, "model", "") or ""
+        key, entry = cassette.lookup(
+            user_message, self.provider_id, model_version,
+            system_message=getattr(self, "system_message", "") or "",
+            variant=variant,
+        )
+        if entry is not None:
+            # The recorded usage is returned verbatim: re-deriving the same cost with nothing
+            # spent is the point. It is the *original* call's usage, so a spend rollup must
+            # consult Cassette.summary() rather than adding a replayed run to a ledger.
+            return entry.result
+
+        started = time.perf_counter()
+        result = self.prompt(user_message, tools if tools is not None else [])
+        cassette.put(CassetteEntry(
+            key=key,
+            prompt=user_message,
+            provider_id=self.provider_id,
+            result=result,
+            model_version=model_version,
+            system_message=getattr(self, "system_message", "") or "",
+            variant=variant,
+            original_wall_s=time.perf_counter() - started,
+        ))
+        return result
 
     def attach_usage(
         self,
