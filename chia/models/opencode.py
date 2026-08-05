@@ -234,6 +234,110 @@ def parse_run_error(stdout: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Diagnosing an error opencode declined to explain
+#
+# opencode answers a wrong model id, an unconfigured provider and a genuine internal
+# fault with the same payload:
+#
+#     {"name":"UnknownError","data":{"message":"Unexpected server error. Check server
+#      logs for details.","ref":"err_19dcabf5"}}
+#
+# and the real cause is not recoverable from anything chia can read. Two dead ends,
+# checked rather than assumed (opencode 1.18.10): the ``ref`` never appears in
+# ``~/.local/share/opencode/log/opencode.log`` — the line carrying it is written only to
+# stderr under ``--print-logs`` — and passing ``--print-logs`` deadlocks when stdout is
+# redirected to a file, which is how this module has to capture the run stream (see
+# ``_capture``).
+#
+# So the cause is inferred instead, from the one thing that *is* cheap to ask for: the
+# catalogue. A model id opencode does not have will never succeed, no matter how many
+# times it is retried.
+#
+# Why this is worth code: reported as-is, a configuration mistake is indistinguishable
+# from a provider outage. An experiment then records "the harness failed on this host"
+# where the truth was "the caller passed an id this provider does not have" — a wrong
+# result, not a poor message. That happened, in examples/harness_study.
+# ---------------------------------------------------------------------------
+
+#: Substring of the message opencode returns when it has masked the real cause.
+MASKED_ERROR_MARKER = "Check server logs for details"
+
+
+def available_models(opencode_bin: str = "opencode",
+                     env: Optional[Dict[str, str]] = None,
+                     timeout: int = 60) -> List[str]:
+    """Every ``provider/model`` id opencode can currently route to.
+
+    :param opencode_bin: The opencode executable.
+    :param env: Environment for the subprocess; defaults to the current one. Matters
+        because a provider only appears once its credentials are visible.
+    :param timeout: Seconds to wait.
+    :type opencode_bin: str
+    :type env: Optional[Dict[str, str]]
+    :type timeout: int
+    :rtype: List[str]
+
+    ``opencode models`` makes no model call, so this is free. Returns ``[]`` if opencode
+    cannot be run at all — a diagnosis helper must not be able to fail a call.
+    """
+    try:
+        proc = subprocess.run(
+            [opencode_bin, "models"], capture_output=True, text=True,
+            env=env if env is not None else dict(os.environ), timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if proc.returncode != 0:
+        return []
+    return [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+
+
+def diagnose_model(model: Optional[str], opencode_bin: str = "opencode",
+                   env: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """Why *model* cannot be used, when the answer is "opencode does not have it".
+
+    :param model: The ``provider/model`` id that was requested.
+    :param opencode_bin: The opencode executable.
+    :param env: Environment for the catalogue lookup.
+    :type model: Optional[str]
+    :type opencode_bin: str
+    :type env: Optional[Dict[str, str]]
+    :rtype: Optional[str]
+
+    Returns a message naming the closest available ids, or ``None`` when the model *is* in
+    the catalogue (so the failure was something else) or when the catalogue could not be
+    read (so nothing can be concluded). ``None`` means "no diagnosis", never "fine".
+
+    The near-miss list is the useful part. The mistake this exists to catch is a Bedrock
+    id carrying a cross-region prefix opencode's catalogue does not use —
+    ``amazon-bedrock/us.amazon.nova-lite-v1:0`` against its
+    ``amazon-bedrock/amazon.nova-lite-v1:0`` — which reads as a typo only once both are
+    on screen together.
+    """
+    if not model:
+        return None
+    catalogue = available_models(opencode_bin, env)
+    if not catalogue or model in catalogue:
+        return None
+
+    import difflib
+
+    close = difflib.get_close_matches(model, catalogue, n=3, cutoff=0.6)
+    if not close:
+        provider = model.split("/", 1)[0]
+        same_provider = [m for m in catalogue if m.startswith(provider + "/")]
+        close = same_provider[:3]
+        if not same_provider:
+            providers = sorted({m.split("/", 1)[0] for m in catalogue if "/" in m})
+            return (f"model {model!r} is not in opencode's catalogue, and it has no "
+                    f"provider {provider!r} configured at all "
+                    f"({len(catalogue)} models across: {', '.join(providers)})")
+    suggestion = ", ".join(close)
+    return (f"model {model!r} is not in opencode's catalogue of {len(catalogue)} "
+            f"models. Closest available: {suggestion}")
+
+
+# ---------------------------------------------------------------------------
 # Custom model providers
 # ---------------------------------------------------------------------------
 
@@ -410,6 +514,12 @@ class OpenCodeLLM(LLMCallBase):
         # tokens a failed attempt burned have to be banked before that happens.
         self.begin_retry_ledger()
 
+        # Tracked because on exhaustion this method used to return a QueryResult with an
+        # empty stderr, discarding every reason it had. A caller then knows only that
+        # something failed self.retries times, which is how a configuration mistake gets
+        # recorded as an unavailable harness.
+        last_error = ""
+
         for attempt in range(self.retries):
             try:
                 self._last_metadata = {}
@@ -452,6 +562,7 @@ class OpenCodeLLM(LLMCallBase):
 
             # -- Retry with exponential backoff: transient service issue --
             except ServerError as exc:
+                last_error = str(exc)
                 backoff = min(5 * 2 ** attempt, 60)
                 self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning(
@@ -462,6 +573,7 @@ class OpenCodeLLM(LLMCallBase):
 
             except UnknownOpenCodeError as exc:
                 self.note_retry(attempt, exc)
+                last_error = str(exc)
                 self.logger.warning(
                     "Unknown error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
@@ -469,21 +581,24 @@ class OpenCodeLLM(LLMCallBase):
 
             except subprocess.TimeoutExpired as exc:
                 self.note_retry(attempt, exc)
+                last_error = f"timed out after {self.timeout_seconds}s"
                 self.logger.warning(
                     "Timeout on attempt %d/%d", attempt + 1, self.retries,
                 )
 
             except Exception as exc:
                 self.note_retry(attempt, exc)
+                last_error = f"{type(exc).__name__}: {exc}"
                 self.logger.warning(
                     "Unexpected error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
-        # Every attempt failed. The result carries no text, but it must still
-        # carry the accounting: the attempts were billed, and a caller summing
-        # spend over a grid would otherwise record the failures as free.
+        # Every attempt failed. The result carries no text, but it must still carry two
+        # things: the accounting (the attempts were billed, and a caller summing spend over
+        # a grid would otherwise record the failures as free) and the reason (otherwise the
+        # caller learns only that something failed N times).
         return self.attach_usage(
-            QueryResult(result="", returncode=-1, stderr="",
+            QueryResult(result="", returncode=-1, stderr=last_error,
                         stream_result="", success=False),
             meta={},
         )
@@ -570,6 +685,17 @@ class OpenCodeLLM(LLMCallBase):
                         node_id, exit_code=cli.returncode, raw_message=message,
                     )
                 raise InvalidRequestError(node_id, cli.returncode, message)
+
+            # An error opencode declined to explain. Before reporting it as unknown, ask
+            # the catalogue whether the model id is even routable: a wrong id is the
+            # commonest cause and the one that must not be retried, because it cannot
+            # start working. Without this the run is retried self.retries times and then
+            # reported as an unavailable harness.
+            if MASKED_ERROR_MARKER in message or (name == "UnknownError" and
+                                                  data.get("ref")):
+                diagnosis = diagnose_model(self.model, self.opencode_bin)
+                if diagnosis:
+                    raise InvalidRequestError(node_id, cli.returncode, diagnosis)
 
             # Any other structured error (MessageAbortedError, UnknownError, ...).
             raise UnknownOpenCodeError(

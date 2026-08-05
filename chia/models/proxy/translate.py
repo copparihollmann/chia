@@ -34,7 +34,7 @@ change that alters the schema fails a test instead of failing a grid.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 #: Model-id substrings whose family speaks Anthropic Messages natively, so the CLI's
 #: request can be forwarded to Bedrock untranslated.
@@ -372,15 +372,23 @@ def to_anthropic_sse(
     *,
     model: str,
     message_id: str = "msg_chia_proxy",
+    on_usage: Optional[Callable[[dict], None]] = None,
 ) -> Iterator[bytes]:
     """Translate a Converse event stream into Anthropic SSE frames.
 
     :param events: Converse stream events (``messageStart``, ``contentBlockDelta``, ...).
     :param model: Model id to echo back in ``message_start``.
     :param message_id: Id to echo back; the CLI does not require a real one.
+    :param on_usage: Called once with the final Anthropic-shaped usage dict, before the
+        closing frames are emitted. This is the only place the *real* token counts for a
+        proxied call exist: the client downstream prices what it believes it called, so
+        for a non-Anthropic model its self-reported cost is wrong by whatever the two
+        models' rates differ by. A caller that wants correct accounting has to read the
+        counts here.
     :type events: Iterable[dict]
     :type model: str
     :type message_id: str
+    :type on_usage: Optional[Callable[[dict], None]]
     :rtype: Iterator[bytes]
 
     A generator, so the CLI starts receiving tokens as Bedrock produces them rather
@@ -485,10 +493,17 @@ def to_anthropic_sse(
         yield _sse("content_block_stop",
                    {"type": "content_block_stop", "index": index})
 
+    final_usage = usage or usage_to_anthropic(None)
+    if on_usage is not None:
+        # Deliberately not wrapped in try/except: a recorder that raises is a bug in the
+        # recorder, and swallowing it here would produce a stream that looks fine while
+        # silently accounting for nothing.
+        on_usage(dict(final_usage))
+
     delta_payload = {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": usage or usage_to_anthropic(None),
+        "usage": final_usage,
     }
     if converse_stop_reason and converse_stop_reason != stop_reason:
         # Preserved rather than lost: Anthropic has no guardrail/content-filter stop
