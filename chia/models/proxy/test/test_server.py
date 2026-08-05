@@ -82,8 +82,12 @@ class _FakeBedrock:
         return {"body": _Body()}
 
 
-def _client(fake):
-    return TestClient(build_app(client=fake))
+def _client(fake, framing="sse"):
+    """A test client. Defaults to ``sse`` framing because most of these tests assert on
+    the *content* of the stream, and SSE is the readable form of it. The default framing
+    the server actually ships (``eventstream``) has its own tests below, decoded with
+    botocore's parser rather than a second implementation of the format."""
+    return TestClient(build_app(client=fake, framing=framing))
 
 
 def _sse_events(text):
@@ -311,7 +315,7 @@ def test_a_translated_call_records_the_converse_counts(tmp_path):
                                 "cacheWriteInputTokens": 7}}},
     ])
 
-    client = TestClient(build_app(client=fake, usage_log=log))
+    client = TestClient(build_app(client=fake, usage_log=log, framing="sse"))
     response = client.post(f"/model/{GLM}/invoke-with-response-stream",
                            json={"messages": [{"role": "user", "content": "ping"}]})
     assert response.status_code == 200
@@ -333,7 +337,7 @@ def test_a_passthrough_call_records_usage_accumulated_across_frames(tmp_path):
     """Anthropic reports input on message_start and output on message_delta, so reading
     either frame alone gives half the bill."""
     log = tmp_path / "usage.jsonl"
-    client = TestClient(build_app(client=_FakeBedrock(), usage_log=log))
+    client = TestClient(build_app(client=_FakeBedrock(), usage_log=log, framing="sse"))
 
     client.post(f"/model/{SONNET}/invoke-with-response-stream",
                 json={"messages": [{"role": "user", "content": "ping"}]})
@@ -362,7 +366,7 @@ def test_a_restated_running_total_is_not_counted_twice(tmp_path):
             return {"body": [{"chunk": {"bytes": json.dumps(f).encode()}}
                              for f in frames]}
 
-    client = TestClient(build_app(client=_Restating(), usage_log=log))
+    client = TestClient(build_app(client=_Restating(), usage_log=log, framing="sse"))
     client.post(f"/model/{SONNET}/invoke-with-response-stream",
                 json={"messages": [{"role": "user", "content": "ping"}]})
 
@@ -373,7 +377,7 @@ def test_a_restated_running_total_is_not_counted_twice(tmp_path):
 
 def test_the_non_streaming_paths_record_too(tmp_path):
     log = tmp_path / "usage.jsonl"
-    client = TestClient(build_app(client=_FakeBedrock(), usage_log=log))
+    client = TestClient(build_app(client=_FakeBedrock(), usage_log=log, framing="sse"))
 
     client.post(f"/model/{GLM}/invoke",
                 json={"messages": [{"role": "user", "content": "ping"}]})
@@ -392,7 +396,7 @@ def test_every_call_gets_a_line_even_with_no_usage_reported(tmp_path):
     the harness make" is one of the questions the log answers."""
     log = tmp_path / "usage.jsonl"
     fake = _FakeBedrock(stream=[{"messageStop": {"stopReason": "end_turn"}}])
-    client = TestClient(build_app(client=fake, usage_log=log))
+    client = TestClient(build_app(client=fake, usage_log=log, framing="sse"))
 
     for _ in range(3):
         client.post(f"/model/{GLM}/invoke-with-response-stream",
@@ -405,7 +409,7 @@ def test_every_call_gets_a_line_even_with_no_usage_reported(tmp_path):
 
 def test_recording_is_off_unless_asked_for(tmp_path, monkeypatch):
     monkeypatch.delenv("CHIA_PROXY_USAGE_LOG", raising=False)
-    client = TestClient(build_app(client=_FakeBedrock()))
+    client = TestClient(build_app(client=_FakeBedrock(), framing="sse"))
 
     response = client.post(f"/model/{SONNET}/invoke-with-response-stream",
                            json={"messages": [{"role": "user", "content": "ping"}]})
@@ -418,7 +422,7 @@ def test_the_env_var_enables_recording_without_a_flag(tmp_path, monkeypatch):
     log = tmp_path / "from-env.jsonl"
     monkeypatch.setenv("CHIA_PROXY_USAGE_LOG", str(log))
 
-    client = TestClient(build_app(client=_FakeBedrock()))
+    client = TestClient(build_app(client=_FakeBedrock(), framing="sse"))
     client.post(f"/model/{SONNET}/invoke-with-response-stream",
                 json={"messages": [{"role": "user", "content": "ping"}]})
 
@@ -479,3 +483,140 @@ def test_main_refuses_to_bind_a_non_loopback_host_without_the_opt_out():
 
     with pytest.raises(SystemExit):
         main(["--host", "0.0.0.0", "--port", "8123"])
+
+
+# ---------------------------------------------------------------------------
+# Response framing
+#
+# The proxy shipped SSE first, with CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD=1 on
+# the client, and it looked like it worked: the CLI printed the answer. It was not working.
+# With usage recording on, every proxied turn reached Bedrock twice — the streaming route
+# and then, same body, /invoke. The CLI was failing to parse the SSE and silently retrying
+# non-streaming, so the proxy was doubling provider spend while the client's own accounting
+# reported one call.
+#
+# These decode with **botocore's** parser, not a hand-rolled one. The format has two CRCs
+# and a parser rejects a message on either mismatch, which client-side is
+# indistinguishable from a network fault — so "my encoder agrees with my decoder" is worth
+# nothing here.
+# ---------------------------------------------------------------------------
+
+
+def _eventstream_events(body: bytes):
+    """Decode an AWS event-stream body into the model events it carries."""
+    import base64
+
+    from botocore.eventstream import EventStreamBuffer
+
+    buffer = EventStreamBuffer()
+    buffer.add_data(body)
+    out = []
+    for event in buffer:
+        payload = json.loads(event.payload)
+        inner = json.loads(base64.b64decode(payload["bytes"]))
+        out.append((dict(event.headers), inner))
+    return out
+
+
+def test_the_default_framing_is_what_the_cli_asks_for():
+    """Not SSE. The default has to be the one that does not make the client pay twice."""
+    fake = _FakeBedrock(stream=[
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "PONG"}}},
+        {"messageStop": {"stopReason": "end_turn"}},
+        {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 2}}},
+    ])
+
+    response = TestClient(build_app(client=fake)).post(
+        f"/model/{GLM}/invoke-with-response-stream",
+        json={"messages": [{"role": "user", "content": "ping"}]})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith(
+        "application/vnd.amazon.eventstream")
+
+
+def test_the_framing_decodes_with_botocores_own_parser():
+    fake = _FakeBedrock(stream=[
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "PO"}}},
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "NG"}}},
+        {"messageStop": {"stopReason": "end_turn"}},
+        {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 2,
+                                "cacheReadInputTokens": 100}}},
+    ])
+
+    response = TestClient(build_app(client=fake)).post(
+        f"/model/{GLM}/invoke-with-response-stream",
+        json={"messages": [{"role": "user", "content": "ping"}]})
+
+    events = _eventstream_events(response.content)
+    headers, first = events[0]
+    assert headers[":message-type"] == "event"
+    assert headers[":event-type"] == "chunk"
+    assert headers[":content-type"] == "application/json"
+    assert first["type"] == "message_start"
+
+    text = "".join(payload["delta"]["text"] for _, payload in events
+                   if payload.get("type") == "content_block_delta")
+    assert text == "PONG"
+
+    # The cache buckets survive the extra framing layer. They are the reason the four-class
+    # accounting works through the proxy at all.
+    delta = next(p for _, p in events if p.get("type") == "message_delta")
+    assert delta["usage"]["cache_read_input_tokens"] == 100
+
+
+def test_the_frame_count_matches_the_event_count():
+    """One message per event, so a client that counts frames sees what was sent. A frame
+    carrying two events, or an empty trailing frame, both parse but misreport the stream."""
+    fake = _FakeBedrock(stream=[
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "a"}}},
+        {"contentBlockStop": {"contentBlockIndex": 0}},
+        {"messageStop": {"stopReason": "end_turn"}},
+    ])
+
+    response = TestClient(build_app(client=fake)).post(
+        f"/model/{GLM}/invoke-with-response-stream",
+        json={"messages": [{"role": "user", "content": "ping"}]})
+
+    kinds = [payload["type"] for _, payload in _eventstream_events(response.content)]
+    assert kinds == ["message_start", "content_block_start", "content_block_delta",
+                     "content_block_stop", "message_delta", "message_stop"]
+
+
+def test_the_passthrough_path_is_framed_too():
+    """An Anthropic model needs no body translation, but it needs the same framing — it was
+    the passthrough path that exposed the double-billing."""
+    response = TestClient(build_app(client=_FakeBedrock())).post(
+        f"/model/{SONNET}/invoke-with-response-stream",
+        json={"messages": [{"role": "user", "content": "ping"}]})
+
+    assert response.headers["content-type"].startswith(
+        "application/vnd.amazon.eventstream")
+    kinds = [payload["type"] for _, payload in _eventstream_events(response.content)]
+    assert kinds[0] == "message_start"
+
+
+def test_usage_is_still_recorded_under_the_binary_framing(tmp_path):
+    """The recorder hangs off the translation layer, not the transport, but that is a
+    design claim until a test holds it."""
+    from chia.models.proxy.server import read_usage_log
+
+    log = tmp_path / "usage.jsonl"
+    fake = _FakeBedrock(stream=[
+        {"messageStop": {"stopReason": "end_turn"}},
+        {"metadata": {"usage": {"inputTokens": 7, "outputTokens": 3}}},
+    ])
+
+    TestClient(build_app(client=fake, usage_log=log)).post(
+        f"/model/{GLM}/invoke-with-response-stream",
+        json={"messages": [{"role": "user", "content": "ping"}]})
+
+    line, = read_usage_log(log)
+    assert (line["input_tokens"], line["output_tokens"]) == (7, 3)
+
+
+def test_an_unknown_framing_is_refused_at_construction():
+    """Rather than at the first request, where it would surface as a stream the client
+    cannot read."""
+    with pytest.raises(ValueError):
+        build_app(client=_FakeBedrock(), framing="protobuf")

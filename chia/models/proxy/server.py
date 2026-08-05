@@ -6,7 +6,6 @@ Run this as a per-worker sidecar and point the CLI at it::
 
     CLAUDE_CODE_USE_BEDROCK=1 \\
     CLAUDE_CODE_SKIP_BEDROCK_AUTH=1 \\
-    CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD=1 \\
     ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:8123 \\
     ANTHROPIC_MODEL=zai.glm-5 \\
     CLAUDE_CODE_SUBAGENT_MODEL=us.amazon.nova-pro-v1:0 \\
@@ -22,8 +21,8 @@ separate levers, so one proxy can route each tier to a different provider.
 surface — the decisive advantage over pulling in a general-purpose LLM gateway, and it
 keeps tool-call and cache-token fidelity under chia's own tests.
 
-Three env vars, and why each is needed
---------------------------------------
+Two env vars, and why each is needed
+------------------------------------
 
 ``CLAUDE_CODE_USE_BEDROCK=1``
     Selects the CLI's Bedrock transport, which is what sends the Anthropic-Messages
@@ -37,13 +36,21 @@ Three env vars, and why each is needed
     that can reach it can spend the credentials it holds.
 
 ``CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD=1``
-    **A documented deviation, not a default.** In Bedrock mode the CLI expects
-    ``application/vnd.amazon.eventstream`` — AWS binary event-stream framing — and
-    rejects ``text/event-stream`` by name. The guard exists for a good reason: a real
-    Bedrock gateway must pass binary framing through. Disabling it lets this proxy
-    reply with plain Anthropic SSE, which is why it needs no eventstream encoder. The
-    flag is undocumented CLI surface and could change, so the tests pin the version it
-    was verified against (2.1.222) in their fixtures.
+    **No longer needed, and should not be used.** The proxy answers in
+    ``application/vnd.amazon.eventstream`` — the framing the CLI's Bedrock transport
+    actually asks for (see :mod:`chia.models.proxy.eventstream`).
+
+    It used to be required, because the proxy replied with plain SSE. That looked like it
+    worked end to end: the CLI printed the answer. It was not working. Once per-call usage
+    recording was switched on, every proxied turn appeared at Bedrock **twice** — once on
+    ``/invoke-with-response-stream`` and again, same body, on ``/invoke``. The CLI was
+    failing to parse the SSE stream and silently retrying non-streaming, then reporting
+    the cost of the one call it accepted. A 2x bill, invisible to the client's own
+    accounting. Cache tokens made it unambiguous: the stream call wrote the prompt cache
+    and the fallback read it, which requires both to have reached the provider.
+
+    ``--framing sse`` keeps the old behaviour for anyone who needs it, and says in its
+    help that it doubles provider spend.
 
 Security posture
 ----------------
@@ -58,11 +65,14 @@ Why it records usage
 
 ``--usage-log`` is not telemetry garnish. A client on the far side of this proxy prices
 what it *believes* it called: point the Claude Code CLI at a Nova or GLM model and it
-reports a Claude-rate cost, over by whatever the two models' rates differ by — measured
-at roughly 400x for GLM-5 — and reports it as authoritatively billed. The only place the
-real token counts for a proxied call exist is here, in the Converse response. So the
-proxy writes them down, one JSON line per call, and a study that needs a defensible cost
-axis prices *those* against the real model's rates instead of trusting the client.
+applies Claude's rate card to the tokens, then reports the result as
+``cost_source="billed"`` — authoritative. The only place the real counts for a proxied
+call exist is here, in the provider's own response, so the proxy writes them down: one
+JSON line per call, with the model id it was actually asked for.
+
+It has already earned its place twice. It is what exposed the SSE double-billing above,
+and it is what lets a study price a proxied call against the right rate card rather than
+inheriting the client's.
 """
 
 from __future__ import annotations
@@ -85,6 +95,8 @@ from typing import Any, Dict, Iterator, Optional, Union
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from chia.models.proxy.eventstream import CONTENT_TYPE as EVENTSTREAM_CONTENT_TYPE
+from chia.models.proxy.eventstream import frames_from_sse
 from chia.models.proxy.translate import (
     is_anthropic_model,
     to_anthropic_message,
@@ -100,6 +112,11 @@ VERIFIED_CLI_VERSION = "2.1.222"
 #: Loopback only. See "Security posture" in the module docstring.
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8123
+
+#: Response framings. ``eventstream`` is what the CLI's Bedrock transport asks for and the
+#: only one that does not make it retry the turn non-streaming.
+FRAMINGS = ("eventstream", "sse")
+DEFAULT_FRAMING = "eventstream"
 
 #: Env var read when ``--usage-log`` is not given, so a launcher can enable recording
 #: without rewriting the command line.
@@ -288,7 +305,8 @@ def _converse_stream(client, model_id: str, body: dict,
 
 
 def build_app(region: Optional[str] = None, client=None,
-              usage_log: Union[str, Path, UsageRecorder, None] = None):
+              usage_log: Union[str, Path, UsageRecorder, None] = None,
+              framing: str = DEFAULT_FRAMING):
     """Build the FastAPI app.
 
     :param region: AWS region for the outbound leg; defaults to the environment.
@@ -297,6 +315,8 @@ def build_app(region: Optional[str] = None, client=None,
     :param usage_log: Path to append per-call usage to, or a ready
         :class:`UsageRecorder`. ``None`` falls back to ``$CHIA_PROXY_USAGE_LOG``, and
         recording stays off when neither is set. See "Why it records usage".
+    :param framing: ``"eventstream"`` (default) or ``"sse"``. See the module docstring:
+        ``sse`` makes the CLI retry every turn non-streaming, doubling provider spend.
     :type region: Optional[str]
     :type usage_log: Union[str, pathlib.Path, UsageRecorder, None]
     :rtype: fastapi.FastAPI
@@ -321,6 +341,9 @@ def build_app(region: Optional[str] = None, client=None,
         usage_log = os.environ.get(USAGE_LOG_ENV) or None
     app.state.usage = (usage_log if isinstance(usage_log, UsageRecorder)
                        else UsageRecorder(usage_log) if usage_log else None)
+    if framing not in FRAMINGS:
+        raise ValueError(f"framing must be one of {FRAMINGS}, got {framing!r}")
+    app.state.framing = framing
 
     def _get_client():
         if app.state.client is None:
@@ -370,9 +393,9 @@ def build_app(region: Optional[str] = None, client=None,
                     if is_anthropic_model(model_id)
                     else _converse_stream(client_obj, model_id, body, recorder)
                 )
-                # text/event-stream, which needs
-                # CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD=1 on the client (see
-                # the module docstring).
+                if app.state.framing == "eventstream":
+                    return StreamingResponse(frames_from_sse(frames),
+                                             media_type=EVENTSTREAM_CONTENT_TYPE)
                 return StreamingResponse(frames, media_type="text/event-stream")
             if is_anthropic_model(model_id):
                 response = client_obj.invoke_model(
@@ -418,6 +441,12 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--region", default=None)
     parser.add_argument("--log-level", default="info")
+    parser.add_argument("--framing", default=DEFAULT_FRAMING, choices=list(FRAMINGS),
+                        help="response framing for the streaming route. The default is "
+                             "what the CLI's Bedrock transport asks for; 'sse' requires "
+                             "CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD=1 on the "
+                             "client AND makes it retry every turn non-streaming, which "
+                             "doubles provider spend.")
     parser.add_argument("--usage-log", default=None, type=Path,
                         help="append one JSON line per call with the real token counts. "
                              "For a proxied non-Anthropic model this is the only "
@@ -437,7 +466,8 @@ def main(argv=None) -> int:
 
     import uvicorn
 
-    uvicorn.run(build_app(region=args.region, usage_log=args.usage_log),
+    uvicorn.run(build_app(region=args.region, usage_log=args.usage_log,
+                          framing=args.framing),
                 host=args.host, port=args.port, log_level=args.log_level)
     return 0
 
