@@ -186,6 +186,10 @@ class AntigravityLLM(LLMCallBase):
     # Honors --dangerously-skip-permissions; has no opencode-style permission block.
     supports_dangerously_skip_permissions = True
 
+    # A per-call sandbox can wrap the ``agy`` subprocess, so `sandbox=` is honored
+    # (see chia.base.sandbox).
+    supports_sandbox = True
+
     def __init__(
         self,
         model: str | None = None,
@@ -203,10 +207,14 @@ class AntigravityLLM(LLMCallBase):
         sandbox: bool = False,
         extra_cli_args: list[str] | None = None,
         config=UNSET,
+        sandbox_spec=UNSET,
+        sandbox_backend: str = "none",
     ):
         super().__init__(system_message=system_message,
                          dangerously_skip_permissions=dangerously_skip_permissions,
-                         config=config)
+                         config=config,
+                         sandbox_spec=sandbox_spec,
+                         sandbox_backend=sandbox_backend)
         self.logging_level = logging_level
         self.logging_name = logging_name
         self.retries = retries
@@ -366,7 +374,7 @@ class AntigravityLLM(LLMCallBase):
         tools = tools or []
         self._write_mcp_config(tools)
         result = subprocess.run(
-            self._build_cmd(user_message),
+            self.sandbox_argv(self._build_cmd(user_message)),
             capture_output=True,
             text=True,
             # Give agy's own --print-timeout a chance to fire first.

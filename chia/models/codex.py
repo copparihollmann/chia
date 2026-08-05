@@ -301,6 +301,10 @@ class CodexLLM(LLMCallBase):
     # has no opencode-style permission block.
     supports_dangerously_skip_permissions = True
 
+    # A per-call sandbox can wrap the ``codex exec`` subprocess, so `sandbox=` is honored
+    # (see chia.base.sandbox).
+    supports_sandbox = True
+
     def __init__(
         self,
         model: str | None = None,
@@ -324,12 +328,16 @@ class CodexLLM(LLMCallBase):
         resume_session: bool = False,
         auto_compact_token_limit: int | None = 200_000,
         config=UNSET,
+        sandbox_spec=UNSET,
+        sandbox_backend: str = "none",
     ):
         # codex's bypass also disables the sandbox, so it keeps its own
         # (more specific) kwarg; mirror it onto the canonical base flag.
         super().__init__(system_message=system_message,
                          dangerously_skip_permissions=dangerously_bypass_approvals_and_sandbox,
-                         config=config)
+                         config=config,
+                         sandbox_spec=sandbox_spec,
+                         sandbox_backend=sandbox_backend)
         self.logging_level = logging_level
         self.logging_name = logging_name
         self.retries = retries
@@ -511,11 +519,11 @@ class CodexLLM(LLMCallBase):
         try:
             resume_session_id = self._session_id if self._resume_session else None
             result = subprocess.run(
-                self._build_cmd(
+                self.sandbox_argv(self._build_cmd(
                     tools or [],
                     output_last_message_path=output_path,
                     resume_session_id=resume_session_id,
-                ),
+                )),
                 input=self._format_prompt(user_message),
                 capture_output=True,
                 text=True,

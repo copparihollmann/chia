@@ -348,6 +348,10 @@ class ClaudeCodeLLM(LLMCallBase):
     # it's left out for now rather than shoehorned in.
     supports_dangerously_skip_permissions = True
 
+    # A per-call sandbox can wrap the ``claude`` subprocess, so `sandbox=` is honored
+    # (see chia.base.sandbox).
+    supports_sandbox = True
+
     def __init__(
         self,
         model: str = "claude-sonnet-4-6",
@@ -369,10 +373,14 @@ class ClaudeCodeLLM(LLMCallBase):
         max_tool_iterations: int = 100,
         dangerously_skip_permissions: bool = True,
         config=UNSET,
+        sandbox_spec=UNSET,
+        sandbox_backend: str = "none",
     ):
         super().__init__(system_message=system_message,
                          dangerously_skip_permissions=dangerously_skip_permissions,
-                         config=config)
+                         config=config,
+                         sandbox_spec=sandbox_spec,
+                         sandbox_backend=sandbox_backend)
         self.logging_level = logging_level
         self.logging_name = logging_name
         self.retries = retries
@@ -820,7 +828,7 @@ class ClaudeCodeLLM(LLMCallBase):
         tools: Optional[List[ChiaTool]] = None,
     ) -> ClaudeCodeQueryResult:
         """Run claude with simple capture (no event streaming)."""
-        cmd = self._build_cmd(tools)
+        cmd = self.sandbox_argv(self._build_cmd(tools))
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
         env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
 
@@ -874,7 +882,7 @@ class ClaudeCodeLLM(LLMCallBase):
         ``log_dir`` was set on the constructor, the same entries are
         also mirrored to ``<prefix>.log`` on disk.
         """
-        cmd = self._build_cmd(tools)
+        cmd = self.sandbox_argv(self._build_cmd(tools))
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
         env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
 
