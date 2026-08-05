@@ -54,10 +54,15 @@ class _FakeBedrock:
 
     def invoke_model_with_response_stream(self, **kwargs):
         self.calls.append(("invoke_model_with_response_stream", kwargs))
+        # Usage split across two frames, as Anthropic really reports it: input (and cache)
+        # on message_start, output on message_delta.
         frames = [
-            {"type": "message_start", "message": {"id": "msg_1"}},
+            {"type": "message_start",
+             "message": {"id": "msg_1",
+                         "usage": {"input_tokens": 11, "cache_read_input_tokens": 5}}},
             {"type": "content_block_delta",
              "delta": {"type": "text_delta", "text": "PONG"}},
+            {"type": "message_delta", "usage": {"output_tokens": 7}},
             {"type": "message_stop"},
         ]
         return {"body": [{"chunk": {"bytes": json.dumps(f).encode()}} for f in frames]}
@@ -68,8 +73,11 @@ class _FakeBedrock:
         class _Body:
             @staticmethod
             def read():
-                return json.dumps({"id": "msg_1", "content": [
-                    {"type": "text", "text": "PONG"}]}).encode()
+                return json.dumps({
+                    "id": "msg_1",
+                    "content": [{"type": "text", "text": "PONG"}],
+                    "usage": {"input_tokens": 3, "output_tokens": 4},
+                }).encode()
 
         return {"body": _Body()}
 
@@ -274,6 +282,189 @@ def test_a_non_object_body_is_a_400():
         f"/model/{GLM}/invoke-with-response-stream", json=["not", "an", "object"])
 
     assert response.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Usage recording
+#
+# The reason this exists: a client on the far side of the proxy prices what it *believes*
+# it called. Point the Claude Code CLI at GLM-5 and it reports a Claude-rate cost —
+# measured ~400x over — and marks it billed. The Converse response is the only place the
+# real counts are, so the proxy has to write them down or the cost axis of any study
+# through it is fiction.
+# ---------------------------------------------------------------------------
+
+
+def _usage_lines(path):
+    from chia.models.proxy.server import read_usage_log
+
+    return read_usage_log(path)
+
+
+def test_a_translated_call_records_the_converse_counts(tmp_path):
+    log = tmp_path / "usage.jsonl"
+    fake = _FakeBedrock(stream=[
+        {"contentBlockDelta": {"contentBlockIndex": 0, "delta": {"text": "PONG"}}},
+        {"messageStop": {"stopReason": "end_turn"}},
+        {"metadata": {"usage": {"inputTokens": 10, "outputTokens": 2,
+                                "cacheReadInputTokens": 100,
+                                "cacheWriteInputTokens": 7}}},
+    ])
+
+    client = TestClient(build_app(client=fake, usage_log=log))
+    response = client.post(f"/model/{GLM}/invoke-with-response-stream",
+                           json={"messages": [{"role": "user", "content": "ping"}]})
+    assert response.status_code == 200
+    # The generator only runs as the body is consumed, so the recording happens when the
+    # stream is read — which the test client does above.
+
+    lines = _usage_lines(log)
+    assert len(lines) == 1
+    assert lines[0]["model_id"] == GLM
+    assert lines[0]["translated"] is True
+    assert lines[0]["route"] == "stream"
+    assert lines[0]["input_tokens"] == 10
+    assert lines[0]["output_tokens"] == 2
+    assert lines[0]["cache_read_input_tokens"] == 100
+    assert lines[0]["cache_creation_input_tokens"] == 7
+
+
+def test_a_passthrough_call_records_usage_accumulated_across_frames(tmp_path):
+    """Anthropic reports input on message_start and output on message_delta, so reading
+    either frame alone gives half the bill."""
+    log = tmp_path / "usage.jsonl"
+    client = TestClient(build_app(client=_FakeBedrock(), usage_log=log))
+
+    client.post(f"/model/{SONNET}/invoke-with-response-stream",
+                json={"messages": [{"role": "user", "content": "ping"}]})
+
+    line, = _usage_lines(log)
+    assert line["translated"] is False
+    assert line["input_tokens"] == 11
+    assert line["cache_read_input_tokens"] == 5
+    assert line["output_tokens"] == 7
+
+
+def test_a_restated_running_total_is_not_counted_twice(tmp_path):
+    """A stream may restate a cumulative figure on several frames. Summing restatements
+    would multiply the bill, so the recorder keeps the largest."""
+    log = tmp_path / "usage.jsonl"
+
+    class _Restating(_FakeBedrock):
+        def invoke_model_with_response_stream(self, **kwargs):
+            frames = [
+                {"type": "message_start", "message": {"usage": {"input_tokens": 11}}},
+                {"type": "message_delta", "usage": {"input_tokens": 11,
+                                                    "output_tokens": 3}},
+                {"type": "message_delta", "usage": {"input_tokens": 11,
+                                                    "output_tokens": 9}},
+            ]
+            return {"body": [{"chunk": {"bytes": json.dumps(f).encode()}}
+                             for f in frames]}
+
+    client = TestClient(build_app(client=_Restating(), usage_log=log))
+    client.post(f"/model/{SONNET}/invoke-with-response-stream",
+                json={"messages": [{"role": "user", "content": "ping"}]})
+
+    line, = _usage_lines(log)
+    assert line["input_tokens"] == 11
+    assert line["output_tokens"] == 9
+
+
+def test_the_non_streaming_paths_record_too(tmp_path):
+    log = tmp_path / "usage.jsonl"
+    client = TestClient(build_app(client=_FakeBedrock(), usage_log=log))
+
+    client.post(f"/model/{GLM}/invoke",
+                json={"messages": [{"role": "user", "content": "ping"}]})
+    client.post(f"/model/{SONNET}/invoke",
+                json={"messages": [{"role": "user", "content": "ping"}]})
+
+    translated, passthrough = _usage_lines(log)
+    assert (translated["route"], translated["translated"]) == ("invoke", True)
+    assert translated["input_tokens"] == 1
+    assert (passthrough["route"], passthrough["translated"]) == ("invoke", False)
+    assert passthrough["input_tokens"] == 3
+
+
+def test_every_call_gets_a_line_even_with_no_usage_reported(tmp_path):
+    """Otherwise the line count stops matching the call count, and "how many calls did
+    the harness make" is one of the questions the log answers."""
+    log = tmp_path / "usage.jsonl"
+    fake = _FakeBedrock(stream=[{"messageStop": {"stopReason": "end_turn"}}])
+    client = TestClient(build_app(client=fake, usage_log=log))
+
+    for _ in range(3):
+        client.post(f"/model/{GLM}/invoke-with-response-stream",
+                    json={"messages": [{"role": "user", "content": "ping"}]})
+
+    lines = _usage_lines(log)
+    assert len(lines) == 3
+    assert all(line["input_tokens"] == 0 for line in lines)
+
+
+def test_recording_is_off_unless_asked_for(tmp_path, monkeypatch):
+    monkeypatch.delenv("CHIA_PROXY_USAGE_LOG", raising=False)
+    client = TestClient(build_app(client=_FakeBedrock()))
+
+    response = client.post(f"/model/{SONNET}/invoke-with-response-stream",
+                           json={"messages": [{"role": "user", "content": "ping"}]})
+
+    assert response.status_code == 200
+    assert not list(tmp_path.iterdir())
+
+
+def test_the_env_var_enables_recording_without_a_flag(tmp_path, monkeypatch):
+    log = tmp_path / "from-env.jsonl"
+    monkeypatch.setenv("CHIA_PROXY_USAGE_LOG", str(log))
+
+    client = TestClient(build_app(client=_FakeBedrock()))
+    client.post(f"/model/{SONNET}/invoke-with-response-stream",
+                json={"messages": [{"role": "user", "content": "ping"}]})
+
+    assert len(_usage_lines(log)) == 1
+
+
+def test_an_offset_selects_exactly_the_calls_made_after_it_was_taken(tmp_path):
+    """How a study attributes usage to one row: count the lines, run the row, take
+    everything after the count. Exact, and independent of clock resolution — which a
+    time-based mark is not, since two concurrent streams can finish in the same
+    millisecond."""
+    from chia.models.proxy.server import (UsageRecorder, count_usage_lines,
+                                          read_usage_log)
+
+    log = tmp_path / "usage.jsonl"
+    recorder = UsageRecorder(log)
+    recorder.record(model_id=GLM, route="stream", usage={"input_tokens": 1},
+                    translated=True)
+
+    mark = count_usage_lines(log)
+    recorder.record(model_id=GLM, route="stream", usage={"input_tokens": 2},
+                    translated=True)
+    recorder.record(model_id=GLM, route="stream", usage={"input_tokens": 3},
+                    translated=True)
+
+    after = read_usage_log(log, offset=mark)
+    assert [line["input_tokens"] for line in after] == [2, 3]
+
+
+def test_a_missing_log_reads_as_empty_rather_than_raising(tmp_path):
+    from chia.models.proxy.server import count_usage_lines, read_usage_log
+
+    absent = tmp_path / "never-written.jsonl"
+    assert read_usage_log(absent) == []
+    assert count_usage_lines(absent) == 0
+
+
+def test_a_partial_final_line_is_skipped_not_raised(tmp_path):
+    """The file is appended to by a live server, so a reader can catch a torn line."""
+    from chia.models.proxy.server import read_usage_log
+
+    log = tmp_path / "usage.jsonl"
+    log.write_text('{"ts": 1.0, "model_id": "a", "input_tokens": 5}\n{"ts": 2.0, "mod')
+
+    lines = read_usage_log(log)
+    assert [line["input_tokens"] for line in lines] == [5]
 
 
 # ---------------------------------------------------------------------------

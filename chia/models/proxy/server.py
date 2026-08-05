@@ -52,6 +52,17 @@ The proxy authenticates nobody and holds live AWS credentials via the standard b
 chain. It binds ``127.0.0.1`` by default and refuses any other host unless
 ``--i-understand-this-is-unauthenticated`` is passed, because a sidecar reachable from
 the network is a credential-spending endpoint reachable from the network.
+
+Why it records usage
+--------------------
+
+``--usage-log`` is not telemetry garnish. A client on the far side of this proxy prices
+what it *believes* it called: point the Claude Code CLI at a Nova or GLM model and it
+reports a Claude-rate cost, over by whatever the two models' rates differ by — measured
+at roughly 400x for GLM-5 — and reports it as authoritatively billed. The only place the
+real token counts for a proxied call exist is here, in the Converse response. So the
+proxy writes them down, one JSON line per call, and a study that needs a defensible cost
+axis prices *those* against the real model's rates instead of trusting the client.
 """
 
 from __future__ import annotations
@@ -61,7 +72,10 @@ import json
 import logging
 import os
 import sys
-from typing import Any, Dict, Iterator, Optional
+import threading
+import time
+from pathlib import Path
+from typing import Any, Dict, Iterator, Optional, Union
 
 # Imported at module scope, not lazily: FastAPI resolves a route handler's annotations
 # with get_type_hints, and under `from __future__ import annotations` a name bound only
@@ -87,6 +101,118 @@ VERIFIED_CLI_VERSION = "2.1.222"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8123
 
+#: Env var read when ``--usage-log`` is not given, so a launcher can enable recording
+#: without rewriting the command line.
+USAGE_LOG_ENV = "CHIA_PROXY_USAGE_LOG"
+
+#: Keys every usage line carries, in order. Stable, because downstream readers select by
+#: name and a study's CSV should not change shape under a proxy upgrade.
+USAGE_FIELDS = (
+    "ts", "model_id", "route", "translated",
+    "input_tokens", "output_tokens",
+    "cache_read_input_tokens", "cache_creation_input_tokens",
+)
+
+
+class UsageRecorder:
+    """Append-only JSONL record of what each proxied call really consumed.
+
+    :param path: File to append to. Parent directories are created.
+    :type path: Union[str, pathlib.Path]
+
+    One line per completed call. Appends are serialised with a lock and each line is
+    written with a single ``write`` of a whole line, because the CLI opens several
+    concurrent streams (a subagent turn overlaps its parent's) and a half-written line is
+    a row a reader silently drops.
+    """
+
+    def __init__(self, path: Union[str, Path]) -> None:
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+
+    def record(self, *, model_id: str, route: str, usage: Optional[dict],
+               translated: bool) -> None:
+        """Append one call's usage.
+
+        :param model_id: The Bedrock model id as it arrived in the request path.
+        :param route: ``"stream"`` or ``"invoke"``.
+        :param usage: Anthropic-shaped usage dict, or ``None`` when none was reported.
+        :param translated: Whether the call went through the Converse translation.
+        :type model_id: str
+        :type route: str
+        :type usage: Optional[dict]
+        :type translated: bool
+
+        A call that reported no usage is still recorded, with zeros. Dropping it would
+        make the line count disagree with the call count, and "how many calls did the
+        harness make" is one of the questions the log exists to answer.
+        """
+        usage = usage or {}
+        line = {
+            # Full precision, not rounded: two concurrent streams can complete inside the
+            # same millisecond, and a reader selecting by time would then drop one.
+            "ts": time.time(),
+            "model_id": model_id,
+            "route": route,
+            "translated": bool(translated),
+        }
+        for key in USAGE_FIELDS[4:]:
+            value = usage.get(key)
+            line[key] = int(value) if isinstance(value, (int, float)) else 0
+        payload = json.dumps(line, sort_keys=False) + "\n"
+        with self._lock:
+            with self.path.open("a") as handle:
+                handle.write(payload)
+
+
+def read_usage_log(path: Union[str, Path], *, since: float = 0.0,
+                   offset: int = 0) -> list:
+    """Usage lines from *path*, optionally only the ones after a mark.
+
+    :param path: The JSONL file written by :class:`UsageRecorder`.
+    :param since: Only return calls whose ``ts`` is strictly greater than this epoch time.
+    :param offset: Skip this many valid leading records. Applied after *since*.
+    :type path: Union[str, pathlib.Path]
+    :type since: float
+    :type offset: int
+    :rtype: list[dict]
+
+    *offset* exists because it is the exact way to attribute usage to one unit of work:
+    count the lines before dispatching, then take everything after that count. A
+    time-based mark is approximate at best — the clock's resolution has to beat the rate
+    at which a harness opens streams, and a subagent turn can overlap its parent's.
+
+    Malformed lines are skipped rather than raising: the file is appended to by a live
+    server, so a reader can legitimately catch a partial final line.
+    """
+    out = []
+    file_path = Path(path)
+    if not file_path.is_file():
+        return out
+    with file_path.open() as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict) and float(record.get("ts") or 0.0) > since:
+                out.append(record)
+    return out[offset:]
+
+
+def count_usage_lines(path: Union[str, Path]) -> int:
+    """How many usage records *path* holds, for use as an :func:`read_usage_log` offset.
+
+    :param path: The JSONL file written by :class:`UsageRecorder`.
+    :type path: Union[str, pathlib.Path]
+    :rtype: int
+    """
+    return len(read_usage_log(path))
+
 
 def _client(region: Optional[str] = None):
     """A ``bedrock-runtime`` client. Imported lazily so importing this module is cheap."""
@@ -97,18 +223,25 @@ def _client(region: Optional[str] = None):
     return boto3.client("bedrock-runtime", region_name=resolved)
 
 
-def _forward_anthropic_stream(client, model_id: str, body: dict) -> Iterator[bytes]:
+def _forward_anthropic_stream(client, model_id: str, body: dict,
+                              recorder: Optional[UsageRecorder] = None,
+                              ) -> Iterator[bytes]:
     """Forward an Anthropic-model request to Bedrock and re-emit it as Anthropic SSE.
 
     The body needs no translation, but the *response* does: Bedrock replies in AWS
     binary event-stream framing, and the CLI has been told (by the content-type guard
     flag) to expect SSE. boto3 already decodes the framing for us, so this only has to
     re-frame each chunk — the payloads inside are already Anthropic events.
+
+    Usage is accumulated across frames rather than read from one: Anthropic reports input
+    tokens on ``message_start`` and output tokens on ``message_delta``, so either frame
+    alone gives half the answer.
     """
     response = client.invoke_model_with_response_stream(
         modelId=model_id, body=json.dumps(body),
         contentType="application/json", accept="application/json",
     )
+    seen: Dict[str, int] = {}
     for event in response.get("body", []):
         chunk = (event or {}).get("chunk") or {}
         raw = chunk.get("bytes")
@@ -118,25 +251,54 @@ def _forward_anthropic_stream(client, model_id: str, body: dict) -> Iterator[byt
             payload = json.loads(raw)
         except Exception:
             continue
+        _absorb_usage(seen, payload.get("usage"))
+        _absorb_usage(seen, (payload.get("message") or {}).get("usage")
+                      if isinstance(payload.get("message"), dict) else None)
         event_type = payload.get("type") or "message_delta"
         yield f"event: {event_type}\ndata: {json.dumps(payload)}\n\n".encode()
+    if recorder is not None:
+        recorder.record(model_id=model_id, route="stream", usage=seen, translated=False)
 
 
-def _converse_stream(client, model_id: str, body: dict) -> Iterator[bytes]:
+def _absorb_usage(into: Dict[str, int], usage: Any) -> None:
+    """Merge an Anthropic usage dict into *into*, keeping the larger of each count.
+
+    Larger rather than summed: a stream may restate a running total on several frames,
+    and summing restatements would multiply the bill.
+    """
+    if not isinstance(usage, dict):
+        return
+    for key, value in usage.items():
+        if isinstance(value, (int, float)):
+            into[key] = max(int(value), int(into.get(key, 0)))
+
+
+def _converse_stream(client, model_id: str, body: dict,
+                     recorder: Optional[UsageRecorder] = None) -> Iterator[bytes]:
     """Translate to Converse, stream it, and re-emit as Anthropic SSE."""
     kwargs = to_converse(body, model_id)
     response = client.converse_stream(**kwargs)
     events = (event for event in response.get("stream", []) if isinstance(event, dict))
-    return to_anthropic_sse(events, model=model_id)
+    on_usage = None
+    if recorder is not None:
+        def on_usage(usage: dict) -> None:
+            recorder.record(model_id=model_id, route="stream", usage=usage,
+                            translated=True)
+    return to_anthropic_sse(events, model=model_id, on_usage=on_usage)
 
 
-def build_app(region: Optional[str] = None, client=None):
+def build_app(region: Optional[str] = None, client=None,
+              usage_log: Union[str, Path, UsageRecorder, None] = None):
     """Build the FastAPI app.
 
     :param region: AWS region for the outbound leg; defaults to the environment.
     :param client: Injected ``bedrock-runtime`` client, for tests. When given, no boto3
         client is constructed and no credentials are needed.
+    :param usage_log: Path to append per-call usage to, or a ready
+        :class:`UsageRecorder`. ``None`` falls back to ``$CHIA_PROXY_USAGE_LOG``, and
+        recording stays off when neither is set. See "Why it records usage".
     :type region: Optional[str]
+    :type usage_log: Union[str, pathlib.Path, UsageRecorder, None]
     :rtype: fastapi.FastAPI
 
     Routes mirror what the CLI was measured to call, and nothing more:
@@ -155,6 +317,10 @@ def build_app(region: Optional[str] = None, client=None):
     app = FastAPI(title="chia bedrock-converse proxy", docs_url=None, redoc_url=None)
     app.state.client = client
     app.state.region = region
+    if usage_log is None:
+        usage_log = os.environ.get(USAGE_LOG_ENV) or None
+    app.state.usage = (usage_log if isinstance(usage_log, UsageRecorder)
+                       else UsageRecorder(usage_log) if usage_log else None)
 
     def _get_client():
         if app.state.client is None:
@@ -196,11 +362,14 @@ def build_app(region: Optional[str] = None, client=None):
             return JSONResponse({"message": "malformed JSON body"}, status_code=400)
 
         client_obj = _get_client()
+        recorder = app.state.usage
         try:
             if streaming:
-                frames = (_forward_anthropic_stream(client_obj, model_id, body)
-                          if is_anthropic_model(model_id)
-                          else _converse_stream(client_obj, model_id, body))
+                frames = (
+                    _forward_anthropic_stream(client_obj, model_id, body, recorder)
+                    if is_anthropic_model(model_id)
+                    else _converse_stream(client_obj, model_id, body, recorder)
+                )
                 # text/event-stream, which needs
                 # CLAUDE_CODE_DISABLE_BEDROCK_CONTENT_TYPE_GUARD=1 on the client (see
                 # the module docstring).
@@ -210,9 +379,17 @@ def build_app(region: Optional[str] = None, client=None):
                     modelId=model_id, body=json.dumps(body),
                     contentType="application/json", accept="application/json",
                 )
-                return JSONResponse(json.loads(response["body"].read()))
+                payload = json.loads(response["body"].read())
+                if recorder is not None:
+                    recorder.record(model_id=model_id, route="invoke",
+                                    usage=payload.get("usage"), translated=False)
+                return JSONResponse(payload)
             converse = client_obj.converse(**to_converse(body, model_id))
-            return JSONResponse(to_anthropic_message(converse, model=model_id))
+            message = to_anthropic_message(converse, model=model_id)
+            if recorder is not None:
+                recorder.record(model_id=model_id, route="invoke",
+                                usage=message.get("usage"), translated=True)
+            return JSONResponse(message)
         except Exception as exc:
             logger.warning("%s failed for %s: %s",
                            "invoke-with-response-stream" if streaming else "invoke",
@@ -241,6 +418,11 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--region", default=None)
     parser.add_argument("--log-level", default="info")
+    parser.add_argument("--usage-log", default=None, type=Path,
+                        help="append one JSON line per call with the real token counts. "
+                             "For a proxied non-Anthropic model this is the only "
+                             "trustworthy cost source; the client prices what it thinks "
+                             "it called. Defaults to $" + USAGE_LOG_ENV + ".")
     parser.add_argument("--i-understand-this-is-unauthenticated", action="store_true",
                         help="required to bind anything but loopback")
     args = parser.parse_args(argv)
@@ -255,8 +437,8 @@ def main(argv=None) -> int:
 
     import uvicorn
 
-    uvicorn.run(build_app(region=args.region), host=args.host, port=args.port,
-                log_level=args.log_level)
+    uvicorn.run(build_app(region=args.region, usage_log=args.usage_log),
+                host=args.host, port=args.port, log_level=args.log_level)
     return 0
 
 
