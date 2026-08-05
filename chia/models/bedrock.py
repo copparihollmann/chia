@@ -28,6 +28,7 @@ import ray
 
 from chia.base.ChiaFunction import ChiaFunction
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
+from chia.base.redact import secret_values, truncate
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
@@ -569,9 +570,18 @@ class BedrockLLM(LLMCallBase):
 
         node_id = self._get_node_id()
 
+        # Redacted before truncation, not after: slicing first would emit the leading
+        # bytes of any credential the message echoes, and a fragment of a token is still
+        # a disclosure. ``truncate`` exists so the ordering is in the call, not in the
+        # reader's memory.
+        secrets = secret_values()
+
         if isinstance(exc, ClientError):
             code = exc.response.get("Error", {}).get("Code", "")
-            msg = exc.response.get("Error", {}).get("Message", str(exc))[:300]
+            msg = truncate(
+                exc.response.get("Error", {}).get("Message", str(exc)), 300,
+                values=secrets,
+            )
 
             if code in ("ThrottlingException", "TooManyRequestsException",
                         "ServiceQuotaExceededException"):
@@ -598,15 +608,15 @@ class BedrockLLM(LLMCallBase):
 
         if isinstance(exc, (EndpointConnectionError, ConnectTimeoutError,
                             ReadTimeoutError)):
-            return ServerError(node_id, raw_message=str(exc)[:300])
+            return ServerError(node_id, raw_message=truncate(str(exc), 300, values=secrets))
 
         # Client-side parameter validation (e.g. maxTokens below the minimum) is
         # a deterministic bad request — never-retry, not an Unknown that burns
         # the retry budget.
         if isinstance(exc, ParamValidationError):
-            return InvalidRequestError(node_id, raw_message=str(exc)[:300])
+            return InvalidRequestError(node_id, raw_message=truncate(str(exc), 300, values=secrets))
 
         if isinstance(exc, BotoCoreError):
-            return UnknownBedrockError(node_id, raw_message=str(exc)[:300])
+            return UnknownBedrockError(node_id, raw_message=truncate(str(exc), 300, values=secrets))
 
         return None

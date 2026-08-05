@@ -28,6 +28,7 @@ import ray
 
 from chia.base.ChiaFunction import ChiaFunction
 from chia.base.llm_call import QueryResult, LLMCallBase
+from chia.base.redact import redact, secret_values
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
@@ -729,6 +730,12 @@ class OpenCodeLLM(LLMCallBase):
         cut mid-JSON and unparseable. A regular file has no such limit. stderr is
         small, so it stays on a pipe. ``stdin=DEVNULL`` because ``run`` blocks on
         an open stdin pipe. ``subprocess.TimeoutExpired`` propagates to the caller.
+
+        Credentials are masked here because this is the one place opencode's own bytes
+        enter chia — ``run`` and ``export`` both come through it, so every downstream
+        consumer (the QueryResult, the log file, the typed errors, the parsed export) is
+        covered once. The mask contains no quote or backslash, so redacting the export
+        payload leaves it valid JSON for :func:`json.loads`.
         """
         tmp = tempfile.NamedTemporaryFile(
             mode="w", suffix=".out", prefix="opencode_out_", delete=False
@@ -748,8 +755,11 @@ class OpenCodeLLM(LLMCallBase):
                 )
             with open(out_path, "r") as in_fh:
                 stdout = in_fh.read()
+            secrets = secret_values(env)
             return SimpleNamespace(
-                returncode=proc.returncode, stdout=stdout, stderr=proc.stderr or ""
+                returncode=proc.returncode,
+                stdout=redact(stdout, values=secrets) or "",
+                stderr=redact(proc.stderr, values=secrets) or "",
             )
         finally:
             try:

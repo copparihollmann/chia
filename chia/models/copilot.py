@@ -32,6 +32,7 @@ import ray
 
 from chia.base.ChiaFunction import ChiaFunction, ObjectRefCallback
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
+from chia.base.redact import redact, secret_values
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
@@ -528,8 +529,14 @@ class CopilotLLM(LLMCallBase):
                     ),
                 ) from exc
             raise
-        stream, meta, final_text, result_code = self._parse_jsonl_stream(result.stdout, result.stderr)
-        parsed_session_id = parse_session_id(result.stdout)
+        # Masked at the boundary, before parsing, logging or truncation: the auth-failure
+        # path is where a provider echoes the credential it refused, and everything below
+        # this line is durable.
+        secrets = secret_values()
+        stdout = redact(result.stdout, values=secrets) or ""
+        stderr = redact(result.stderr, values=secrets) or ""
+        stream, meta, final_text, result_code = self._parse_jsonl_stream(stdout, stderr)
+        parsed_session_id = parse_session_id(stdout)
         if self._resume_session and parsed_session_id:
             self._session_id = parsed_session_id
         if self._session_id:
@@ -544,11 +551,11 @@ class CopilotLLM(LLMCallBase):
         if returncode == 0 and result_code != 0:
             returncode = 1 if result_code is None else result_code
         if returncode != 0:
-            self.logger.warning("copilot exited %d: %s", returncode, result.stderr[:500])
+            self.logger.warning("copilot exited %d: %s", returncode, stderr[:500])
         return CopilotQueryResult(
             final_text,
             returncode,
-            result.stderr,
+            stderr,
             stream,
             session_id=self._session_id,
         )

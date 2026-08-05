@@ -23,6 +23,7 @@ import ray
 
 from chia.base.ChiaFunction import ChiaFunction, ObjectRefCallback
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
+from chia.base.redact import redact, secret_values
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
@@ -523,10 +524,16 @@ class CodexLLM(LLMCallBase):
                 cwd=self.work_dir or None,
                 env=os.environ.copy(),
             )
+            # Masked at the boundary, before parsing, logging or truncation — the CLI
+            # echoes the credential it was refused on the auth-failure path, and
+            # everything below this line is durable.
+            secrets = secret_values()
+            stdout = redact(result.stdout, values=secrets) or ""
+            stderr = redact(result.stderr, values=secrets) or ""
             with open(output_path) as f:
-                final_text = f.read()
-            stream, meta, fallback = self._parse_jsonl_stream(result.stdout, result.stderr)
-            parsed_session_id = parse_session_id(result.stdout)
+                final_text = redact(f.read(), values=secrets) or ""
+            stream, meta, fallback = self._parse_jsonl_stream(stdout, stderr)
+            parsed_session_id = parse_session_id(stdout)
             if self._resume_session and parsed_session_id:
                 self._session_id = parsed_session_id
             if self._session_id:
@@ -536,11 +543,11 @@ class CodexLLM(LLMCallBase):
             if self._log_prefix is not None:
                 self._write_log(user_message, final_text, stream)
             if result.returncode != 0:
-                self.logger.warning("codex exited %d: %s", result.returncode, result.stderr[:500])
+                self.logger.warning("codex exited %d: %s", result.returncode, stderr[:500])
             return CodexQueryResult(
                 final_text,
                 result.returncode,
-                result.stderr,
+                stderr,
                 stream,
                 session_id=self._session_id,
             )
