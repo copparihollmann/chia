@@ -124,3 +124,48 @@ with `CIRCT_SOLVER_PY` / `CIRCT_SOLVER_CHIA`.
   hacking around them.
 - Default GCS port 6379 / dashboard 8265 — bring only one chia cluster up per host
   at a time.
+
+## Docker versus bubblewrap benchmark
+
+``isolation_benchmark.py`` runs the zero-credit performance gate against the
+same immutable CIRCT OCI image in Docker and a pre-exported bubblewrap rootfs.
+It interleaves the order within each pair and appends every completed trial to
+JSONL. Image pull/rootfs export are deliberately outside the timed interval.
+
+```bash
+export CHIA_HEAD=localhost
+python isolation_benchmark.py \
+  --docker-config benchmark-cluster-docker.yaml \
+  --bwrap-config benchmark-cluster-bwrap.yaml \
+  --trials 10 --dispatches 100 --full-lit \
+  --repro-script benchmarks/issue-10568-repro.sh \
+  --output results/isolation-benchmark.jsonl
+```
+
+The supplied bwrap config names the lab rootfs exported from image ID
+``sha256:5c61bd…493c8``. Before every bwrap arm the runner makes fresh
+reflink-or-copy snapshots of the image's ``/workspace`` and ``/home/ray`` at
+the stable bind paths in the config. This matches Docker's fresh overlay and
+never mutates the immutable exported rootfs. Snapshot time is recorded
+separately and excluded from ``up_seconds``; both arms retain only build state
+baked into the pinned image. Change ``--bwrap-rootfs``,
+``--bwrap-writable-root``, and the config bind sources together on another
+machine. The optional repro script is copied into each worker and its SHA-256
+is recorded in the manifest. The benchmark uses dedicated GCS port 46379 and
+never runs a host-global ``ray stop``, so it does not disturb an unrelated Ray
+cluster on the same host. Do not run the two benchmark configs concurrently
+because they intentionally share that dedicated port.
+
+After the ten pairs, compute the predeclared merge gate:
+
+```bash
+python isolation_benchmark_analysis.py \
+  --input results/isolation-benchmark.jsonl \
+  --output results/isolation-benchmark-summary.json
+```
+
+The machine-readable decision is ``go`` only when all trials succeed, at least
+ten complete pairs exist, median representative end-to-end time improves by at
+least 5%, and the paired bootstrap 95% confidence interval excludes zero
+improvement. Startup is reported separately. A smoke run with fewer pairs is
+always ``no-go`` regardless of its point estimate.

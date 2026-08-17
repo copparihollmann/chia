@@ -1,0 +1,36 @@
+# Deterministic bwrap arm for isolation_benchmark.py. The rootfs was exported
+# once from the exact image used by benchmark-cluster-docker.yaml, outside every
+# timed trial.
+cluster_name: circt_isolation_benchmark
+provider:
+    head_ip: ${CHIA_HEAD}
+auth:
+    ssh_user: ${USER}
+available_node_types:
+    circt_worker:
+        resources: {"circt": 1}
+        num_workers: 1
+        compatible_ips: ["${CHIA_HEAD}"]
+        bwrap:
+            rootfs: /scratch/agustin/cache/chia-bwrap-rootfs/sha256-5c61bd07a4716d2d1f235300138f6c5dd97c42738f7195cb1d3570c9539493c8
+            worker_name: "circt_isolation_bwrap_${USER}"
+            state_dir: /tmp/chia-bwrap
+            working_dir: /workspace
+            read_write_binds:
+                /scratch/agustin/cache/chia-bwrap-benchmark/workspace: /workspace
+                /scratch/agustin/cache/chia-bwrap-benchmark/home-ray: /home/ray
+            environment:
+                HOME: /home/ray
+                PATH: /home/ray/anaconda3/envs/py_worker/bin:/workspace/circt/build/bin:/opt/circt-sdk/bin:/usr/lib/ccache:/opt/sbt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                LD_LIBRARY_PATH: /opt/circt-sdk/lib
+                CC: clang
+                CXX: clang++
+            run_setup_commands:
+                - git config --global --add safe.directory /workspace/circt || true
+head_env_commands:
+    - "source /scratch2/agustin/miniforge3/etc/profile.d/conda.sh && conda activate chia_matrix"
+head_start_ray_commands:
+    - "source /scratch2/agustin/miniforge3/etc/profile.d/conda.sh && conda activate chia_matrix && ray start --head --port=46379 --include-dashboard=False"
+worker_start_ray_commands:
+    - ray stop
+    - ray start --address=$RAY_HEAD_IP:46379 --dashboard-agent-listen-port=0

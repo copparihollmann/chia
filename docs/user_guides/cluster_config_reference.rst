@@ -126,6 +126,11 @@ Top-level keys
      - ``None``
      - A cluster-wide default container config (see `Container config`_), which
        individual node types can override. Specify at most one of the two.
+   * - ``bwrap``
+     - ``None``
+     - A cluster-wide rootless bubblewrap worker config (see `Bubblewrap
+       workers`_), which individual node types can override. A worker may not
+       combine Docker and bubblewrap.
    * - ``aws_nodes``
      - ``None``
      - Provision EC2 instances and join them to the cluster — over the
@@ -273,6 +278,10 @@ the container (if any) they run in.
      - ``None``
      - Container config for this type, overriding any cluster-wide default.
        Specify at most one. See `Container config`_.
+   * - ``bwrap``
+     - ``None``
+     - Persistent rootless bubblewrap config for this type, overriding a
+       cluster-wide bubblewrap default. See `Bubblewrap workers`_.
    * - ``balance_level``
      - ``"cluster"``
      - How this type spreads across its eligible IPs: ``cluster`` packs around
@@ -338,6 +347,71 @@ inside any node type; the node-type block overrides the cluster-wide one.
    If you rely on conda/venv set up in ``~/.bashrc``, source it explicitly in
    ``head_env_commands`` / ``worker_env_commands``, e.g.
    ``source ~/.bashrc && conda activate chia_env``.
+
+Bubblewrap workers
+~~~~~~~~~~~~~~~~~~
+
+A ``bwrap:`` block is a lighter-weight alternative to ``docker:`` for logical
+workers. It may appear at the top level or inside a node type. Docker and
+bubblewrap are mutually exclusive within one block. An explicit node-level
+backend shadows the top-level default, even when it is the other kind; this
+allows a mixed cluster with (for example) global Docker and one bwrap node type.
+
+Bubblewrap does not run one sandbox per command. CHIA starts a small persistent
+supervisor in a PID/IPC/UTS namespace and submits the complete worker setup and
+``ray start`` script to it. The worker therefore stays alive after the setup SSH
+session exits. ``chia down`` validates the recorded Linux process start time
+before terminating the namespace, so a stale PID cannot target an unrelated
+process. Host networking is deliberately retained for Ray and MCP traffic.
+
+.. code-block:: yaml
+
+   bwrap:
+       rootfs: /scratch/${USER}/chia-rootfs/circt
+       worker_name: circt-bwrap-${USER}
+       image: ghcr.io/ucb-bar/chia-circt@sha256:<registry-digest>
+       image_digest: sha256:<immutable-image-id>
+       engine: docker
+       pull_before_prepare: true
+       state_dir: /tmp/chia-bwrap-${USER}
+       working_dir: /workspace
+       read_only_binds:
+           /opt/site-tools: /opt/site-tools
+       read_write_binds:
+           /scratch/${USER}/circt-workspace: /workspace
+           /scratch/${USER}/claude-state: /home/ray/.claude
+       tmpfs: [/tmp, /dev/shm]
+       environment:
+           HOME: /home/ray
+       environment_allowlist: [SSH_AUTH_SOCK]
+       unset_environment: [AWS_SECRET_ACCESS_KEY]
+       run_setup_commands:
+           - git config --global --add safe.directory /workspace/circt
+
+``rootfs`` is required and must be an absolute path. If it does not exist,
+``image`` is also required: CHIA pulls (optionally), creates a stopped OCI
+container, exports its filesystem outside the worker startup interval, and
+records the resolved image identities and image environment in
+``.chia-oci-rootfs.json``. Existing unmarked directories are never overwritten.
+Set ``image_digest`` to make a tag resolve failure fatal. For a rootfs prepared
+by another tool, omit ``image``; it must already contain executable
+``/bin/bash``.
+
+The rootfs and ``read_only_binds`` are mounted read-only. Only
+``read_write_binds``, the private control directory, and paths listed in
+``tmpfs`` are writable. Bind maps are ``host_path: sandbox_path`` and both paths
+must be absolute. The environment is cleared, then populated from OCI image
+metadata, explicit ``environment`` values, and only the host variables named in
+``environment_allowlist``; ``unset_environment`` wins last. Host networking is
+not isolated.
+
+.. warning::
+
+   Bubblewrap requires user namespaces (or a correctly installed setuid
+   bubblewrap). CHIA fails setup if ``bwrap`` is unavailable or cannot create
+   the namespace; it never falls back to an unisolated worker. An OCI image
+   export still needs the selected ``engine`` once, but subsequent starts use
+   the exported rootfs without a container daemon.
 
 Cloud nodes
 -----------

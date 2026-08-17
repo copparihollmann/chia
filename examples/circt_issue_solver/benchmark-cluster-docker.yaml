@@ -1,0 +1,28 @@
+# Deterministic Docker arm for isolation_benchmark.py. The OCI registry digest
+# and local image ID are recorded by the runner.
+cluster_name: circt_isolation_benchmark
+provider:
+    head_ip: ${CHIA_HEAD}
+auth:
+    ssh_user: ${USER}
+available_node_types:
+    circt_worker:
+        resources: {"circt": 1}
+        num_workers: 1
+        compatible_ips: ["${CHIA_HEAD}"]
+        docker:
+            image: "ghcr.io/ucb-bar/chia-circt@sha256:09e59dfa30035b773dd978a84e5c3c76b9326eb9e846ced025093cdeca96145d"
+            container_name: "circt_isolation_docker_${USER}"
+            pull_before_run: false
+            run_options:
+                - --ulimit nofile=65536:65536
+                - --shm-size=10.24gb
+        worker_setup_commands:
+            - git config --global --add safe.directory /workspace/circt || true
+head_env_commands:
+    - "source /scratch2/agustin/miniforge3/etc/profile.d/conda.sh && conda activate chia_matrix"
+head_start_ray_commands:
+    - "source /scratch2/agustin/miniforge3/etc/profile.d/conda.sh && conda activate chia_matrix && ray start --head --port=46379 --include-dashboard=False"
+worker_start_ray_commands:
+    - ray stop
+    - ray start --address=$RAY_HEAD_IP:46379 --dashboard-agent-listen-port=0

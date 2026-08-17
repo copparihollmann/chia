@@ -165,6 +165,42 @@ class DockerConfig:
 
 
 @dataclass
+class BwrapConfig:
+    """Persistent rootless bubblewrap worker configuration.
+
+    ``rootfs`` is an unpacked OCI root filesystem.  When ``image`` is set,
+    CHIA creates it once with ``engine create``/``engine export`` and records
+    the resolved image identity beside the exported files.  A pre-exported
+    rootfs can instead be supplied by omitting ``image``.
+
+    Bind dictionaries map host paths to paths inside the sandbox.  The rootfs
+    itself is always read-only; only ``read_write_binds`` and the configured
+    tmpfs paths are writable.
+    """
+
+    rootfs: str
+    worker_name: str = "chia-bwrap-worker"
+    image: str | None = None
+    image_digest: str | None = None
+    engine: str = "docker"
+    pull_before_prepare: bool = True
+    pull_timeout: int = 600
+    state_dir: str = "/tmp/chia-bwrap"
+    working_dir: str | None = None
+    hostname: str | None = None
+    read_only_binds: dict[str, str] = field(default_factory=dict)
+    read_write_binds: dict[str, str] = field(default_factory=dict)
+    tmpfs: list[str] = field(default_factory=lambda: ["/tmp", "/dev/shm"])
+    environment: dict[str, str] = field(default_factory=dict)
+    environment_allowlist: list[str] = field(default_factory=list)
+    unset_environment: list[str] = field(default_factory=list)
+    run_setup_commands: list[str] = field(default_factory=list)
+    start_timeout: int = 60
+    command_timeout: int = 600
+    binary: str = "bwrap"
+
+
+@dataclass
 class NodeTypeConfig:
     name: str
     resources: dict[str, float] = field(default_factory=dict)
@@ -172,6 +208,7 @@ class NodeTypeConfig:
     worker_env_commands: list[str] = field(default_factory=list)
     worker_setup_commands: list[str] = field(default_factory=list)
     docker: DockerConfig | None = None
+    bwrap: BwrapConfig | None = None
     compatible_ips: list[str] | None = None
     # How this type's workers pick among usable IPs in assign_nodes:
     #   "cluster" (default) — fewest nodes globally (across all types);
@@ -220,12 +257,33 @@ class ClusterConfig:
     rsync_exclude: list[str] = field(default_factory=list)
     rsync_filter: list[str] = field(default_factory=list)
     global_docker: DockerConfig | None = None
+    global_bwrap: BwrapConfig | None = None
     aws_config: AWSClusterConfig | None = None
     firesim_config: FireSimClusterConfig | None = None
     auth_overrides: dict[str, SSHAuthConfig] = field(default_factory=dict)
     ssh_proxy_command: str | None = None
     tailnet_config: TailnetConfig | None = None
     scoped_teardown: bool = True
+
+    def get_worker_backend(
+        self, node_type: NodeTypeConfig,
+    ) -> tuple[str, DockerConfig | BwrapConfig | None]:
+        """Return the effective execution backend for ``node_type``.
+
+        An explicit node backend shadows the cluster-wide default, including a
+        backend of the other kind. This permits heterogeneous clusters such as
+        global Docker workers plus one lighter-weight bwrap CIRCT node type.
+        Mutual exclusion is enforced within each individual YAML block.
+        """
+        if node_type.docker is not None:
+            return "docker", node_type.docker
+        if node_type.bwrap is not None:
+            return "bwrap", node_type.bwrap
+        if self.global_docker is not None:
+            return "docker", self.global_docker
+        if self.global_bwrap is not None:
+            return "bwrap", self.global_bwrap
+        return "bare", None
 
     def get_ssh_auth(self, ip: str) -> SSHAuthConfig:
         """Return SSH auth for *ip*, falling back to the global config."""
@@ -291,10 +349,89 @@ def _parse_docker(raw: dict, engine: str = "docker") -> DockerConfig:
 
 
 def _parse_container_section(raw: dict, where: str) -> DockerConfig | None:
-    """Parse the ``docker:`` section of *raw* (at most one)."""
+    """Parse the ``docker:`` section of *raw*."""
     if "docker" in raw:
         return _parse_docker(raw["docker"], engine="docker")
     return None
+
+
+def _parse_bwrap(raw: dict, where: str) -> BwrapConfig | None:
+    section = raw.get("bwrap")
+    if section is None:
+        return None
+    if "docker" in raw:
+        raise ConfigError(
+            f"{where}: 'docker' and 'bwrap' are mutually exclusive")
+    if not isinstance(section, dict):
+        raise ConfigError(f"{where}.bwrap must be a mapping")
+
+    valid = {f.name for f in fields(BwrapConfig)}
+    unknown = set(section) - valid
+    if unknown:
+        raise ConfigError(
+            f"{where}.bwrap has unknown field(s): {sorted(unknown)} "
+            f"(valid: {sorted(valid)})")
+    if not section.get("rootfs"):
+        raise ConfigError(f"{where}.bwrap: missing required field 'rootfs'")
+
+    cfg = BwrapConfig(**section)
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", cfg.worker_name):
+        raise ConfigError(
+            f"{where}.bwrap.worker_name must contain only letters, digits, "
+            "'.', '_' and '-'")
+    if cfg.start_timeout <= 0 or cfg.command_timeout <= 0:
+        raise ConfigError(
+            f"{where}.bwrap timeouts must be positive")
+    for label, path in (("rootfs", cfg.rootfs), ("state_dir", cfg.state_dir)):
+        if not Path(path).is_absolute():
+            raise ConfigError(f"{where}.bwrap.{label} must be an absolute path")
+    for kind, binds in (
+        ("read_only_binds", cfg.read_only_binds),
+        ("read_write_binds", cfg.read_write_binds),
+    ):
+        if not isinstance(binds, dict):
+            raise ConfigError(f"{where}.bwrap.{kind} must be a mapping")
+        for source, destination in binds.items():
+            if not Path(source).is_absolute() or not Path(destination).is_absolute():
+                raise ConfigError(
+                    f"{where}.bwrap.{kind} paths must be absolute: "
+                    f"{source!r}: {destination!r}")
+    for path in cfg.tmpfs:
+        if not Path(path).is_absolute():
+            raise ConfigError(
+                f"{where}.bwrap.tmpfs entries must be absolute: {path!r}")
+    if not isinstance(cfg.environment, dict) or not all(
+        isinstance(key, str) and isinstance(value, str)
+        for key, value in cfg.environment.items()
+    ):
+        raise ConfigError(
+            f"{where}.bwrap.environment must map string names to string values")
+    for label, names in (
+        ("environment_allowlist", cfg.environment_allowlist),
+        ("unset_environment", cfg.unset_environment),
+    ):
+        if not isinstance(names, list) or not all(
+            isinstance(name, str)
+            and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name)
+            for name in names
+        ):
+            raise ConfigError(
+                f"{where}.bwrap.{label} must contain valid environment "
+                "variable names")
+    if not isinstance(cfg.run_setup_commands, list) or not all(
+        isinstance(command, str) for command in cfg.run_setup_commands
+    ):
+        raise ConfigError(
+            f"{where}.bwrap.run_setup_commands must be a list of strings")
+    overlap = (
+        set(cfg.read_only_binds.values())
+        & set(cfg.read_write_binds.values())
+    )
+    if overlap:
+        raise ConfigError(
+            f"{where}.bwrap destination(s) appear in both read-only and "
+            f"read-write maps: {sorted(overlap)}")
+    return cfg
 
 
 def _expand_env_vars(data):
@@ -777,6 +914,7 @@ def build_config(raw: dict) -> ClusterConfig:
     node_types: dict[str, NodeTypeConfig] = {}
     for name, nt_raw in raw.get("available_node_types", {}).items():
         docker = _parse_container_section(nt_raw, f"available_node_types.{name}")
+        bwrap = _parse_bwrap(nt_raw, f"available_node_types.{name}")
         balance_level = nt_raw.get("balance_level", "cluster")
         if balance_level not in ("cluster", "worker"):
             logger.warning(
@@ -790,6 +928,7 @@ def build_config(raw: dict) -> ClusterConfig:
             worker_env_commands=nt_raw.get("worker_env_commands", []),
             worker_setup_commands=nt_raw.get("worker_setup_commands", []),
             docker=docker,
+            bwrap=bwrap,
             compatible_ips=nt_raw.get("compatible_ips"),
             balance_level=balance_level,
         )
@@ -812,6 +951,7 @@ def build_config(raw: dict) -> ClusterConfig:
 
     # Parse global docker
     global_docker = _parse_container_section(raw, "top-level config")
+    global_bwrap = _parse_bwrap(raw, "top-level config")
 
     # Parse optional AWS config
     aws_config = None
@@ -916,6 +1056,7 @@ def build_config(raw: dict) -> ClusterConfig:
         rsync_exclude=raw.get("rsync_exclude", []),
         rsync_filter=raw.get("rsync_filter", []),
         global_docker=global_docker,
+        global_bwrap=global_bwrap,
         aws_config=aws_config,
         firesim_config=firesim_config,
         auth_overrides=auth_overrides,
