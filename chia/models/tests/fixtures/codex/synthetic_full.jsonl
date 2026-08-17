@@ -1,0 +1,16 @@
+{"type":"thread.started","thread_id":"01a0f00d-0000-7000-a000-000000000001"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"I will inspect the file, edit it, and run a check."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'ls'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'ls'","aggregated_output":"note.txt\n","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_2","type":"file_change","changes":[{"path":"note.txt","kind":"update"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"note.txt","kind":"update"}],"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"First turn done."}}
+{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":200,"cache_write_input_tokens":50,"output_tokens":120,"reasoning_output_tokens":40}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_4","type":"agent_message","text":"Second turn done."}}
+{"type":"turn.completed","usage":{"input_tokens":300,"cached_input_tokens":300,"cache_write_input_tokens":null,"output_tokens":10,"reasoning_output_tokens":0}}
+{"type":"item.completed","item":{"id":"item_5","type":"quantum_teleport","note":"an item type this version does not model"}}
+{"type":"cosmic.ray","detail":"an event type this version does not model"}
+{"type":"error","message":"transient upstream hiccup"}
+this line is not-json and must be kept as unparsed
