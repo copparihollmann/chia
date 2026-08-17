@@ -39,6 +39,7 @@ def test_recorder_streams_turn_tool_attempt_to_local_jsonl(tmp_path):
     assert usage[0]["uncached_input_tokens"] == 100 - 20 - 5  # subset math preserved
     tools = _lines(agent / "tools.jsonl")
     assert tools[0]["item_type"] == "command_execution"
+    assert "command" not in tools[0]
     attempts = _lines(agent / "attempts.jsonl")
     assert attempts[0]["index"] == 0
     assert (agent / "session.jsonl").exists()

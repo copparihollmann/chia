@@ -479,10 +479,45 @@ def record_run(
         )
         _write_run(run_logger, run, model=model, extra=extra, run_id=run_id,
                    run_path=run_path)
+        export_profile_jsonl(events, run_path / "agent" / "chia_profile.jsonl")
+        _materialize_structured_profile(run_path, run_id=run_id)
         run_logger.finish("completed")
         return True
     except Exception as exc:  # never let telemetry break a run
         logger.debug("aet sink failed (ignored): %s", exc)
+        return False
+
+
+def export_profile_jsonl(events: Sequence[dict], path: os.PathLike | str) -> int:
+    """Write only stable privacy-safe profile records for an external profiler.
+
+    The exporter intentionally rejects ordinary profiler ``extra`` metadata:
+    callers may put arbitrary domain data there, while ``chia.agent_profile``
+    records have a closed schema that excludes prompt/tool payloads.
+    """
+    selected = [event for event in events if event.get("schema") == "chia.agent_profile"]
+    if not selected:
+        return 0
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    temporary = out.with_suffix(out.suffix + ".partial")
+    temporary.write_text("".join(json.dumps(event, sort_keys=True) + "\n" for event in selected))
+    temporary.replace(out)
+    return len(selected)
+
+
+def _materialize_structured_profile(run_path: Path, *, run_id: str) -> bool:
+    """Let a compatible AET enrich its trajectory from the exported JSONL."""
+    profile = run_path / "agent" / "chia_profile.jsonl"
+    if not profile.is_file():
+        return False
+    try:
+        from aet.trajectory.importers.chia import import_chia
+
+        import_chia(profile, run_id=run_id).to_json(run_path / "metrics" / "trajectory.json")
+        return True
+    except Exception as exc:
+        logger.debug("structured AET profile not materialized (ignored): %s", exc)
         return False
 
 
@@ -937,12 +972,28 @@ class CodexAetRecorder:
     def record_tool(self, tool: Any) -> bool:
         if not self.enabled:
             return False
-        return self._append("tools.jsonl", _as_record(tool))
+        raw = _as_record(tool)
+        safe = {key: raw.get(key) for key in (
+            "item_id", "item_type", "kind", "status", "exit_code",
+            "started_at", "completed_at",
+        ) if raw.get(key) is not None}
+        return self._append("tools.jsonl", safe)
 
     def record_attempt(self, attempt: Any) -> bool:
         if not self.enabled:
             return False
-        return self._append("attempts.jsonl", _as_record(attempt))
+        raw = _as_record(attempt)
+        turns = raw.get("turns") if isinstance(raw.get("turns"), list) else []
+        safe = {key: raw.get(key) for key in (
+            "index", "thread_id", "started_at", "ended_at", "exit_code",
+            "signal", "timeout", "retry_reason", "failure_class",
+        ) if raw.get(key) is not None}
+        safe["usage"] = {
+            key: sum(int(turn.get(key) or 0) for turn in turns if isinstance(turn, dict))
+            for key in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                        "output_tokens", "reasoning_output_tokens")
+        }
+        return self._append("attempts.jsonl", safe)
 
     def finish(self, run_result: Any = None, status: str = "completed") -> bool:
         if not self.enabled:
@@ -951,7 +1002,12 @@ class CodexAetRecorder:
         wrote = False
         if run_result is not None:
             rec = _as_record(run_result)
-            wrote = self._append("run_result.json", rec)
+            safe = {key: rec.get(key) for key in (
+                "thread_id", "resolved_model", "requested_model", "agent_version",
+                "status", "active_wall_s", "price_snapshot_id", "total_usage",
+                "usage_complete",
+            ) if rec.get(key) is not None}
+            wrote = self._append("run_result.json", safe)
             cost = rec.get("cost_usd")
         if isinstance(cost, (int, float)):
             self._safe(lambda rl: rl.log_cost(float(cost), model=self.model))
