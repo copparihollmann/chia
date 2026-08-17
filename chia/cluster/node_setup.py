@@ -9,6 +9,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from chia.cluster.bwrap import BubblewrapManager
 from chia.cluster.config import ClusterConfig, NodeAssignment, TunnelConfig, assign_nodes
 from chia.cluster.docker import DockerManager
 from chia.cluster.ray_stop import build_address
@@ -600,18 +601,30 @@ def setup_worker_node(
             ssh.run_commands(config.initialization_commands)
         _rsync_file_mounts(ssh, config)
 
-    # Determine execution context: docker or bare SSH
-    docker_config = nt.docker or config.global_docker
+    # Determine execution context: Docker, persistent bubblewrap, or bare SSH.
+    backend, backend_config = config.get_worker_backend(nt)
+    docker_config = backend_config if backend == "docker" else None
+    bwrap_config = backend_config if backend == "bwrap" else None
     if docker_config:
         docker_config = replace(docker_config, container_name=f"{docker_config.container_name}-{assignment.worker_index}")
         docker_mgr = DockerManager(ssh, docker_config)
         with log_phase(logger, f"Setting up docker container on {ip} ({nt.name}-{assignment.worker_index})"):
             docker_mgr.setup_container()
+    elif bwrap_config:
+        bwrap_config = BubblewrapManager.for_worker(
+            bwrap_config, assignment.worker_index)
+        bwrap_mgr = BubblewrapManager(ssh, bwrap_config)
+        with log_phase(
+            logger,
+            f"Setting up bubblewrap worker on {ip} "
+            f"({nt.name}-{assignment.worker_index})",
+        ):
+            bwrap_mgr.setup_worker()
 
-    # Docker workers have isolated PID namespaces, so ray stop is always
-    # safe.  For bare-SSH workers, honour the caller's skip_ray_stop flag
-    # to avoid killing a sibling worker's Ray processes.
-    effective_skip = skip_ray_stop and not docker_config
+    # Docker and bwrap workers have isolated PID namespaces, so ray stop is
+    # always safe. For bare-SSH workers, honour skip_ray_stop to avoid killing
+    # a sibling worker's Ray processes.
+    effective_skip = skip_ray_stop and not (docker_config or bwrap_config)
     script = build_worker_script(config, assignment, tunnel_config=tunnel_config,
                                  skip_ray_stop=effective_skip, head_ip=head_ip,
                                  tailnet_alloc=tailnet_alloc)
@@ -619,6 +632,8 @@ def setup_worker_node(
     with log_phase(logger, f"Running setup and starting Ray worker on {ip} ({nt.name})"):
         if docker_config:
             docker_mgr.exec_script(script)
+        elif bwrap_config:
+            bwrap_mgr.exec_script(script)
         else:
             ssh.run_script(script)
 
@@ -953,16 +968,16 @@ def _parse_scoped_ray_stop(result) -> tuple[bool, int | None, int | None]:
     return ok, matched, foreign
 
 
-def _run_scoped_ray_stop_in_container(
-    docker_mgr: DockerManager, env_commands: list[str], target_address: str,
+def _run_scoped_ray_stop_in_context(
+    manager, env_commands: list[str], target_address: str,
 ) -> tuple[bool, int | None]:
-    """Run the scoped killer INSIDE a container. Returns ``(ok, foreign)``.
+    """Run the scoped killer inside an isolated context.
 
-    Stops only ``target_address``'s Ray in the container (by GCS address) and
-    reports how many OTHER-cluster Ray processes remain — so the caller knows
-    whether the container is still in use by another cluster.
+    The manager can be DockerManager or BubblewrapManager; both expose
+    ``exec_script``. Returns ``(ok, foreign)`` so teardown can preserve a
+    deliberately shared execution context.
     """
-    result = docker_mgr.exec_script(
+    result = manager.exec_script(
         _scoped_ray_stop_script(env_commands, target_address),
         timeout=120, check=False,
     )
@@ -1024,7 +1039,9 @@ def tear_down_worker_node(
     nt = assignment.node_type
     ssh = _make_ssh(config, ip)
 
-    docker_config = nt.docker or config.global_docker
+    backend, backend_config = config.get_worker_backend(nt)
+    docker_config = backend_config if backend == "docker" else None
+    bwrap_config = backend_config if backend == "bwrap" else None
     is_head_ip = (ip == config.head_ip)
 
     if docker_config:
@@ -1048,7 +1065,7 @@ def tear_down_worker_node(
         # a `docker rm -f` would take the co-tenant's worker down with it.
         target = gcs_address_for_node(config, assignment, tunnel_config)
         with log_phase(logger, f"Scoped stop of Ray in container '{container_name}' on {ip}"):
-            ok, foreign = _run_scoped_ray_stop_in_container(
+            ok, foreign = _run_scoped_ray_stop_in_context(
                 docker_mgr, nt.worker_env_commands, target)
         logger.info(
             f"[{ip}] scoped ray stop in '{container_name}' (target {target}): "
@@ -1071,6 +1088,48 @@ def tear_down_worker_node(
             with log_phase(logger, f"Stopping and removing container '{container_name}' on {ip}"):
                 docker_mgr.stop_container()
                 ssh.run(f"{docker_config_copy.engine} rm -f {container_name}", check=False)
+    elif bwrap_config:
+        bwrap_config = BubblewrapManager.for_worker(
+            bwrap_config, assignment.worker_index)
+        bwrap_mgr = BubblewrapManager(ssh, bwrap_config)
+        worker_name = bwrap_config.worker_name
+
+        if not config.scoped_teardown:
+            with log_phase(
+                logger, f"Stopping Ray in bubblewrap worker '{worker_name}' on {ip}",
+            ):
+                bwrap_mgr.exec_script(
+                    nt.worker_env_commands + ["ray stop"], check=False)
+            with log_phase(
+                logger, f"Stopping bubblewrap worker '{worker_name}' on {ip}",
+            ):
+                bwrap_mgr.stop_worker()
+            return
+
+        target = gcs_address_for_node(config, assignment, tunnel_config)
+        with log_phase(
+            logger,
+            f"Scoped stop of Ray in bubblewrap worker '{worker_name}' on {ip}",
+        ):
+            ok, foreign = _run_scoped_ray_stop_in_context(
+                bwrap_mgr, nt.worker_env_commands, target)
+        logger.info(
+            f"[{ip}] scoped ray stop in bubblewrap worker '{worker_name}' "
+            f"(target {target}): ok={ok} foreign={foreign}")
+        if not ok:
+            logger.error(
+                f"[{ip}] scoped Ray stop in bubblewrap worker '{worker_name}' "
+                "could not run. Leaving the namespace untouched; re-run with "
+                "--no-scoped to force removal.")
+        elif foreign:
+            logger.info(
+                f"[{ip}] bubblewrap worker '{worker_name}' still hosts "
+                f"{foreign} Ray process(es) from another cluster — leaving it running.")
+        else:
+            with log_phase(
+                logger, f"Stopping bubblewrap worker '{worker_name}' on {ip}",
+            ):
+                bwrap_mgr.stop_worker()
     elif not is_head_ip:
         with log_phase(logger, f"Stopping Ray on {ip} ({nt.name})"):
             if not config.scoped_teardown:
