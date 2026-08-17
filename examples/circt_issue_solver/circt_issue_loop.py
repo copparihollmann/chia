@@ -79,6 +79,7 @@ CFG = {
 # two levels up: <repo>/chia.
 _CHIA_PKG = FLOW_DIR.parent.parent / "chia"
 _PY_MODULES = [str(FLOW_DIR / "circt_util.py"),
+               str(FLOW_DIR / "agent_factory.py"),
                str(FLOW_DIR / "issue_task.py"),
                str(_CHIA_PKG)]
 # excludes applies to runtime-env uploads (working_dir + py_modules).

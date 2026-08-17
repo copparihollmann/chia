@@ -22,7 +22,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Union
 
 import ray
 
@@ -30,9 +30,13 @@ from chia.base.ChiaFunction import ChiaFunction
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
 from chia.base.redact import redact, secret_values
 from chia.base.usage import normalize_usage_keys
+from chia.models.agents import AgentDefinition, ModelRef, ProviderSpec, validate_agents
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
+
+
+VERIFIED_OPENCODE_VERSION = "1.18.10"
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +410,27 @@ class AdditionalModelProvider:
             entry["options"] = options
         return entry
 
+    def to_provider_spec(self) -> ProviderSpec:
+        """Return the shared provider shape used by new integrations.
+
+        ``AdditionalModelProvider`` remains supported for compatibility. New
+        code should prefer :class:`chia.models.agents.ProviderSpec`, whose
+        credential field names an environment variable instead of accepting a
+        literal secret.
+        """
+        credential_env = None
+        if self.api_key and self.api_key.startswith("{env:") and self.api_key.endswith("}"):
+            credential_env = self.api_key[5:-1]
+        options = dict(self.options or {})
+        return ProviderSpec(
+            id=self.id,
+            protocol="openai-compatible",
+            models=self.models,
+            base_url=self.base_url,
+            credential_env=credential_env,
+            options=options,
+        )
+
 
 class OpenCodeLLM(LLMCallBase):
     """Wraps the ``opencode`` CLI as an LLM backend.
@@ -442,6 +467,10 @@ class OpenCodeLLM(LLMCallBase):
         config: Optional[dict] = None,
         sandbox_spec=UNSET,
         sandbox_backend: str = "none",
+        agents: Optional[Sequence[AgentDefinition]] = None,
+        primary_agent: Optional[str] = None,
+        providers: Optional[Sequence[ProviderSpec]] = None,
+        extra_env: Optional[dict] = None,
     ):
         super().__init__(system_message=system_message,
                          dangerously_skip_permissions=dangerously_skip_permissions,
@@ -455,6 +484,31 @@ class OpenCodeLLM(LLMCallBase):
         self.model = model
         self.opencode_bin = opencode_bin
         self.agent_name = agent_name
+        self.agents = tuple(agents or ())
+        self.primary_agent = primary_agent
+        self.providers = tuple(providers or ())
+        self.extra_env = dict(extra_env or {})
+        validate_agents(self.agents, self.primary_agent)
+        provider_by_id = {provider.id: provider for provider in self.providers}
+        if len(provider_by_id) != len(self.providers):
+            raise ValueError("duplicate provider id in providers")
+        for agent in self.agents:
+            if not isinstance(agent.model, ModelRef):
+                continue
+            provider = provider_by_id.get(agent.model.provider)
+            if provider is None:
+                continue  # built-in providers need no ProviderSpec
+            if not provider.has_model(agent.model.model):
+                raise ValueError(
+                    f"provider {provider.id!r} does not declare model {agent.model.model!r}"
+                )
+            if agent.role != "background" and provider.options.get("supports_tools") is False:
+                raise ValueError(
+                    f"agent {agent.name!r} requires tools but provider {provider.id!r} "
+                    "declares supports_tools=False"
+                )
+        if self.primary_agent is not None:
+            self.agent_name = self.primary_agent
         self.work_dir = work_dir
         self.extra_cli_args = extra_cli_args or []
         self.additional_providers = additional_providers or []
@@ -732,6 +786,8 @@ class OpenCodeLLM(LLMCallBase):
                 }
             },
         }
+        for agent in sorted(self.agents, key=lambda item: item.name):
+            cfg["agent"][agent.name] = agent.to_opencode()
         if tools:
             mcp: dict = {}
             for tool in tools:
@@ -757,6 +813,12 @@ class OpenCodeLLM(LLMCallBase):
             provider_cfg: dict = cfg.setdefault("provider", {})
             for provider in self.additional_providers:
                 provider_cfg[provider.id] = provider.to_config_entry()
+        if self.providers:
+            provider_cfg = cfg.setdefault("provider", {})
+            for provider in self.providers:
+                if provider.id in provider_cfg:
+                    raise ValueError(f"duplicate provider id: {provider.id}")
+                provider_cfg[provider.id] = provider.to_opencode()
         return cfg
 
     def _build_run_cmd(self, user_message: str) -> list:
@@ -799,6 +861,7 @@ class OpenCodeLLM(LLMCallBase):
         # credentials / provider env vars in the inherited environment provide
         # auth (we don't touch them).
         env = dict(os.environ)
+        env.update(self.extra_env)
         env["OPENCODE_CONFIG"] = cfg_path
         env["OPENCODE_DISABLE_PROJECT_CONFIG"] = "1"
 

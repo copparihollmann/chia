@@ -9,6 +9,39 @@ For most serious tasks that don't require on-premises LLM serving, we expect you
 
 API reference for :mod:`chia.models`. These pages are generated from the docstrings in the source, so they stay in sync with the code.
 
+Provider-neutral agents
+-----------------------
+
+``AgentDefinition`` is the shared description accepted by both
+``ClaudeCodeLLM(agents=..., primary_agent=...)`` and
+``OpenCodeLLM(agents=..., primary_agent=...)``. ``ModelRef`` keeps provider and
+model identities explicit, while ``ProviderSpec`` describes transport without
+copying a credential into configuration::
+
+   from chia.models.agents import AgentDefinition, ModelRef, ProviderSpec
+
+   providers = [ProviderSpec(
+       id="local", protocol="openai-compatible", models=("strong", "weak"),
+       base_url="http://127.0.0.1:8124/v1", credential_env="LOCAL_API_KEY",
+   )]
+   agents = [
+       AgentDefinition("lead", "Own the answer", "Delegate repository research.",
+                       role="primary", model=ModelRef("local", "strong")),
+       AgentDefinition("explorer", "Read the tree", "Return evidence only.",
+                       model=ModelRef("local", "weak"),
+                       tools=("Read", "Glob", "Grep")),
+   ]
+
+For Claude Code, run the loopback Messages gateway and set
+``ANTHROPIC_BASE_URL``, ``ANTHROPIC_AUTH_TOKEN`` and
+``CLAUDE_CODE_USE_GATEWAY=1`` in the Claude subprocess environment. For
+OpenCode, pass the same providers and agents directly. The older
+``AdditionalModelProvider`` remains supported. Offline fixtures pin Claude Code
+2.1.233 and OpenCode 1.18.10; Claude feature-detects the required flags before
+launching a delegated run.
+
+.. automodule:: chia.models.agents
+
 Claude
 ------
 
@@ -69,7 +102,8 @@ Bedrock Converse proxy
 
 A local Bedrock-shaped endpoint that lets the Claude Code CLI drive **any** Bedrock
 model, not only the Anthropic ones. Requests for Anthropic models are forwarded
-verbatim; everything else is translated to Converse and streamed back as Anthropic SSE.
+verbatim; everything else is translated to Converse and streamed back using AWS
+event-stream framing.
 Because ``ANTHROPIC_MODEL``, ``CLAUDE_CODE_SUBAGENT_MODEL`` and
 ``ANTHROPIC_SMALL_FAST_MODEL`` are separate levers, one proxy can route each tier to a
 different provider.
@@ -77,3 +111,14 @@ different provider.
 .. automodule:: chia.models.proxy.server
 
 .. automodule:: chia.models.proxy.translate
+
+Provider-agnostic Messages gateway
+----------------------------------
+
+The gateway routes opaque ``provider/model`` identifiers to a backend protocol.
+It includes Bedrock Converse and OpenAI-compatible adapters, binds loopback by
+default, and references credentials by environment-variable name. It is suitable
+for Claude Code's ``ANTHROPIC_BASE_URL`` transport and for deterministic local
+test endpoints.
+
+.. automodule:: chia.models.proxy.gateway

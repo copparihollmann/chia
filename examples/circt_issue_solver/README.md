@@ -169,3 +169,13 @@ ten complete pairs exist, median representative end-to-end time improves by at
 least 5%, and the paired bootstrap 95% confidence interval excludes zero
 improvement. Startup is reported separately. A smoke run with fewer pairs is
 always ``no-go`` regardless of its point estimate.
+
+## Agent harness experiments
+
+The worker pipeline constructs its harness through ``agent_factory.make_agent``.
+The default remains ``ClaudeCodeLLM``. Set ``CFG["agent_kwargs"]`` to pass
+provider-neutral ``agents`` / ``primary_agent`` definitions, or set
+``CFG["agent_factory"]`` to an importable ``"module:function"`` for a different
+harness. A custom factory receives ``cfg``, ``phase``, and ``default_kwargs``;
+it must return an object exposing Chia's ``prompt`` interface. This keeps the
+issue task, prompts, tools, and verification identical across harness arms.
