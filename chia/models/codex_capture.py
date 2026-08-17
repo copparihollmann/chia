@@ -25,7 +25,7 @@ import os
 import select
 import signal
 import subprocess
-import threading
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -94,7 +94,8 @@ def _now() -> str:
 def stream_codex(
     cmd: Sequence[str],
     *,
-    input_text: str,
+    input_text: str | None = None,
+    stdin_path: str | None = None,
     raw_path: str,
     stderr_path: str,
     timeout: float | None = None,
@@ -103,76 +104,117 @@ def stream_codex(
     on_event: EventCallback | None = None,
     timestamped_path: str | None = None,
     fsync_every: int = _FSYNC_EVERY,
-    popen: Callable[..., "subprocess.Popen[str]"] | None = None,
+    popen: Callable[..., "subprocess.Popen"] | None = None,
 ) -> CaptureResult:
-    """Run *cmd*, teeing stdout JSONL to *raw_path* line by line as it arrives.
+    """Run *cmd*, teeing stdout to *raw_path* byte-for-byte as it arrives.
 
-    ``input_text`` is written to the child's stdin (in a helper thread so a large
-    prompt cannot deadlock against a child that starts emitting before it has
-    drained stdin). ``on_event`` is called for every stdout line with the raw
-    line and its parsed form (or ``None`` when the line is not a JSON object).
+    The prompt is delivered to the child's stdin from a *file* (``stdin_path``,
+    or a temp file holding ``input_text``): a regular file cannot deadlock
+    against a child that emits before it has drained stdin, so no feeder thread
+    is needed, and the on-disk bytes are the reproducible prompt artifact.
+
+    stdout is read at the fd level in chunks (``os.read``, never ``readline`` —
+    a line lacking a trailing newline must not be able to block the reader past
+    its deadline) and mirrored to *raw_path* verbatim. ``on_event`` is called
+    per complete line with the decoded text and its parsed form (``None`` when
+    the line is not a JSON object).
 
     On *timeout* the process is killed and ``timed_out`` is set, but *raw_path*
-    remains a complete, parseable JSONL of everything seen up to the kill — that
-    salvage guarantee is the whole point of streaming rather than buffering.
+    still holds everything the child had flushed — including a final PARTIAL
+    line (no newline) written when it was killed mid-write. That salvage
+    guarantee is the whole reason this streams rather than buffers.
     """
     os.makedirs(os.path.dirname(os.path.abspath(raw_path)) or ".", exist_ok=True)
     _popen = popen or subprocess.Popen
     result = CaptureResult(raw_path=raw_path, stderr_path=stderr_path, started_at=_now())
     deadline = None if timeout is None else time.monotonic() + timeout
 
+    # Prompt via a file, not a pipe (avoids the classic write-stdin-while-reading
+    # -stdout deadlock without a thread). A temp file is used only when the
+    # caller passed raw text instead of an on-disk prompt path.
+    tmp_stdin: str | None = None
+    if stdin_path is None:
+        fd, tmp_stdin = tempfile.mkstemp(prefix="codex_prompt_")
+        with os.fdopen(fd, "w", encoding="utf-8") as pf:
+            pf.write(input_text or "")
+        stdin_path = tmp_stdin
+    stdin_f = open(stdin_path, "rb")
+
     proc = _popen(
         list(cmd),
-        stdin=subprocess.PIPE,
+        stdin=stdin_f,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+        bufsize=0,  # unbuffered bytes; we frame lines ourselves
         cwd=cwd,
         env=env,
     )
 
-    def _feed_stdin() -> None:
-        try:
-            if proc.stdin is not None:
-                proc.stdin.write(input_text)
-                proc.stdin.close()
-        except (BrokenPipeError, ValueError, OSError):
-            pass
-
-    stdin_thread = threading.Thread(target=_feed_stdin, daemon=True)
-    stdin_thread.start()
-
-    raw_file = open(raw_path, "w", encoding="utf-8")
+    stdout_fd = proc.stdout.fileno()
+    raw_file = open(raw_path, "wb")
     ts_file = open(timestamped_path, "w", encoding="utf-8") if timestamped_path else None
+    line_buf = b""
     since_fsync = 0
+    _closed = False
 
-    def _tee(line: str) -> None:
-        """Write one stdout line to disk immediately, parse it, and notify."""
-        nonlocal since_fsync
-        raw_file.write(line)
-        raw_file.flush()
-        since_fsync += 1
-        if since_fsync >= fsync_every:
+    def _close_files() -> None:
+        # Idempotent: an early-return path and the finally both call this.
+        nonlocal _closed
+        if _closed:
+            return
+        _closed = True
+        try:
+            raw_file.flush()
             os.fsync(raw_file.fileno())
-            since_fsync = 0
+        except (OSError, ValueError):
+            pass
+        try:
+            raw_file.close()
+        except (OSError, ValueError):
+            pass
+        if ts_file is not None:
+            try:
+                ts_file.close()
+            except (OSError, ValueError):
+                pass
+
+    def _emit_line(bline: bytes) -> None:
+        """Account one complete logical line for parsing/callback (already tee'd)."""
+        nonlocal since_fsync
+        text = bline.decode("utf-8", "replace")
         result.lines_written += 1
-        stripped = line.rstrip("\n")
-        event = parse_line(stripped)
+        event = parse_line(text)
         if event is None:
-            if stripped.strip():
-                result.unparsed_lines.append(stripped)
+            if text.strip():
+                result.unparsed_lines.append(text)
         else:
             result.events.append(event)
         if ts_file is not None:
-            ts_file.write(json.dumps({"ts": _now(), "line": stripped}) + "\n")
+            ts_file.write(json.dumps({"ts": _now(), "line": text}) + "\n")
             ts_file.flush()
         if on_event is not None:
             try:
-                on_event(stripped, event)
+                on_event(text, event)
             except Exception:
                 # A live recorder is telemetry; it must never break capture.
                 pass
+        since_fsync += 1
+        if since_fsync >= fsync_every:
+            try:
+                os.fsync(raw_file.fileno())
+            except OSError:
+                pass
+            since_fsync = 0
+
+    def _consume(chunk: bytes) -> None:
+        """Tee raw bytes to disk immediately, then frame and emit whole lines."""
+        nonlocal line_buf
+        raw_file.write(chunk)
+        raw_file.flush()  # visible to a concurrent re-reader at once (salvage)
+        line_buf += chunk
+        while b"\n" in line_buf:
+            line, line_buf = line_buf.split(b"\n", 1)
+            _emit_line(line)
 
     try:
         while True:
@@ -185,49 +227,59 @@ def stream_codex(
             else:
                 remaining = None
 
-            ready, _, _ = select.select([proc.stdout], [], [], remaining)
+            ready, _, _ = select.select([stdout_fd], [], [], remaining)
             if not ready:
-                # select timed out; loop recomputes the deadline (and exits).
-                continue
+                continue  # select woke on the deadline; loop re-checks it
 
-            line = proc.stdout.readline()
-            if line == "":
-                break  # EOF: the child closed stdout (normal completion).
-            _tee(line)
+            chunk = os.read(stdout_fd, 65536)
+            if chunk == b"":
+                break  # EOF: the child closed stdout (normal completion)
+            _consume(chunk)
 
-        # Salvage any lines that were already sitting in the pipe when we broke
-        # out (a timeout kill in particular): drain without blocking so nothing
-        # the child had already flushed is lost from the raw file.
+        # Drain whatever the child had already written into the pipe before we
+        # broke out — a timeout kill in particular. Non-blocking, to EOF/empty,
+        # so no flushed byte is lost from the raw file.
         while True:
-            ready, _, _ = select.select([proc.stdout], [], [], 0)
+            ready, _, _ = select.select([stdout_fd], [], [], 0)
             if not ready:
                 break
-            line = proc.stdout.readline()
-            if line == "":
+            try:
+                chunk = os.read(stdout_fd, 65536)
+            except OSError:
                 break
-            _tee(line)
-    finally:
-        raw_file.flush()
-        try:
-            os.fsync(raw_file.fileno())
-        except OSError:
-            pass
-        raw_file.close()
-        if ts_file is not None:
-            ts_file.close()
+            if chunk == b"":
+                break
+            _consume(chunk)
 
-    # Drain whatever the child wrote to stderr and reap it. stdout is already
-    # drained above, so only stderr is collected here.
+        # A trailing PARTIAL line (no newline) — the last thing a mid-write kill
+        # leaves — is already on disk byte-for-byte via the raw tee; account it
+        # for parsing too so it survives verbatim as an (unparsed) record.
+        if line_buf.strip():
+            _emit_line(line_buf)
+            line_buf = b""
+    finally:
+        _close_files()
+
+    # stdout is already drained; collect stderr and reap.
     try:
-        _, stderr_text = proc.communicate(timeout=5)
+        _, stderr_bytes = proc.communicate(timeout=5)
     except subprocess.TimeoutExpired:
         _kill(proc)
-        _, stderr_text = proc.communicate()
-    stderr_text = stderr_text or ""
+        _, stderr_bytes = proc.communicate()
+    stderr_text = (stderr_bytes or b"").decode("utf-8", "replace")
     with open(stderr_path, "w", encoding="utf-8") as sf:
         sf.write(stderr_text)
 
-    stdin_thread.join(timeout=1)
+    try:
+        stdin_f.close()
+    except OSError:
+        pass
+    if tmp_stdin is not None:
+        try:
+            os.unlink(tmp_stdin)
+        except OSError:
+            pass
+
     result.returncode = proc.returncode
     result.signal = _signal_name(proc.returncode)
     result.stderr_text = stderr_text
@@ -235,7 +287,7 @@ def stream_codex(
     return result
 
 
-def _kill(proc: "subprocess.Popen[str]") -> None:
+def _kill(proc: "subprocess.Popen") -> None:
     """Best-effort terminate → kill of a child that overran its deadline."""
     if proc.poll() is not None:
         return

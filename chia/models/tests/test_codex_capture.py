@@ -64,6 +64,31 @@ def test_timeout_kills_but_raw_jsonl_is_salvageable(tmp_path):
     assert parsed.turns_completed == 0  # died before turn.completed
 
 
+def test_partial_line_no_newline_survives_a_mid_write_kill(tmp_path):
+    raw = tmp_path / "events.raw.jsonl"
+    err = tmp_path / "stderr.log"
+    # One complete line, then a PARTIAL line with no trailing newline, then hang.
+    # readline() would block forever on the newline-less fragment; the fd reader
+    # must instead salvage it verbatim when the process is killed for timeout.
+    body = (
+        "import sys, json, time\n"
+        "sys.stdout.write(json.dumps({'type': 'thread.started', 'thread_id': 'T5'}) + '\\n')\n"
+        "sys.stdout.write('{\"type\":\"turn.started\"')\n"  # deliberately no newline
+        "sys.stdout.flush()\n"
+        "time.sleep(60)\n"
+    )
+    res = stream_codex(_child(body), input_text="", raw_path=str(raw), stderr_path=str(err), timeout=1.0)
+    assert res.timed_out is True
+    text = raw.read_text()
+    # The partial fragment is on disk byte-for-byte (no newline was invented).
+    assert text.endswith('{"type":"turn.started"')
+    # It is kept as an unparsed record, never dropped.
+    assert '{"type":"turn.started"' in res.unparsed_lines
+    # And the complete line before it still parses.
+    parsed = parse_stream_text(text)
+    assert parsed.thread_id == "T5"
+
+
 def test_corrupt_line_is_kept_not_dropped(tmp_path):
     raw = tmp_path / "events.raw.jsonl"
     err = tmp_path / "stderr.log"
