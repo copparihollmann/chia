@@ -95,6 +95,38 @@ For events that aren't tied to a single call, use ``log_event``:
 Each custom event is timestamped and tagged with the current ``worker_id``
 automatically.
 
+Agent and cache telemetry
+-------------------------
+
+Model calls also emit schema-versioned ``chia.agent_profile`` JSONL records. The stable event
+types are ``llm_request``, ``tool_activity``, ``agent_start``, and ``agent_end``. They inherit the
+active ``call_id`` across the profiled worker trampoline and carry provider/model, attempt and retry
+identity, timing, fresh/cache-read/cache-write/output/reasoning token buckets, and billing
+provenance. Prompts, tool arguments/results, file contents, environment values, and credentials are
+never included.
+
+External profilers can consume the collector JSONL directly. AET understands it as a native import:
+
+.. code-block:: console
+
+   aet import --source chia --raw /data/chia_profiles/ChiaProfileCollector.log \
+       --out trajectory.json
+   aet plot trajectory.json --kind agent-profiles --out agent-profile.png
+
+Use :func:`chia.trace.profile_events.agent_scope` around a parent or delegated agent to populate the
+agent hierarchy. Cache reads/writes are provider measurements; context occupancy and probable TTL
+expiry are downstream derivations and must not be described as physical KV-cache fullness or a
+known eviction cause.
+
+``AetClaudeCodeLLM`` experiment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:class:`chia.models.aet_claude.AetClaudeCodeLLM` subclasses the regular Claude backend and starts a
+worker-local AET OTLP/HTTP receiver on an ephemeral port for each invocation. It injects telemetry
+variables only into that subprocess and shuts the receiver down in ``finally``. AET remains an
+optional dependency and receiver failures do not fail the agent call. Default Chia profiling does
+not depend on this subclass.
+
 Visualizing a profile
 ---------------------
 

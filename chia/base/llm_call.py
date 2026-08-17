@@ -1,5 +1,6 @@
 
 import warnings
+import uuid
 from typing import List, Optional, Sequence, Tuple
 from dataclasses import dataclass, field
 from abc import ABC, abstractmethod
@@ -277,7 +278,68 @@ class LLMCallBase(ABC):
         if isinstance(meta, dict) and meta:
             meta.setdefault("cost_source", result.usage.cost_source)
             meta.setdefault("billing_mode", result.usage.billing_mode)
+        # Retry attempts were emitted individually by ``note_retry``.  The
+        # public QueryResult intentionally carries the cumulative total, but
+        # emitting that total here would count every retry twice in a trace.
+        # An explicit empty mapping is used by all-attempts-failed paths; there
+        # is no additional provider request to represent in that case.
+        if meta:
+            self._emit_usage_event(usage, meta=meta, status=(
+                "completed" if result.success or result.returncode == 0 else "failed"
+            ), attempt=len(self.retry_attempts) + 1, retry=False)
         return result
+
+    def _emit_usage_event(self, usage: TokenUsage, *, meta: Optional[dict], status: str,
+                          attempt: int, retry: bool) -> None:
+        """Mirror one provider attempt into the privacy-safe profile schema."""
+        try:
+            from dataclasses import replace
+            from chia.trace.profile_events import llm_request_event
+            from chia.trace.profiler import get_profiler
+
+            profiler = get_profiler()
+            if not profiler.enabled:
+                return
+            raw = meta if isinstance(meta, dict) else {}
+            context = profiler.profile_context()
+            session_id = str(raw.get("session_id", "") or getattr(self, "_session_id", "") or "")
+            if session_id:
+                context = replace(context, session_id=session_id)
+            model = usage.model or str(getattr(self, "model", "") or "")
+            backend = type(self).__name__
+            explicit_provider = str(raw.get("provider", "") or "").lower()
+            qualified_model = model.lower()
+            if explicit_provider:
+                provider = explicit_provider
+            elif (qualified_model.startswith(("bedrock/", "aws/", "arn:aws:"))
+                  or ".anthropic." in qualified_model):
+                provider = "aws"
+            elif qualified_model.startswith(("openai/", "azure/")):
+                provider = "openai"
+            elif qualified_model.startswith(("vertex/", "google/")):
+                provider = "google"
+            else:
+                lower = f"{backend} {model}".lower()
+                provider = (
+                    "openai" if "codex" in lower or "openai" in lower else
+                    "google" if "vertex" in lower or "gemini" in lower else
+                    "aws" if "bedrock" in lower else
+                    "anthropic" if "claude" in lower else "unknown"
+                )
+            profiler.log_profile_event(llm_request_event(
+                context, provider=provider, model=model, backend=backend,
+                status=status, request_id=getattr(self, "_profile_request_id", ""),
+                attempt=attempt, duration_s=raw.get("duration_s"),
+                ttft_s=raw.get("ttft_s"), input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cache_read_tokens=usage.cache_read_input_tokens,
+                cache_write_tokens=usage.cache_creation_input_tokens,
+                reasoning_tokens=usage.reasoning_tokens, cost_usd=usage.cost_usd,
+                cost_source=usage.cost_source, billing_mode=usage.billing_mode,
+                retry=retry,
+            ))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Retry accounting
@@ -295,6 +357,7 @@ class LLMCallBase(ABC):
         propagated an exception from leaking its attempts into the next call.
         """
         self._retry_attempts: List[RetryAttempt] = []
+        self._profile_request_id = uuid.uuid4().hex
 
     def note_retry(
         self,
@@ -345,6 +408,10 @@ class LLMCallBase(ABC):
         if not hasattr(self, "_retry_attempts"):
             self.begin_retry_ledger()
         self._retry_attempts.append(record)
+
+        self._emit_usage_event(
+            record.usage, meta=meta, status="failed", attempt=record.attempt, retry=True,
+        )
 
         try:
             from chia.trace.profiler import get_profiler

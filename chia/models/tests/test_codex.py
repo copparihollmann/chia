@@ -276,8 +276,11 @@ def test_prompt_streams_into_typed_run_result(monkeypatch, tmp_path):
     assert usage.uncached_input_tokens == 100 - 20 - 0  # subset accounting
     assert usage.provider_reported is True
     # Cumulative canonical metadata omits unknown fields, never fabricates 0.
-    assert llm._last_metadata["input_tokens"] == 100
+    assert llm._last_metadata["input_tokens"] == 80
     assert llm._last_metadata["cache_read_input_tokens"] == 20
+    assert cli.usage.input_tokens == 80
+    assert cli.usage.cache_read_input_tokens == 20
+    assert cli.usage.total_tokens == 110  # 80 fresh + 20 cached + 10 output
     # Raw JSONL was teed to a durable per-attempt file.
     assert os.path.exists(run.attempts[0].raw_event_path)
 
@@ -329,6 +332,10 @@ def test_retry_preserves_failed_attempt_usage(monkeypatch, tmp_path):
     # The failed attempt's tokens are NOT erased by the retry.
     assert run.total_usage.input_tokens == 300
     assert run.total_usage.output_tokens == 12
+    # QueryResult exposes the same two-attempt bill once, not cumulative run
+    # usage plus the failed-attempt retry ledger a second time.
+    assert cli.usage.input_tokens == 300
+    assert cli.usage.output_tokens == 12
     assert run.attempts[0].failure_class == "unknown"
     assert run.attempts[1].failure_class is None
 

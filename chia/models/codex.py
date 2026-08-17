@@ -465,6 +465,16 @@ class CodexLLM(LLMCallBase):
             requested_model=self.model,
             prompt_sha256=hashlib.sha256(self._format_prompt(user_message).encode("utf-8")).hexdigest(),
         )
+        try:
+            from chia.trace.aet_sink import CodexAetRecorder
+
+            self._aet_recorder = CodexAetRecorder(
+                run_id=os.environ.get("CHIA_PROFILE_RUN_ID", "")
+                or os.environ.get("CHIA_AET_RUN_ID", ""),
+                model=self.model or "codex-default",
+            )
+        except Exception:
+            self._aet_recorder = None
         self._last_metadata = {}
         last_error = ""
         for attempt in range(self.retries):
@@ -480,6 +490,9 @@ class CodexLLM(LLMCallBase):
                         for t in tool_list
                     ],
                 })
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled:
                     profiler.add_info(self._last_metadata)
                 self._classify_error(cli)
@@ -488,9 +501,11 @@ class CodexLLM(LLMCallBase):
                 self._run_result.resolved_model = self.model
                 cli.success = True
                 cli.run_result = self._run_result
+                self._finish_aet_recorder("completed")
                 return cli
             except (RateLimitError, AuthenticationError, BillingError, InvalidRequestError) as exc:
                 self._note_failure(exc)
+                self._finish_aet_recorder("failed")
                 raise
             except MaxOutputTokensError as exc:
                 self._note_failure(exc)
@@ -498,6 +513,7 @@ class CodexLLM(LLMCallBase):
                     self.logger.warning("Max output tokens on attempt %d/%d, retrying once",
                                         attempt + 1, self.retries)
                     continue
+                self._finish_aet_recorder("failed")
                 raise
             except ServerError as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
@@ -517,7 +533,10 @@ class CodexLLM(LLMCallBase):
                 self.logger.warning("Unexpected Codex error on attempt %d/%d: %s",
                                     attempt + 1, self.retries, exc)
         self._run_result.status = "failed"
-        return CodexQueryResult(
+        self._finish_aet_recorder("failed")
+        # Every attempt failed. The result still carries accounting: failed
+        # attempts may be billed and cannot appear free in aggregate profiles.
+        return self.attach_usage(CodexQueryResult(
             result=self._run_result.final_output,
             returncode=-1,
             stderr=last_error,
@@ -528,7 +547,7 @@ class CodexLLM(LLMCallBase):
             session_state_paths=self._session_state_paths,
             run_result=self._run_result,
             thread_id=self._run_result.thread_id,
-        )
+        ), meta={})
 
     def _note_failure(self, exc: BaseException) -> None:
         """Tag the most recent attempt with a failure class (best effort)."""
@@ -541,6 +560,16 @@ class CodexLLM(LLMCallBase):
                 )
             if last.retry_reason is None:
                 last.retry_reason = f"{type(exc).__name__}: {str(exc)[:200]}"
+
+    def _finish_aet_recorder(self, status: str) -> None:
+        recorder = getattr(self, "_aet_recorder", None)
+        if recorder is None:
+            return
+        try:
+            recorder.finish(self._run_result, status=status)
+        except Exception:
+            pass
+        self._aet_recorder = None
 
     def _sync_session(self, cli: CodexQueryResult) -> CodexQueryResult:
         """Copy worker-captured Codex session state onto this instance."""
@@ -651,18 +680,22 @@ class CodexLLM(LLMCallBase):
         timestamped = base + ".timestamped.jsonl" if self.capture_arrival_timestamps else None
         return base + ".events.jsonl", base + ".stderr.log", timestamped
 
-    def _canonical_usage(self) -> dict:
-        """Cumulative usage across all recorded attempts, in canonical keys.
+    def _canonical_usage(self, attempt: CodexAttempt) -> dict:
+        """Usage for one attempt, in canonical non-overlapping keys.
 
         Only reported fields are written; an unknown (``None``) count is omitted
         entirely rather than coerced to ``0`` (unknown is not free — see
-        :mod:`chia.models.usage`).
+        :mod:`chia.base.usage`). Retried attempts are folded later by
+        :meth:`LLMCallBase.attach_usage`; passing cumulative run usage here would
+        count every failed attempt twice.
         """
-        assert self._run_result is not None
-        total = self._run_result.total_usage
+        total = attempt.usage
         meta: dict[str, Any] = {}
         mapping = {
-            "input_tokens": total.input_tokens,
+            # Codex reports cache counters as subsets of input_tokens. Chia's
+            # canonical input is fresh only, with reads/writes in their own
+            # priced buckets.
+            "input_tokens": total.uncached_input_tokens,
             "output_tokens": total.output_tokens,
             "cache_read_input_tokens": total.cached_input_tokens,
             "cache_creation_input_tokens": total.cache_write_input_tokens,
@@ -671,8 +704,8 @@ class CodexLLM(LLMCallBase):
         for key, value in mapping.items():
             if value is not None:
                 meta[key] = value
-        turns = sum(1 for a in self._run_result.attempts
-                    for t in a.turns if t.source_event == codex_events.EVENT_TURN_COMPLETED)
+        turns = sum(1 for t in attempt.turns
+                    if t.source_event == codex_events.EVENT_TURN_COMPLETED)
         if turns:
             meta["num_turns"] = turns
         if self._session_id:
@@ -706,6 +739,7 @@ class CodexLLM(LLMCallBase):
                 cwd=self.work_dir or None,
                 env=os.environ.copy(),
                 timestamped_path=timestamped_path,
+                on_event=self._record_stream_event,
             )
             parsed = codex_events.parse_events(capture.events)
             parsed.unparsed_lines.extend(capture.unparsed_lines)
@@ -738,10 +772,39 @@ class CodexLLM(LLMCallBase):
                 final_output=final_text,
             )
             self._run_result.attempts.append(attempt)
+            recorder = getattr(self, "_aet_recorder", None)
+            if recorder is not None:
+                recorder.record_attempt(attempt)
             if self._run_result.thread_id is None and thread_id:
                 self._run_result.thread_id = thread_id
             self._run_result.active_wall_s += capture.active_wall_s
-            self._last_metadata = self._canonical_usage()
+            self._last_metadata = self._canonical_usage(attempt)
+
+            # Preserve tool activity as structured events without exporting
+            # commands, file paths, output, or the raw item payload.
+            try:
+                from chia.trace.profile_events import tool_activity_event
+                from chia.trace.profiler import get_profiler
+
+                profiler = get_profiler()
+                for tool in attempt.tools:
+                    duration_s = None
+                    if tool.started_at and tool.completed_at:
+                        try:
+                            duration_s = max(0.0, (
+                                datetime.fromisoformat(tool.completed_at.replace("Z", "+00:00"))
+                                - datetime.fromisoformat(tool.started_at.replace("Z", "+00:00"))
+                            ).total_seconds())
+                        except (TypeError, ValueError):
+                            pass
+                    profiler.log_profile_event(tool_activity_event(
+                        profiler.profile_context(), tool_name=tool.kind,
+                        category="write" if tool.kind == "file_change" else "tool",
+                        status="failed" if tool.failed else "completed",
+                        duration_s=duration_s,
+                    ))
+            except Exception:
+                pass
 
             raw_text = redact(self._read_text(raw_path), values=secrets) or ""
             if self._log_prefix is not None:
@@ -770,6 +833,27 @@ class CodexLLM(LLMCallBase):
                 os.unlink(output_path)
             except FileNotFoundError:
                 pass
+
+    def _record_stream_event(self, _line: str, event: dict | None) -> None:
+        """Feed safe typed facts to the optional recorder as stdout arrives."""
+        recorder = getattr(self, "_aet_recorder", None)
+        if recorder is None or not isinstance(event, dict):
+            return
+        event_type = str(event.get("type") or "")
+        if event_type == "thread.started":
+            recorder.record_thread(str(event.get("thread_id") or ""))
+        elif event_type == "turn.completed":
+            recorder.record_turn(codex_events.TurnUsage.from_payload(
+                event.get("usage"), source_event=codex_events.EVENT_TURN_COMPLETED,
+            ))
+        elif event_type == "item.completed":
+            item = event.get("item") if isinstance(event.get("item"), dict) else {}
+            recorder.record_tool({
+                "item_id": str(item.get("id") or ""),
+                "item_type": str(item.get("type") or "unknown"),
+                "status": str(item.get("status") or "completed"),
+                "exit_code": item.get("exit_code"),
+            })
 
     @staticmethod
     def _read_text(path: str) -> str:

@@ -114,7 +114,14 @@ class ChiaFunction:
             profiler = get_profiler()
             if profiler.enabled:
                 info = profiler.on_local_start(func, args, kwargs)
-                result = func(*args, **kwargs)
+                try:
+                    result = func(*args, **kwargs)
+                except BaseException:
+                    # Do not leak this call's structured telemetry identity into
+                    # the next local invocation when the function raises.
+                    if info is not None:
+                        profiler.set_profile_context(info.previous_context)
+                    raise
                 profiler.on_local_end(info, result)
                 return result
             return func(*args, **kwargs)
@@ -437,6 +444,7 @@ def _chia_trampoline_profiled(func, call_id, dispatch_meta, _chia_bypass_state_,
     # Emit the dispatch event from the worker at actual task start.
     profiler = get_profiler()
     display_name = dispatch_meta.get("display_name", "") if dispatch_meta else ""
+    previous_context = profiler.begin_call_context(call_id)
 
     if profiler.enabled and dispatch_meta:
         profiler.on_worker_dispatch(
@@ -449,8 +457,10 @@ def _chia_trampoline_profiled(func, call_id, dispatch_meta, _chia_bypass_state_,
 
     # perf_counter for high-res duration, time() for wall-clock timestamp
     from chia.base.pid_registry import _pid_tracking_scope
-    _run_chia_setup(_chia_hooks_)
+    setup_complete = False
     try:
+        _run_chia_setup(_chia_hooks_)
+        setup_complete = True
         with _pid_tracking_scope():
             t0 = _time.perf_counter()
             result = func(*args, **kwargs)
@@ -476,7 +486,9 @@ def _chia_trampoline_profiled(func, call_id, dispatch_meta, _chia_bypass_state_,
             extra=extra,
         )
     finally:
-        _run_chia_cleanup(_chia_hooks_)
+        profiler.set_profile_context(previous_context)
+        if setup_complete:
+            _run_chia_cleanup(_chia_hooks_)
 
 
 def ChiaCallRemote(

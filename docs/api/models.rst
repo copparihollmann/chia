@@ -47,6 +47,11 @@ Claude
 
 .. automodule:: chia.models.claude
 
+AET-instrumented Claude experiment
+----------------------------------
+
+.. automodule:: chia.models.aet_claude
+
 Bedrock
 -------
 

@@ -917,6 +917,22 @@ class ClaudeCodeLLM(LLMCallBase):
             summary = summarize_stream(raw_events)
             if summary:
                 self._last_metadata = merge_into_metadata(self._last_metadata, summary)
+                # Emit one privacy-safe event per tool. Bands contain only the
+                # fixed tool name/category, timing and error bit; raw inputs and
+                # outputs remain worker-local.
+                from chia.trace.profile_events import tool_activity_event
+                from chia.trace.profiler import get_profiler
+
+                profiler = get_profiler()
+                for band in summary.get("bands", ()):
+                    profiler.log_profile_event(tool_activity_event(
+                        profiler.profile_context(),
+                        tool_name=str(band.get("tool_name", "tool")),
+                        category=str(band.get("category", "tool")),
+                        status="failed" if band.get("is_error") else "completed",
+                        duration_s=max(0.0, float(band.get("t1_s", 0.0))
+                                       - float(band.get("t0_s", 0.0))),
+                    ))
         except Exception as exc:                     # pragma: no cover - defensive
             self.logger.debug("stream telemetry not attached: %s", exc)
 

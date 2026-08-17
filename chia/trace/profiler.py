@@ -62,6 +62,7 @@ class _CallInfo:
     options: dict
     dispatch_perf_ts: float  # perf_counter() at dispatch, for exec_time_s calculation
     is_remote: bool
+    previous_context: Any = None
 
 
 # ------------------------------------------------------------------
@@ -225,6 +226,12 @@ def get_collector(namespace: Optional[str] = None):
     if _collector_override is not None:
         return _collector_override
     import ray as _ray
+    # ``ray.get_actor`` is wrapped by Ray's auto-init hook. Profiling is
+    # opt-in, so merely accounting for an LLM request in a non-Ray process
+    # must not connect to or start a cluster. ``start_collector`` is explicitly
+    # called after ``ray.init`` and installs the override used by workers.
+    if not _ray.is_initialized():
+        return None
     lookup_kwargs = {"namespace": namespace} if namespace else {}
     try:
         return _ray.get_actor(_COLLECTOR_ACTOR_NAME, **lookup_kwargs)
@@ -250,6 +257,7 @@ class ChiaProfiler:
         self._collector = get_collector(namespace)
         self._enabled = self._collector is not None
         self._extra = threading.local()  # per-task extra metadata
+        self._context = threading.local()  # call/agent identity for structured telemetry
         if not self._enabled:
             return
 
@@ -270,11 +278,13 @@ class ChiaProfiler:
         state = self.__dict__.copy()
         # threading.local is not picklable; recreate on deserialization
         state.pop('_extra', None)
+        state.pop('_context', None)
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._extra = threading.local()
+        self._context = threading.local()
 
     @property
     def enabled(self) -> bool:
@@ -297,6 +307,30 @@ class ChiaProfiler:
         data = getattr(self._extra, 'data', {})
         self._extra.data = {}
         return data
+
+    def profile_context(self):
+        """Return the structured telemetry context active on this thread."""
+        from chia.trace.profile_events import ProfileContext
+
+        return getattr(self._context, "value", ProfileContext(
+            run_id=os.environ.get("CHIA_PROFILE_RUN_ID", "")
+            or os.environ.get("CHIA_AET_RUN_ID", ""),
+        ))
+
+    def set_profile_context(self, context) -> None:
+        """Set the active call/agent context; intended for trampoline/lifecycle hooks."""
+        self._context.value = context
+
+    def begin_call_context(self, call_id: str, *, session_id: str = ""):
+        """Activate *call_id* and return the previous context for restoration."""
+        from dataclasses import asdict
+        from chia.trace.profile_events import ProfileContext
+
+        previous = self.profile_context()
+        self.set_profile_context(ProfileContext(
+            **{**asdict(previous), "call_id": call_id, "session_id": session_id}
+        ))
+        return previous
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -479,6 +513,7 @@ class ChiaProfiler:
             options={},
             dispatch_perf_ts=time.perf_counter(),  # for exec_time_s
             is_remote=False,
+            previous_context=self.begin_call_context(call_id),
         )
 
         try:
@@ -531,6 +566,7 @@ class ChiaProfiler:
             self._maybe_record_aet(extra)
         self._write(event)
         self._register_result(result, info.call_id)
+        self.set_profile_context(info.previous_context)
 
     # ------------------------------------------------------------------
     # General-purpose custom events
@@ -557,6 +593,20 @@ class ChiaProfiler:
             **kwargs,
         }
         self._write(event)
+
+    def log_profile_event(self, event: dict) -> None:
+        """Write one validated ``chia.agent_profile`` record to the profile JSONL."""
+        if not self._enabled:
+            return
+        from chia.trace.profile_events import PROFILE_EVENT_TYPES, PROFILE_SCHEMA_VERSION
+
+        if (event.get("schema") != "chia.agent_profile"
+                or event.get("schema_version") != PROFILE_SCHEMA_VERSION
+                or event.get("type") not in PROFILE_EVENT_TYPES):
+            raise ValueError("invalid structured profile event")
+        enriched = dict(event)
+        enriched.setdefault("worker_id", self._worker_id)
+        self._write(enriched)
 
     # ------------------------------------------------------------------
     # Lifecycle
