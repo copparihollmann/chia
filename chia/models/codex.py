@@ -8,6 +8,7 @@ configuration.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -15,7 +16,7 @@ import re
 import subprocess
 import tempfile
 from glob import glob
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -23,9 +24,45 @@ import ray
 
 from chia.base.ChiaFunction import ChiaFunction, ObjectRefCallback
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
+from chia.models import codex_events
+from chia.models.codex_capture import stream_codex
+from chia.models.codex_records import (
+    CodexAttempt,
+    CodexRunResult,
+    attempt_from_parsed,
+    redact_argv,
+)
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
+
+
+#: How many logical ``codex_slots`` one prompt call reserves on a Ray worker.
+#: Replaces the old fractional ``codex_creds: 0.01`` (which permitted ~100
+#: concurrent calls per unit). A cluster advertises an integer ``codex_slots=N``
+#: and each call takes ``CODEX_SLOTS_PER_CALL``, so exactly ``N /
+#: CODEX_SLOTS_PER_CALL`` Codex subprocesses run at once. Configurable at import
+#: time via ``CHIA_CODEX_SLOTS_PER_CALL`` for coarser gating.
+def _codex_slots_per_call() -> int:
+    try:
+        value = int(os.environ.get("CHIA_CODEX_SLOTS_PER_CALL", "1"))
+    except ValueError:
+        return 1
+    return max(value, 1)
+
+
+#: Env flag by which a caller declares the whole Codex process is already inside
+#: a hardened outer sandbox (oscar's bwrap), which is the only thing that makes
+#: ``--dangerously-bypass-approvals-and-sandbox`` safe. See :meth:`_assert_external_sandbox`.
+_EXTERNAL_SANDBOX_ENV = "CHIA_CODEX_EXTERNAL_SANDBOX"
+
+
+def _external_sandbox_declared() -> bool:
+    return os.environ.get(_EXTERNAL_SANDBOX_ENV, "").strip() in ("1", "true", "True", "yes")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class CodexError(Exception):
@@ -137,11 +174,12 @@ _UUID_RE = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
 )
 
-_CODEX_SESSION_STATE_PATTERNS = (
-    "state_*.sqlite",
-    "state_*.sqlite-wal",
-    "state_*.sqlite-shm",
-)
+# Files that must NEVER be captured into a portable bundle: credentials and any
+# shared/global state db that may span *other* conversations (contract §7:
+# session portability is scoped to the current thread only). Only the current
+# thread's rollout JSONL is portable; see ``_session_rollout_files``.
+_FORBIDDEN_STATE_BASENAMES = frozenset({"auth.json"})
+_FORBIDDEN_STATE_PREFIXES = ("state_",)
 
 
 @dataclass
@@ -157,10 +195,25 @@ class CodexQueryResult(QueryResult):
     session_id: str | None = None
     session_state: dict[str, bytes] | None = None
     session_state_paths: tuple[str, ...] = ()
+    #: The full typed record of every attempt (retries included).
+    run_result: CodexRunResult | None = None
+    #: 0.147.0 thread id (``thread.started.thread_id``); mirror of ``session_id``.
+    thread_id: str | None = None
+    #: Path to the last attempt's byte-for-byte raw JSONL, for offline replay.
+    raw_event_path: str | None = None
 
 
 def parse_session_id(stdout: str) -> str | None:
-    """Extract a Codex session id from JSONL stdout."""
+    """Extract the Codex thread/session id from ``codex exec --json`` stdout.
+
+    0.147.0 emits it as ``{"type":"thread.started","thread_id":"..."}`` — read
+    that structurally first (the authoritative source). The nested/heuristic
+    fallbacks remain only for older or non-standard streams, never overriding a
+    real ``thread.started``.
+    """
+    thread_id = codex_events.parse_stream_text(stdout).thread_id
+    if thread_id:
+        return thread_id
     for line in stdout.splitlines():
         event = CodexLLM._json_or_none(line.strip())
         if event is None:
@@ -316,6 +369,7 @@ class CodexLLM(LLMCallBase):
         sandbox: str = "workspace-write",
         approval_policy: str = "never",
         dangerously_bypass_approvals_and_sandbox: bool = True,
+        external_sandbox: bool = False,
         skip_git_repo_check: bool = True,
         ephemeral: bool = False,
         ignore_rules: bool = False,
@@ -323,6 +377,7 @@ class CodexLLM(LLMCallBase):
         reasoning_effort: str | None = None,
         resume_session: bool = False,
         auto_compact_token_limit: int | None = 200_000,
+        raw_event_dir: str | None = None,
         config=UNSET,
     ):
         # codex's bypass also disables the sandbox, so it keeps its own
@@ -341,19 +396,24 @@ class CodexLLM(LLMCallBase):
         self.sandbox = sandbox
         self.approval_policy = approval_policy
         self.dangerously_bypass_approvals_and_sandbox = dangerously_bypass_approvals_and_sandbox
+        self.external_sandbox = external_sandbox
         self.skip_git_repo_check = skip_git_repo_check
         self.ephemeral = ephemeral
         self.ignore_rules = ignore_rules
         self.profile = profile
         self.reasoning_effort = reasoning_effort
         self.auto_compact_token_limit = auto_compact_token_limit
+        self.raw_event_dir = raw_event_dir
         self.logger = logging.getLogger(logging_name)
         self._call_counter = 0
+        self._attempt_seq = 0
+        self._raw_dir_cache: str | None = None
         self._resume_session = resume_session
         self._session_id: str | None = None
         self._session_state: dict[str, bytes] | None = None
         self._session_state_paths: tuple[str, ...] = ()
         self._last_metadata: dict = {}
+        self._run_result: CodexRunResult | None = None
         self._log_prefix = None
 
         self.logger.warning("CodexLLM is experimental and has not been production-validated.")
@@ -365,18 +425,33 @@ class CodexLLM(LLMCallBase):
             self._log_prefix = os.path.join(log_dir, f"{logging_name}_{stamp}")
 
     @_session_tracked
-    @ChiaFunction(resources={"codex_creds": 0.01})
+    @ChiaFunction(resources={"codex_slots": _codex_slots_per_call()})
     def prompt(
         self,
         user_message: str,
         tools: list[ChiaTool] | None = None,
     ) -> CodexQueryResult:
-        """Send *user_message* to ``codex exec``."""
+        """Send *user_message* to ``codex exec``.
+
+        Every attempt (including retries and timeouts) is recorded into a single
+        :class:`CodexRunResult`; usage is *never* reset between attempts, so a
+        failed attempt's billable tokens survive into the successful call's
+        ledger (contract §5).
+        """
         import time as _time
 
         from chia.trace.profiler import get_profiler
 
         profiler = get_profiler()
+        tool_list = tools or []
+        # One run result spans all attempts of this logical call. Reset here (per
+        # prompt), never per attempt — that reset was the bug that dropped a
+        # failed attempt's usage.
+        self._run_result = CodexRunResult(
+            requested_model=self.model,
+            prompt_sha256=hashlib.sha256(self._format_prompt(user_message).encode("utf-8")).hexdigest(),
+        )
+        self._last_metadata = {}
         last_error = ""
         # Per-attempt metadata is cleared at the top of each attempt below, so the
         # tokens a failed attempt burned have to be banked before that happens.
@@ -384,8 +459,6 @@ class CodexLLM(LLMCallBase):
 
         for attempt in range(self.retries):
             try:
-                tool_list = tools or []
-                self._last_metadata = {}
                 self._restore_session_state()
                 cli = self._run_codex(user_message, tool_list)
                 self._call_counter += 1
@@ -404,11 +477,16 @@ class CodexLLM(LLMCallBase):
                     profiler.add_info(self._last_metadata)
                 self._classify_error(cli)
                 self._capture_session_state(cli)
+                self._run_result.status = "completed"
+                self._run_result.resolved_model = self.model
                 cli.success = True
+                cli.run_result = self._run_result
                 return cli
-            except (RateLimitError, AuthenticationError, BillingError, InvalidRequestError):
+            except (RateLimitError, AuthenticationError, BillingError, InvalidRequestError) as exc:
+                self._note_failure(exc)
                 raise
             except MaxOutputTokensError as exc:
+                self._note_failure(exc)
                 if attempt == 0:
                     self.note_retry(attempt, exc)
                     self.logger.warning("Max output tokens on attempt %d/%d, retrying once",
@@ -417,6 +495,7 @@ class CodexLLM(LLMCallBase):
                 raise
             except ServerError as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                self._note_failure(exc)
                 backoff = min(5 * 2 ** attempt, 60)
                 self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning("Server error on attempt %d/%d, backing off %ds",
@@ -424,19 +503,21 @@ class CodexLLM(LLMCallBase):
                 _time.sleep(backoff)
             except (UnknownCodexError, subprocess.TimeoutExpired) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                self._note_failure(exc)
                 self.note_retry(attempt, exc)
                 self.logger.warning("Codex attempt %d/%d failed: %s",
                                     attempt + 1, self.retries, exc)
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                self._note_failure(exc)
                 self.note_retry(attempt, exc)
                 self.logger.warning("Unexpected Codex error on attempt %d/%d: %s",
                                     attempt + 1, self.retries, exc)
-        # Every attempt failed. The result carries no text, but it must still
-        # carry the accounting: the attempts were billed, and a caller summing
-        # spend over a grid would otherwise record the failures as free.
+        self._run_result.status = "failed"
+        # Every attempt failed. The result still carries accounting: failed
+        # attempts may be billed and cannot appear free in aggregate profiles.
         return self.attach_usage(CodexQueryResult(
-            result="",
+            result=self._run_result.final_output,
             returncode=-1,
             stderr=last_error,
             stream_result="",
@@ -444,7 +525,21 @@ class CodexLLM(LLMCallBase):
             session_id=self._session_id,
             session_state=self._session_state,
             session_state_paths=self._session_state_paths,
-        ), meta={})
+            run_result=self._run_result,
+            thread_id=self._run_result.thread_id,
+        ), meta=self._canonical_usage())
+
+    def _note_failure(self, exc: BaseException) -> None:
+        """Tag the most recent attempt with a failure class (best effort)."""
+        if self._run_result and self._run_result.attempts:
+            last = self._run_result.attempts[-1]
+            if last.failure_class is None:
+                last.failure_class = (
+                    "timeout" if isinstance(exc, subprocess.TimeoutExpired)
+                    else getattr(exc, "error_type", type(exc).__name__)
+                )
+            if last.retry_reason is None:
+                last.retry_reason = f"{type(exc).__name__}: {str(exc)[:200]}"
 
     def _sync_session(self, cli: CodexQueryResult) -> CodexQueryResult:
         """Copy worker-captured Codex session state onto this instance."""
@@ -485,8 +580,6 @@ class CodexLLM(LLMCallBase):
         resume_session_id: str | None = None,
     ) -> list[str]:
         cmd = [self.codex_bin]
-        if not self.dangerously_bypass_approvals_and_sandbox and self.approval_policy:
-            cmd += ["--ask-for-approval", self.approval_policy]
         if resume_session_id:
             cmd += ["exec", "resume", "--json"]
         else:
@@ -504,9 +597,14 @@ class CodexLLM(LLMCallBase):
         if self.ignore_rules:
             cmd.append("--ignore-rules")
         if self.dangerously_bypass_approvals_and_sandbox:
+            self._assert_external_sandbox()
             cmd.append("--dangerously-bypass-approvals-and-sandbox")
         else:
             cmd += ["--sandbox", self.sandbox]
+            # 0.147.0 has NO ``--ask-for-approval``; the approval policy is a TOML
+            # override. The old flag would have made every "safe" run error out.
+            if self.approval_policy:
+                cmd += ["-c", f"approval_policy={_toml(self.approval_policy)}"]
         if output_last_message_path:
             cmd += ["--output-last-message", output_last_message_path]
         if self.reasoning_effort:
@@ -519,44 +617,139 @@ class CodexLLM(LLMCallBase):
             return cmd + [resume_session_id, "-"]
         return cmd + ["-"]
 
+    def _assert_external_sandbox(self) -> None:
+        """Refuse the dangerous bypass unless an outer sandbox is declared present.
+
+        ``--dangerously-bypass-approvals-and-sandbox`` disables Codex's own
+        sandbox entirely; it is safe *only* when the whole process already runs
+        inside oscar's hardened outer bwrap (which masks the answer surfaces).
+        That fact cannot be inferred, so the caller must assert it explicitly —
+        either ``external_sandbox=True`` or ``CHIA_CODEX_EXTERNAL_SANDBOX=1`` —
+        which makes the yolo mode opt-in rather than the silent default it was.
+        """
+        if self.external_sandbox or _external_sandbox_declared():
+            return
+        raise RuntimeError(
+            "CodexLLM(dangerously_bypass_approvals_and_sandbox=True) disables the "
+            "Codex sandbox; pass external_sandbox=True (or set "
+            f"{_EXTERNAL_SANDBOX_ENV}=1) to assert the process runs inside a "
+            "hardened outer sandbox, or use dangerously_bypass_approvals_and_sandbox=False."
+        )
+
+    def _raw_dir(self) -> str:
+        if self.raw_event_dir:
+            os.makedirs(self.raw_event_dir, exist_ok=True)
+            return self.raw_event_dir
+        if self._raw_dir_cache is None:
+            self._raw_dir_cache = tempfile.mkdtemp(prefix="codex_events_")
+        return self._raw_dir_cache
+
+    def _attempt_paths(self) -> tuple[str, str]:
+        self._attempt_seq += 1
+        base = os.path.join(self._raw_dir(), f"codex_attempt_{self._attempt_seq:04d}")
+        return base + ".events.jsonl", base + ".stderr.log"
+
+    def _canonical_usage(self) -> dict:
+        """Cumulative usage across all recorded attempts, in canonical keys.
+
+        Only reported fields are written; an unknown (``None``) count is omitted
+        entirely rather than coerced to ``0`` (unknown is not free — see
+        :mod:`chia.models.usage`).
+        """
+        assert self._run_result is not None
+        total = self._run_result.total_usage
+        meta: dict[str, Any] = {}
+        mapping = {
+            "input_tokens": total.input_tokens,
+            "output_tokens": total.output_tokens,
+            "cache_read_input_tokens": total.cached_input_tokens,
+            "cache_creation_input_tokens": total.cache_write_input_tokens,
+            "reasoning_tokens": total.reasoning_output_tokens,
+        }
+        for key, value in mapping.items():
+            if value is not None:
+                meta[key] = value
+        turns = sum(1 for a in self._run_result.attempts
+                    for t in a.turns if t.source_event == codex_events.EVENT_TURN_COMPLETED)
+        if turns:
+            meta["num_turns"] = turns
+        if self._session_id:
+            meta["session_id"] = self._session_id
+        return meta
+
     def _run_codex(self, user_message: str, tools: list[ChiaTool] | None = None) -> CodexQueryResult:
+        assert self._run_result is not None
         fd, output_path = tempfile.mkstemp(suffix=".txt")
         os.close(fd)
+        raw_path, stderr_path = self._attempt_paths()
+        index = len(self._run_result.attempts)
+        resume_session_id = self._session_id if self._resume_session else None
+        cmd = self._build_cmd(
+            tools or [],
+            output_last_message_path=output_path,
+            resume_session_id=resume_session_id,
+        )
+        started_at = _now_iso()
         try:
-            resume_session_id = self._session_id if self._resume_session else None
-            result = subprocess.run(
-                self._build_cmd(
-                    tools or [],
-                    output_last_message_path=output_path,
-                    resume_session_id=resume_session_id,
-                ),
-                input=self._format_prompt(user_message),
-                capture_output=True,
-                text=True,
+            capture = stream_codex(
+                cmd,
+                input_text=self._format_prompt(user_message),
+                raw_path=raw_path,
+                stderr_path=stderr_path,
                 timeout=self.timeout_seconds,
                 cwd=self.work_dir or None,
                 env=os.environ.copy(),
             )
+            parsed = codex_events.parse_events(capture.events)
+            parsed.unparsed_lines.extend(capture.unparsed_lines)
+
             with open(output_path) as f:
                 final_text = f.read()
-            stream, meta, fallback = self._parse_jsonl_stream(result.stdout, result.stderr)
-            parsed_session_id = parse_session_id(result.stdout)
-            if self._resume_session and parsed_session_id:
-                self._session_id = parsed_session_id
-            if self._session_id:
-                meta["session_id"] = self._session_id
-            self._last_metadata = meta
-            final_text = final_text or fallback
+            final_text = final_text or parsed.final_text
+
+            thread_id = parsed.thread_id
+            if self._resume_session and thread_id:
+                self._session_id = thread_id
+
+            attempt = attempt_from_parsed(
+                parsed,
+                index=index,
+                cmd_argv=cmd,
+                started_at=started_at,
+                ended_at=capture.ended_at,
+                exit_code=capture.returncode,
+                signal=capture.signal,
+                timeout=capture.timed_out,
+                raw_event_path=raw_path,
+                stderr_path=stderr_path,
+                final_output=final_text,
+            )
+            self._run_result.attempts.append(attempt)
+            if self._run_result.thread_id is None and thread_id:
+                self._run_result.thread_id = thread_id
+            self._run_result.active_wall_s += capture.active_wall_s
+            self._last_metadata = self._canonical_usage()
+
+            raw_text = self._read_text(raw_path)
             if self._log_prefix is not None:
-                self._write_log(user_message, final_text, stream)
-            if result.returncode != 0:
-                self.logger.warning("codex exited %d: %s", result.returncode, result.stderr[:500])
+                self._write_log(user_message, final_text, raw_text)
+
+            returncode = capture.returncode if capture.returncode is not None else -1
+            if capture.timed_out:
+                self.logger.warning("codex timed out after %ss (attempt salvaged to %s)",
+                                    self.timeout_seconds, raw_path)
+                raise subprocess.TimeoutExpired(cmd, self.timeout_seconds)
+            if returncode != 0:
+                self.logger.warning("codex exited %d: %s", returncode, capture.stderr_text[:500])
             return CodexQueryResult(
                 final_text,
-                result.returncode,
-                result.stderr,
-                stream,
+                returncode,
+                capture.stderr_text,
+                raw_text,
                 session_id=self._session_id,
+                run_result=self._run_result,
+                thread_id=self._run_result.thread_id,
+                raw_event_path=raw_path,
             )
         finally:
             try:
@@ -564,25 +757,28 @@ class CodexLLM(LLMCallBase):
             except FileNotFoundError:
                 pass
 
+    @staticmethod
+    def _read_text(path: str) -> str:
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except OSError:
+            return ""
+
     def _codex_home(self) -> str:
         return os.environ.get("CODEX_HOME") or os.path.join(os.path.expanduser("~"), ".codex")
 
-    def _session_state_files(self) -> list[tuple[str, str]]:
-        home = self._codex_home()
-        paths: list[tuple[str, str]] = []
-        for pattern in _CODEX_SESSION_STATE_PATTERNS:
-            dirname = os.path.dirname(pattern)
-            basename = os.path.basename(pattern)
-            root = os.path.join(home, dirname)
-            if not os.path.isdir(root):
-                continue
-            for name in os.listdir(root):
-                if not re.fullmatch(basename.replace(".", r"\.").replace("*", ".*"), name):
-                    continue
-                full = os.path.join(root, name)
-                if os.path.isfile(full):
-                    paths.append((os.path.relpath(full, home), full))
-        return sorted(set(paths))
+    @staticmethod
+    def _is_forbidden_state(rel_path: str) -> bool:
+        """True for anything that may leak credentials or *other* conversations.
+
+        ``auth.json`` (credentials) and any ``state_*`` shared db (which can span
+        conversations other than this thread) are never portable — contract §7.
+        """
+        base = os.path.basename(rel_path)
+        if base in _FORBIDDEN_STATE_BASENAMES:
+            return True
+        return any(base.startswith(prefix) for prefix in _FORBIDDEN_STATE_PREFIXES)
 
     def _path_relative_to_codex_home(self, path: str) -> str | None:
         home = os.path.abspath(self._codex_home())
@@ -613,6 +809,8 @@ class CodexLLM(LLMCallBase):
         for rel_path, data in self._session_state.items():
             if os.path.isabs(rel_path) or rel_path.startswith(".."):
                 continue
+            if self._is_forbidden_state(rel_path):
+                continue  # never write back a credential/shared-state db
             path = os.path.join(home, rel_path)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "wb") as f:
@@ -622,7 +820,11 @@ class CodexLLM(LLMCallBase):
         if not self._resume_session or self._session_id is None:
             return
         state: dict[str, bytes] = {}
-        for rel_path, path in self._session_state_files() + self._session_rollout_files():
+        # ONLY the current thread's rollout is portable. No ``state_*`` db (may
+        # cover other conversations) and never ``auth.json`` (credentials).
+        for rel_path, path in self._session_rollout_files():
+            if self._is_forbidden_state(rel_path):
+                continue
             try:
                 with open(path, "rb") as f:
                     state[rel_path] = f.read()
