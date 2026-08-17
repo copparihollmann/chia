@@ -124,3 +124,12 @@ with `CIRCT_SOLVER_PY` / `CIRCT_SOLVER_CHIA`.
   hacking around them.
 - Default GCS port 6379 / dashboard 8265 — bring only one chia cluster up per host
   at a time.
+## Agent harness experiments
+
+The worker pipeline constructs its harness through ``agent_factory.make_agent``.
+The default remains ``ClaudeCodeLLM``. Set ``CFG["agent_kwargs"]`` to pass
+provider-neutral ``agents`` / ``primary_agent`` definitions, or set
+``CFG["agent_factory"]`` to an importable ``"module:function"`` for a different
+harness. A custom factory receives ``cfg``, ``phase``, and ``default_kwargs``;
+it must return an object exposing Chia's ``prompt`` interface. This keeps the
+issue task, prompts, tools, and verification identical across harness arms.

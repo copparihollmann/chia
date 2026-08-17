@@ -9,13 +9,14 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import threading
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Sequence
 from uuid import uuid4
 
 import ray
 
 from chia.base.ChiaFunction import ChiaFunction, ObjectRefCallback
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
+from chia.models.agents import AgentDefinition, validate_agents
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
@@ -53,6 +54,8 @@ _NESTED_SESSION_ENV_VARS = (
     "CLAUDE_CODE_ENTRYPOINT",
     "AI_AGENT",
 )
+
+_CLI_AGENT_CAPABILITY: dict[str, bool] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +407,9 @@ class ClaudeCodeLLM(LLMCallBase):
         max_tool_iterations: int = 100,
         dangerously_skip_permissions: bool = True,
         config=UNSET,
+        agents: Optional[Sequence[AgentDefinition]] = None,
+        primary_agent: Optional[str] = None,
+        claude_bin: str = "claude",
     ):
         super().__init__(system_message=system_message,
                          dangerously_skip_permissions=dangerously_skip_permissions,
@@ -415,6 +421,10 @@ class ClaudeCodeLLM(LLMCallBase):
         self.model = model
         self.extra_cli_args = extra_cli_args or []
         self.extra_env = dict(extra_env or {})
+        self.agents = tuple(agents or ())
+        self.primary_agent = primary_agent
+        self.claude_bin = claude_bin
+        validate_agents(self.agents, self.primary_agent)
         self.logger = logging.getLogger(logging_name)
         self.log_stream = log_stream
         self.log_all = log_all
@@ -425,6 +435,8 @@ class ClaudeCodeLLM(LLMCallBase):
         if backend not in ("cli", "api"):
             raise ValueError(f"backend must be 'cli' or 'api', got {backend!r}")
         self.backend = backend
+        if backend != "cli" and (self.agents or self.primary_agent):
+            raise ValueError("agents and primary_agent require backend='cli'")
         self.api_key = api_key
         self.max_tokens = max_tokens
         self.thinking = thinking
@@ -812,7 +824,7 @@ class ClaudeCodeLLM(LLMCallBase):
         argument-length limits with long prompts.
         """
         cmd = [
-            "claude",
+            self.claude_bin,
             "--print",
             "--model", self.model,
         ]
@@ -827,6 +839,13 @@ class ClaudeCodeLLM(LLMCallBase):
 
         if self.system_message:
             cmd += ["--system-prompt", self.system_message]
+
+        if self.agents:
+            rendered = {agent.name: agent.to_claude()
+                        for agent in sorted(self.agents, key=lambda item: item.name)}
+            cmd += ["--agents", json.dumps(rendered, sort_keys=True, separators=(",", ":"))]
+        if self.primary_agent is not None:
+            cmd += ["--agent", self.primary_agent]
 
         if self._session_id is not None:
             if self._call_counter > 0:
@@ -850,6 +869,26 @@ class ClaudeCodeLLM(LLMCallBase):
         cmd += ["-p", "-"]
         return cmd
 
+    def _ensure_cli_supports_agents(self) -> None:
+        """Feature-detect the custom-agent flags once per CLI binary."""
+        if not self.agents and self.primary_agent is None:
+            return
+        supported = _CLI_AGENT_CAPABILITY.get(self.claude_bin)
+        if supported is None:
+            probe = subprocess.run(
+                [self.claude_bin, "--help"], capture_output=True, text=True,
+                timeout=min(self.timeout_seconds, 10), env=self._child_env(),
+            )
+            help_text = f"{probe.stdout}\n{probe.stderr}"
+            advertised = set(re.findall(r"(?m)^\s*(--[a-z-]+)\b", help_text))
+            supported = probe.returncode == 0 and {"--agents", "--agent"} <= advertised
+            _CLI_AGENT_CAPABILITY[self.claude_bin] = supported
+        if not supported:
+            raise RuntimeError(
+                f"{self.claude_bin!r} does not advertise --agents and --agent; "
+                "custom delegation requires Claude Code 2.1.233 or a compatible release"
+            )
+
     def _child_env(self) -> dict:
         """Environment for the ``claude`` subprocess.
 
@@ -867,6 +906,7 @@ class ClaudeCodeLLM(LLMCallBase):
         tools: Optional[List[ChiaTool]] = None,
     ) -> ClaudeCodeQueryResult:
         """Run claude with simple capture (no event streaming)."""
+        self._ensure_cli_supports_agents()
         cmd = self._build_cmd(tools)
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
         env = self._child_env()
@@ -921,6 +961,7 @@ class ClaudeCodeLLM(LLMCallBase):
         ``log_dir`` was set on the constructor, the same entries are
         also mirrored to ``<prefix>.log`` on disk.
         """
+        self._ensure_cli_supports_agents()
         cmd = self._build_cmd(tools)
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
         env = self._child_env()
@@ -1455,4 +1496,3 @@ class ClaudeCodeLLM(LLMCallBase):
             return UnknownClaudeError(node_id=node_id, raw_message=msg, stderr=msg)
 
         return None
-
