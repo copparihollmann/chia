@@ -39,21 +39,25 @@ from chia.models.codex_events import (
 CodexTurnUsage = TurnUsage
 CodexToolCall = ToolCall
 
-#: Argv tokens whose *following* value is a secret to redact from a stored argv.
+#: Argv flags whose *following* value is a secret to redact from a stored argv.
 _SECRET_FLAG_VALUES = frozenset({
     "--api-key", "--apikey", "--token", "--auth", "--authorization",
     "--openai-api-key", "--bearer", "--password",
 })
-#: Argv tokens that are themselves secret-ish and should be masked wholesale.
-_SECRET_SUBSTRINGS = ("api_key", "apikey", "authorization", "bearer", "secret", "token=")
+#: Keywords that, when present in a ``key=value`` override's KEY, mark the value
+#: as sensitive. Matched against the key only (structural split on the first
+#: ``=``), never against the value — so ``mcp_servers.t.headers.authorization=
+#: Bearer z`` is caught by its key, and a value that merely looks token-ish is
+#: not spuriously masked.
+_SECRET_KEY_TOKENS = ("key", "token", "secret", "password", "credential", "auth")
 
 
 def redact_argv(argv: list[str] | tuple[str, ...]) -> list[str]:
-    """Return *argv* with obvious secrets masked (contract §7: no secrets stored).
+    """Return *argv* with secrets masked (contract §7: no secrets stored).
 
-    Masks the value after a known secret flag, and any single token that itself
-    looks like ``key=secret``. Conservative by construction: it never drops a
-    token (so the command stays reproducible in shape), only masks values.
+    Masks the value after a known secret flag, and the value of any ``key=value``
+    override whose *key* names a credential. Never drops a token (the command
+    stays reproducible in shape), only masks values.
     """
     out: list[str] = []
     mask_next = False
@@ -62,15 +66,15 @@ def redact_argv(argv: list[str] | tuple[str, ...]) -> list[str]:
             out.append("***REDACTED***")
             mask_next = False
             continue
-        low = tok.lower()
-        if low in _SECRET_FLAG_VALUES:
+        if tok.lower() in _SECRET_FLAG_VALUES:
             out.append(tok)
             mask_next = True
             continue
-        if "=" in tok and any(s in low for s in _SECRET_SUBSTRINGS):
-            key, _, _ = tok.partition("=")
-            out.append(f"{key}=***REDACTED***")
-            continue
+        if "=" in tok:
+            key, _, _ = tok.partition("=")  # first "=" only
+            if any(s in key.lower() for s in _SECRET_KEY_TOKENS):
+                out.append(f"{key}=***REDACTED***")
+                continue
         out.append(tok)
     return out
 

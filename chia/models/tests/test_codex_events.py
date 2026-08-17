@@ -169,6 +169,32 @@ def test_runresult_keeps_failed_attempt_usage_across_retry():
     assert len(run.attempts) == 2
 
 
+def test_usage_fold_is_contagious_unknown_per_field():
+    # None + 5 == 5: an unreported turn must NOT erase a reported one.
+    reported = CodexTurnUsage(input_tokens=100, output_tokens=10,
+                              source_event="turn.completed", reported=True)
+    unreported = CodexTurnUsage.unreported("turn.failed")
+    folded = ev.sum_usage([unreported, reported, unreported])
+    assert folded.input_tokens == 100
+    assert folded.output_tokens == 10
+    assert folded.reported is True
+    # An all-unreported fold stays unknown, never a confident zero.
+    empty = ev.sum_usage([unreported, unreported])
+    assert empty.reported is False
+    assert empty.input_tokens is None
+    assert empty.output_tokens is None
+
+
+def test_opt_int_rejects_bool_in_token_fields():
+    # isinstance(True, int) is True, so a bool must be rejected before int
+    # coercion or a token count silently becomes 1.
+    u = CodexTurnUsage.from_payload(
+        {"input_tokens": True, "output_tokens": 7}, source_event="turn.completed",
+    )
+    assert u.input_tokens is None   # bool rejected, not coerced to 1
+    assert u.output_tokens == 7
+
+
 def test_redact_argv_masks_secrets_without_dropping_tokens():
     argv = ["codex", "exec", "--api-key", "sk-super-secret", "-c", "authorization=Bearer xyz", "-"]
     out = redact_argv(argv)
@@ -176,6 +202,15 @@ def test_redact_argv_masks_secrets_without_dropping_tokens():
     assert out[5] == "authorization=***REDACTED***"
     assert out[0] == "codex" and out[-1] == "-"
     assert len(out) == len(argv)  # shape preserved
+
+
+def test_redact_argv_masks_mcp_header_auth_by_key():
+    # The realistic case: a dotted MCP header override carrying a bearer token.
+    argv = ["-c", "mcp_servers.t.headers.authorization=Bearer super-secret-token"]
+    out = redact_argv(argv)
+    assert out[0] == "-c"
+    assert out[1] == "mcp_servers.t.headers.authorization=***REDACTED***"
+    assert "super-secret-token" not in " ".join(out)
 
 
 def test_resume_fixture_shares_thread_id():
