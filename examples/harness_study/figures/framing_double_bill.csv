@@ -1,0 +1,3 @@
+framing,sonnet_cells,median_provider_calls_per_task,provider_calls_logged,non_streaming_fallbacks,fallback_share_pct
+SSE (guard flag disabled),5,4,60,30,50.0
+event-stream (what the CLI asks for),5,2,72,0,0.0

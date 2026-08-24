@@ -186,6 +186,10 @@ class AntigravityLLM(LLMCallBase):
     # Honors --dangerously-skip-permissions; has no opencode-style permission block.
     supports_dangerously_skip_permissions = True
 
+    # A per-call sandbox can wrap the ``agy`` subprocess, so `sandbox=` is honored
+    # (see chia.base.sandbox).
+    supports_sandbox = True
+
     def __init__(
         self,
         model: str | None = None,
@@ -203,10 +207,14 @@ class AntigravityLLM(LLMCallBase):
         sandbox: bool = False,
         extra_cli_args: list[str] | None = None,
         config=UNSET,
+        sandbox_spec=UNSET,
+        sandbox_backend: str = "none",
     ):
         super().__init__(system_message=system_message,
                          dangerously_skip_permissions=dangerously_skip_permissions,
-                         config=config)
+                         config=config,
+                         sandbox_spec=sandbox_spec,
+                         sandbox_backend=sandbox_backend)
         self.logging_level = logging_level
         self.logging_name = logging_name
         self.retries = retries
@@ -250,6 +258,10 @@ class AntigravityLLM(LLMCallBase):
         from chia.trace.profiler import get_profiler
 
         profiler = get_profiler()
+        # Per-attempt metadata is cleared at the top of each attempt below, so the
+        # tokens a failed attempt burned have to be banked before that happens.
+        self.begin_retry_ledger()
+
         for attempt in range(self.retries):
             try:
                 tool_list = tools or []
@@ -264,6 +276,9 @@ class AntigravityLLM(LLMCallBase):
                         for t in tool_list
                     ],
                 })
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled:
                     profiler.add_info(self._last_metadata)
                 self._classify_error(cli)
@@ -271,24 +286,35 @@ class AntigravityLLM(LLMCallBase):
                 return cli
             except (RateLimitError, AuthenticationError, BillingError, InvalidRequestError):
                 raise
-            except MaxOutputTokensError:
+            except MaxOutputTokensError as exc:
                 if attempt == 0:
+                    self.note_retry(attempt, exc)
                     self.logger.warning("Max output tokens on attempt %d/%d, retrying once",
                                         attempt + 1, self.retries)
                     continue
                 raise
-            except ServerError:
+            except ServerError as exc:
                 backoff = min(5 * 2 ** attempt, 60)
+                self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning("Server error on attempt %d/%d, backing off %ds",
                                     attempt + 1, self.retries, backoff)
                 _time.sleep(backoff)
             except (UnknownAntigravityError, subprocess.TimeoutExpired) as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning("Antigravity attempt %d/%d failed: %s",
                                     attempt + 1, self.retries, exc)
             except Exception as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning("Unexpected Antigravity error on attempt %d/%d: %s",
                                     attempt + 1, self.retries, exc)
-        return QueryResult(result="", returncode=-1, stderr="", stream_result="", success=False)
+        # Every attempt failed. The result carries no text, but it must still
+        # carry the accounting: the attempts were billed, and a caller summing
+        # spend over a grid would otherwise record the failures as free.
+        return self.attach_usage(
+            QueryResult(result="", returncode=-1, stderr="",
+                        stream_result="", success=False),
+            meta={},
+        )
 
     def _get_node_id(self) -> str:
         try:
@@ -366,7 +392,7 @@ class AntigravityLLM(LLMCallBase):
         tools = tools or []
         self._write_mcp_config(tools)
         result = subprocess.run(
-            self._build_cmd(user_message),
+            self.sandbox_argv(self._build_cmd(user_message)),
             capture_output=True,
             text=True,
             # Give agy's own --print-timeout a chance to fire first.

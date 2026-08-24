@@ -75,15 +75,30 @@ def _choice(message, finish_reason):
     return SimpleNamespace(message=message, finish_reason=finish_reason)
 
 
-def _resp(choices, prompt_tokens=0, completion_tokens=0):
-    return SimpleNamespace(
-        choices=choices,
-        usage=SimpleNamespace(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens,
-        ),
-    )
+def _resp(choices, prompt_tokens=0, completion_tokens=0,
+          cached_tokens=None, reasoning_tokens=None, cost=None):
+    """A chat-completions response.
+
+    ``cached_tokens`` / ``reasoning_tokens`` / ``cost`` default to *absent*, not
+    zero: the OpenAI-compatible servers this backend targets each omit a different
+    part of the usage object, so the fake has to be able to omit them too.
+    """
+    usage_kwargs = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    }
+    if cached_tokens is not None:
+        usage_kwargs["prompt_tokens_details"] = SimpleNamespace(
+            cached_tokens=cached_tokens
+        )
+    if reasoning_tokens is not None:
+        usage_kwargs["completion_tokens_details"] = SimpleNamespace(
+            reasoning_tokens=reasoning_tokens
+        )
+    if cost is not None:
+        usage_kwargs["cost"] = cost
+    return SimpleNamespace(choices=choices, usage=SimpleNamespace(**usage_kwargs))
 
 
 def _install_fake_openai(monkeypatch, responses, capture):
@@ -263,6 +278,103 @@ def test_chat_no_tools_request_shaping_and_result(monkeypatch):
     assert llm._last_metadata["output_tokens"] == 5
     assert llm._last_metadata["num_turns"] == 1
     assert llm._last_metadata["model"] == "gpt-4o"
+
+
+def test_chat_splits_cached_prompt_tokens_out_of_fresh_input(monkeypatch):
+    """OpenAI counts cached prompt tokens *inside* ``prompt_tokens``. Recording the
+    whole prompt as fresh input prices the cached part at up to 10x its real rate;
+    dropping the cached count entirely leaves the run unpriced in aet."""
+    capture = {"calls": []}
+    _install_fake_openai(
+        monkeypatch,
+        [_resp([_choice(_msg(content="PONG"), "stop")],
+               prompt_tokens=16_255, completion_tokens=5, cached_tokens=15_345)],
+        capture,
+    )
+
+    llm = OpenAICompatLLM(model="gpt-4o")
+    cli = llm.prompt("ping", tools=[])
+
+    assert cli.usage.cache_read_input_tokens == 15_345
+    assert cli.usage.input_tokens == 910          # 16_255 - 15_345, fresh only
+    assert cli.usage.billed_input_tokens == 16_255  # ...and nothing is lost
+    assert cli.usage.cache_hit_ratio == pytest.approx(15_345 / 16_255)
+
+
+def test_chat_records_reasoning_tokens_as_a_breakdown_of_output(monkeypatch):
+    """``reasoning_tokens`` is already inside ``completion_tokens``, so it must not
+    be added on top — chia's invariant is that reasoning is a breakdown of output,
+    not a fourth billable class."""
+    capture = {"calls": []}
+    _install_fake_openai(
+        monkeypatch,
+        [_resp([_choice(_msg(content="PONG"), "stop")],
+               prompt_tokens=10, completion_tokens=500, reasoning_tokens=450)],
+        capture,
+    )
+
+    llm = OpenAICompatLLM(model="gpt-4o")
+    cli = llm.prompt("ping", tools=[])
+
+    assert cli.usage.output_tokens == 500
+    assert cli.usage.reasoning_tokens == 450
+    assert cli.usage.total_tokens == 510
+
+
+def test_chat_passes_through_a_provider_reported_cost(monkeypatch):
+    """OpenRouter reports the actual charge for a generation. A reported figure
+    beats any estimate, so it lands as cost_source="billed"."""
+    capture = {"calls": []}
+    _install_fake_openai(
+        monkeypatch,
+        [_resp([_choice(_msg(content="PONG"), "stop")],
+               prompt_tokens=10, completion_tokens=5, cost=0.00042)],
+        capture,
+    )
+
+    llm = OpenAICompatLLM(model="z-ai/glm-4.6")
+    cli = llm.prompt("ping", tools=[])
+
+    assert cli.usage.cost_usd == pytest.approx(0.00042)
+    assert cli.usage.cost_source == "billed"
+
+
+def test_chat_usage_is_absent_field_tolerant(monkeypatch):
+    """vLLM and Ollama omit the details objects entirely; that must read as zero,
+    not raise."""
+    capture = {"calls": []}
+    _install_fake_openai(
+        monkeypatch,
+        [_resp([_choice(_msg(content="PONG"), "stop")],
+               prompt_tokens=10, completion_tokens=5)],
+        capture,
+    )
+
+    llm = OpenAICompatLLM(model="Qwen/Qwen3-8B")
+    cli = llm.prompt("ping", tools=[])
+
+    assert cli.usage.input_tokens == 10
+    assert cli.usage.cache_read_input_tokens == 0
+    assert cli.usage.reasoning_tokens == 0
+    assert cli.usage.cost_usd is None
+
+
+def test_chat_cached_tokens_larger_than_the_prompt_cannot_go_negative(monkeypatch):
+    """Defensive: a server that reports cached_tokens *in addition to*
+    prompt_tokens rather than inside it must not yield a negative fresh count."""
+    capture = {"calls": []}
+    _install_fake_openai(
+        monkeypatch,
+        [_resp([_choice(_msg(content="PONG"), "stop")],
+               prompt_tokens=100, completion_tokens=5, cached_tokens=999)],
+        capture,
+    )
+
+    llm = OpenAICompatLLM(model="some-server/model")
+    cli = llm.prompt("ping", tools=[])
+
+    assert cli.usage.input_tokens == 0
+    assert cli.usage.cache_read_input_tokens == 100
 
 
 def test_chat_tool_loop_executes_mcp_and_feeds_results(monkeypatch):

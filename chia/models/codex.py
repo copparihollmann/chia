@@ -301,6 +301,10 @@ class CodexLLM(LLMCallBase):
     # has no opencode-style permission block.
     supports_dangerously_skip_permissions = True
 
+    # A per-call sandbox can wrap the ``codex exec`` subprocess, so `sandbox=` is honored
+    # (see chia.base.sandbox).
+    supports_sandbox = True
+
     def __init__(
         self,
         model: str | None = None,
@@ -324,12 +328,16 @@ class CodexLLM(LLMCallBase):
         resume_session: bool = False,
         auto_compact_token_limit: int | None = 200_000,
         config=UNSET,
+        sandbox_spec=UNSET,
+        sandbox_backend: str = "none",
     ):
         # codex's bypass also disables the sandbox, so it keeps its own
         # (more specific) kwarg; mirror it onto the canonical base flag.
         super().__init__(system_message=system_message,
                          dangerously_skip_permissions=dangerously_bypass_approvals_and_sandbox,
-                         config=config)
+                         config=config,
+                         sandbox_spec=sandbox_spec,
+                         sandbox_backend=sandbox_backend)
         self.logging_level = logging_level
         self.logging_name = logging_name
         self.retries = retries
@@ -378,6 +386,10 @@ class CodexLLM(LLMCallBase):
 
         profiler = get_profiler()
         last_error = ""
+        # Per-attempt metadata is cleared at the top of each attempt below, so the
+        # tokens a failed attempt burned have to be banked before that happens.
+        self.begin_retry_ledger()
+
         for attempt in range(self.retries):
             try:
                 tool_list = tools or []
@@ -393,6 +405,9 @@ class CodexLLM(LLMCallBase):
                         for t in tool_list
                     ],
                 })
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled:
                     profiler.add_info(self._last_metadata)
                 self._classify_error(cli)
@@ -401,8 +416,9 @@ class CodexLLM(LLMCallBase):
                 return cli
             except (RateLimitError, AuthenticationError, BillingError, InvalidRequestError):
                 raise
-            except MaxOutputTokensError:
+            except MaxOutputTokensError as exc:
                 if attempt == 0:
+                    self.note_retry(attempt, exc)
                     self.logger.warning("Max output tokens on attempt %d/%d, retrying once",
                                         attempt + 1, self.retries)
                     continue
@@ -410,18 +426,24 @@ class CodexLLM(LLMCallBase):
             except ServerError as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 backoff = min(5 * 2 ** attempt, 60)
+                self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning("Server error on attempt %d/%d, backing off %ds",
                                     attempt + 1, self.retries, backoff)
                 _time.sleep(backoff)
             except (UnknownCodexError, subprocess.TimeoutExpired) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                self.note_retry(attempt, exc)
                 self.logger.warning("Codex attempt %d/%d failed: %s",
                                     attempt + 1, self.retries, exc)
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
+                self.note_retry(attempt, exc)
                 self.logger.warning("Unexpected Codex error on attempt %d/%d: %s",
                                     attempt + 1, self.retries, exc)
-        return CodexQueryResult(
+        # Every attempt failed. The result carries no text, but it must still
+        # carry the accounting: the attempts were billed, and a caller summing
+        # spend over a grid would otherwise record the failures as free.
+        return self.attach_usage(CodexQueryResult(
             result="",
             returncode=-1,
             stderr=last_error,
@@ -430,7 +452,7 @@ class CodexLLM(LLMCallBase):
             session_id=self._session_id,
             session_state=self._session_state,
             session_state_paths=self._session_state_paths,
-        )
+        ), meta={})
 
     def _sync_session(self, cli: CodexQueryResult) -> CodexQueryResult:
         """Copy worker-captured Codex session state onto this instance."""
@@ -511,11 +533,11 @@ class CodexLLM(LLMCallBase):
         try:
             resume_session_id = self._session_id if self._resume_session else None
             result = subprocess.run(
-                self._build_cmd(
+                self.sandbox_argv(self._build_cmd(
                     tools or [],
                     output_last_message_path=output_path,
                     resume_session_id=resume_session_id,
-                ),
+                )),
                 input=self._format_prompt(user_message),
                 capture_output=True,
                 text=True,

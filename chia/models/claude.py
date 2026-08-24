@@ -16,6 +16,11 @@ import ray
 
 from chia.base.ChiaFunction import ChiaFunction, ObjectRefCallback
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
+from chia.base.usage import BillingMode
+from chia.base.ratelimit import (
+    CLAUDE_SESSION_RESOURCE, RateLimitPolicy, RateLimitWaiter,
+    RateLimitWaitExhausted,
+)
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
@@ -348,6 +353,22 @@ class ClaudeCodeLLM(LLMCallBase):
     # it's left out for now rather than shoehorned in.
     supports_dangerously_skip_permissions = True
 
+    # A per-call sandbox can wrap the ``claude`` subprocess, so `sandbox_spec=` is
+    # honored (see chia.base.sandbox).
+    supports_sandbox = True
+
+    # Env vars whose presence means the CLI is authenticating against a metered
+    # endpoint rather than spending a subscription seat's quota. Checked in the
+    # process that actually runs the CLI (a Ray worker), which is why this is a
+    # property and not decided in __init__ on the driver.
+    _METERED_AUTH_ENV_VARS = (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    )
+
     def __init__(
         self,
         model: str = "claude-sonnet-4-6",
@@ -368,11 +389,24 @@ class ClaudeCodeLLM(LLMCallBase):
         thinking: Optional[str] = "adaptive",
         max_tool_iterations: int = 100,
         dangerously_skip_permissions: bool = True,
+        use_bedrock: bool = False,
+        subagent_model: Optional[str] = None,
+        background_model: Optional[str] = None,
+        region: Optional[str] = None,
+        bearer_token: Optional[str] = None,
+        opus_model: Optional[str] = None,
+        sonnet_model: Optional[str] = None,
+        haiku_model: Optional[str] = None,
         config=UNSET,
+        sandbox_spec=UNSET,
+        sandbox_backend: str = "none",
+        rate_limit_policy: Optional[RateLimitPolicy] = None,
     ):
         super().__init__(system_message=system_message,
                          dangerously_skip_permissions=dangerously_skip_permissions,
-                         config=config)
+                         config=config,
+                         sandbox_spec=sandbox_spec,
+                         sandbox_backend=sandbox_backend)
         self.logging_level = logging_level
         self.logging_name = logging_name
         self.retries = retries
@@ -393,6 +427,23 @@ class ClaudeCodeLLM(LLMCallBase):
         self.max_tokens = max_tokens
         self.thinking = thinking
         self.max_tool_iterations = max_tool_iterations
+
+        # Bedrock multi-model routing (CLI backend). When ``use_bedrock`` is
+        # True the ``claude`` subprocess env is augmented with the Bedrock
+        # tier env vars (see ``chia.models.bedrock_config``): ``self.model``
+        # stays the primary/orchestrator, ``subagent_model`` runs all Task-tool
+        # subagents, ``background_model`` handles background chores, and the
+        # opus/sonnet/haiku pins resolve aliases to concrete profiles. All are
+        # optional; with ``use_bedrock=False`` (the default) the subprocess env
+        # is unchanged.
+        self.use_bedrock = use_bedrock
+        self.subagent_model = subagent_model
+        self.background_model = background_model
+        self.region = region
+        self.bearer_token = bearer_token
+        self.opus_model = opus_model
+        self.sonnet_model = sonnet_model
+        self.haiku_model = haiku_model
 
         # The CLI backend ignores the API-only parameters; warn if any were
         # set away from their defaults so a misdirected config doesn't pass
@@ -423,6 +474,11 @@ class ClaudeCodeLLM(LLMCallBase):
                 "exercised by unit tests so far, not validated in production."
             )
 
+        # How (and whether) to wait out a usage limit. None keeps the historical
+        # behaviour: RateLimitError propagates immediately, which is right for an
+        # interactive call and wrong for a grid (see chia.base.ratelimit).
+        self.rate_limit_policy = rate_limit_policy
+
         self._call_counter = 0
         self._session_id = str(uuid4()) if resume_session else None
         self._last_metadata: dict = {}  # populated by _process_event_line
@@ -445,6 +501,26 @@ class ClaudeCodeLLM(LLMCallBase):
     # Public API
     # ------------------------------------------------------------------
 
+    @property
+    def billing_mode(self) -> BillingMode:
+        """Whether this call's cost is metered spend or subscription quota.
+
+        :rtype: str
+
+        The CLI reports ``total_cost_usd`` on every run regardless of how it
+        authenticated, so the figure alone cannot tell the two apart. Under a
+        subscription seat it is the *metered-equivalent* of the quota consumed, not
+        money — hence ``"subscription"``, which
+        :meth:`chia.base.usage.TokenUsage.__add__` then refuses to add to real
+        charges. The ``api`` backend and any of :data:`_METERED_AUTH_ENV_VARS` in the
+        worker's environment mean genuine per-token billing.
+        """
+        if self.backend == "api" or self.api_key:
+            return "per_token"
+        if any(os.environ.get(var) for var in self._METERED_AUTH_ENV_VARS):
+            return "per_token"
+        return "subscription"
+
     @_session_tracked
     @ChiaFunction(resources={"claude_creds": 0.01})
     def prompt(
@@ -460,7 +536,11 @@ class ClaudeCodeLLM(LLMCallBase):
             case ``result`` is empty and ``returncode`` is ``-1``).
 
         Raises:
-            RateLimitError: Usage limit hit — propagates immediately.
+            RateLimitError: Usage limit hit, and no ``rate_limit_policy`` was
+                configured (the default). With a policy, the call instead waits for the
+                window to reset and resumes — see :mod:`chia.base.ratelimit`.
+            RateLimitWaitExhausted: A policy was configured but its wait budget ran
+                out before the window reset. Chains the original ``RateLimitError``.
             AuthenticationError: Auth failure — propagates immediately.
             BillingError: Billing/payment issue — propagates immediately.
             InvalidRequestError: Malformed request — propagates immediately.
@@ -472,8 +552,20 @@ class ClaudeCodeLLM(LLMCallBase):
         from chia.trace.profiler import get_profiler
 
         profiler = get_profiler()
+        # Per-attempt metadata is cleared at the top of each attempt below, so the
+        # tokens a failed attempt burned have to be banked before that happens.
+        self.begin_retry_ledger()
+        # One waiter per call: the wait budget is per call, so a long-running driver does
+        # not accumulate a debt that starves a later one.
+        waiter = (RateLimitWaiter(self.rate_limit_policy)
+                  if self.rate_limit_policy is not None
+                  and self.rate_limit_policy.enabled else None)
 
-        for attempt in range(self.retries):
+        attempt = -1
+        while True:
+            attempt += 1
+            if attempt >= self.retries:
+                break
             try:
                 self._last_metadata = {}
                 self._rate_limit_event = None
@@ -496,6 +588,9 @@ class ClaudeCodeLLM(LLMCallBase):
                     for t in tools
                 ]
 
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled and self._last_metadata:
                     profiler.add_info(self._last_metadata)
 
@@ -509,13 +604,32 @@ class ClaudeCodeLLM(LLMCallBase):
                 cli.success = True
                 return cli
 
+            # -- Usage limit: wait for the window when a policy says to, else propagate --
+            except RateLimitError as exc:
+                if waiter is None:
+                    raise
+                try:
+                    waiter.wait(exc, getattr(exc, "reset_time", None))
+                except RateLimitWaitExhausted:
+                    # Chain, so the operator sees both the provider's message and which
+                    # bound stopped the wait — "waited 3 times" and "waited 5 hours" are
+                    # different situations with different fixes.
+                    raise
+                # A waited-out limit does not consume a retry attempt: the call did not
+                # fail on its merits, it was deferred. Counting it would let three
+                # windows exhaust a three-attempt budget without ever reaching the model.
+                # The waiter's own max_waits is what bounds this, not self.retries.
+                attempt -= 1
+                continue
+
             # -- Never retry: propagate immediately --
-            except (RateLimitError, AuthenticationError, BillingError, InvalidRequestError):
+            except (AuthenticationError, BillingError, InvalidRequestError):
                 raise
 
             # -- Retry once: stochastic generation may produce shorter output --
-            except MaxOutputTokensError:
+            except MaxOutputTokensError as exc:
                 if attempt == 0:
+                    self.note_retry(attempt, exc)
                     self.logger.warning(
                         "Max output tokens on attempt %d/%d, retrying once",
                         attempt + 1, self.retries,
@@ -524,8 +638,9 @@ class ClaudeCodeLLM(LLMCallBase):
                 raise
 
             # -- Retry with exponential backoff: transient API issue --
-            except ServerError:
+            except ServerError as exc:
                 backoff = min(5 * 2 ** attempt, 60)
+                self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning(
                     "Server error on attempt %d/%d, backing off %ds",
                     attempt + 1, self.retries, backoff,
@@ -534,26 +649,36 @@ class ClaudeCodeLLM(LLMCallBase):
 
             # -- Standard retry for unknown errors --
             except UnknownClaudeError as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unknown error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
 
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
                 # A timeout means the session was likely created;
                 # switch to --resume for subsequent attempts.
                 if self._session_id is not None and self._call_counter == 0:
                     self._call_counter = 1
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Timeout on attempt %d/%d", attempt + 1, self.retries,
                 )
 
             except Exception as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unexpected error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
-        return ClaudeCodeQueryResult(result="", returncode=-1, stderr="", stream_result="", success=False)
+        # Every attempt failed. The result carries no text, but it must still carry
+        # the accounting: the attempts were billed, and a caller summing spend over
+        # a grid would otherwise record the failures as free.
+        return self.attach_usage(
+            ClaudeCodeQueryResult(result="", returncode=-1, stderr="",
+                                  stream_result="", success=False),
+            meta={},
+        )
 
     def _sync_transcript(self, cli: ClaudeCodeQueryResult) -> ClaudeCodeQueryResult:
         """Copy a worker-captured transcript off *cli* onto this instance.
@@ -814,15 +939,48 @@ class ClaudeCodeLLM(LLMCallBase):
         cmd += ["-p", "-"]
         return cmd
 
+    def _subprocess_env(self) -> dict:
+        """Environment for the ``claude`` subprocess.
+
+        Starts from the current process env with ``CLAUDECODE`` stripped (the
+        CLI refuses to run nested otherwise). When ``use_bedrock`` is set, the
+        Bedrock multi-model env vars are overlaid via
+        :func:`chia.models.bedrock_config.bedrock_model_env`, with ``self.model``
+        as the primary/orchestrator. Only the tiers/overrides that were provided
+        are forwarded, so unset ones fall back to the helper's defaults.
+        """
+        base = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        if not self.use_bedrock:
+            return base
+
+        from chia.models.bedrock_config import bedrock_model_env
+
+        kwargs: dict = {"primary": self.model, "base_env": base}
+        if self.subagent_model is not None:
+            kwargs["subagent"] = self.subagent_model
+        if self.background_model is not None:
+            kwargs["background"] = self.background_model
+        if self.region is not None:
+            kwargs["region"] = self.region
+        if self.bearer_token is not None:
+            kwargs["bearer_token"] = self.bearer_token
+        if self.opus_model is not None:
+            kwargs["opus"] = self.opus_model
+        if self.sonnet_model is not None:
+            kwargs["sonnet"] = self.sonnet_model
+        if self.haiku_model is not None:
+            kwargs["haiku"] = self.haiku_model
+        return bedrock_model_env(**kwargs)
+
     def _run_claude(
         self,
         user_message: str,
         tools: Optional[List[ChiaTool]] = None,
     ) -> ClaudeCodeQueryResult:
         """Run claude with simple capture (no event streaming)."""
-        cmd = self._build_cmd(tools)
+        cmd = self.sandbox_argv(self._build_cmd(tools))
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
-        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env = self._subprocess_env()
 
         result = subprocess.run(
             cmd,
@@ -874,9 +1032,9 @@ class ClaudeCodeLLM(LLMCallBase):
         ``log_dir`` was set on the constructor, the same entries are
         also mirrored to ``<prefix>.log`` on disk.
         """
-        cmd = self._build_cmd(tools)
+        cmd = self.sandbox_argv(self._build_cmd(tools))
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
-        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env = self._subprocess_env()
 
         result_text_parts: list[str] = []
         stderr_parts: list[str] = []

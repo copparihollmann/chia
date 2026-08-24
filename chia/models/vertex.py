@@ -283,6 +283,10 @@ class VertexGeminiLLM(LLMCallBase):
 
         profiler = get_profiler()
 
+        # Per-attempt metadata is cleared at the top of each attempt below, so the
+        # tokens a failed attempt burned have to be banked before that happens.
+        self.begin_retry_ledger()
+
         for attempt in range(self.retries):
             try:
                 self._last_metadata = {}
@@ -294,6 +298,9 @@ class VertexGeminiLLM(LLMCallBase):
                      "node_id": getattr(t, "node_id", None)}
                     for t in tools
                 ]
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled and self._last_metadata:
                     profiler.add_info(self._last_metadata)
 
@@ -306,8 +313,9 @@ class VertexGeminiLLM(LLMCallBase):
                 raise
 
             # -- Retry once: a shorter generation may fit --
-            except MaxOutputTokensError:
+            except MaxOutputTokensError as exc:
                 if attempt == 0:
+                    self.note_retry(attempt, exc)
                     self.logger.warning(
                         "Max output tokens on attempt %d/%d, retrying once",
                         attempt + 1, self.retries,
@@ -316,8 +324,9 @@ class VertexGeminiLLM(LLMCallBase):
                 raise
 
             # -- Retry with exponential backoff: transient service issue --
-            except ServerError:
+            except ServerError as exc:
                 backoff = min(5 * 2 ** attempt, 60)
+                self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning(
                     "Server error on attempt %d/%d, backing off %ds",
                     attempt + 1, self.retries, backoff,
@@ -326,17 +335,26 @@ class VertexGeminiLLM(LLMCallBase):
 
             # -- Standard retry for unknown errors --
             except UnknownVertexError as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unknown error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
 
             except Exception as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unexpected error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
-        return QueryResult(result="", returncode=-1, stderr="", stream_result="", success=False)
+        # Every attempt failed. The result carries no text, but it must still
+        # carry the accounting: the attempts were billed, and a caller summing
+        # spend over a grid would otherwise record the failures as free.
+        return self.attach_usage(
+            QueryResult(result="", returncode=-1, stderr="",
+                        stream_result="", success=False),
+            meta={},
+        )
 
     def _get_node_id(self) -> str:
         try:
@@ -458,7 +476,8 @@ class VertexGeminiLLM(LLMCallBase):
             contents = [types.Content(
                 role="user", parts=[types.Part.from_text(text=user_message)]
             )]
-            meta = {"input_tokens": 0, "output_tokens": 0, "num_turns": 0}
+            meta = {"input_tokens": 0, "output_tokens": 0, "num_turns": 0,
+                    "cache_read_input_tokens": 0, "reasoning_tokens": 0}
             final_text = ""
 
             for _ in range(self.max_tool_iterations):
@@ -478,8 +497,7 @@ class VertexGeminiLLM(LLMCallBase):
                 meta["num_turns"] += 1
                 usage = getattr(resp, "usage_metadata", None)
                 if usage is not None:
-                    meta["input_tokens"] += getattr(usage, "prompt_token_count", 0) or 0
-                    meta["output_tokens"] += getattr(usage, "candidates_token_count", 0) or 0
+                    self._record_usage(usage, meta)
 
                 candidate = (resp.candidates or [None])[0]
                 if candidate is None or candidate.content is None:
@@ -589,6 +607,44 @@ class VertexGeminiLLM(LLMCallBase):
             stderr="",
             stream_result="".join(stream_parts),
         )
+
+    @staticmethod
+    def _record_usage(usage, meta: dict) -> None:
+        """Accumulate one ``generate_content`` response's usage into *meta*.
+
+        :param usage: A response's ``usage_metadata``. Fields are read via
+            ``getattr`` because which ones are populated depends on the model —
+            ``cached_content_token_count`` only appears with context caching, and
+            ``thoughts_token_count`` only on thinking models.
+        :param meta: The call's canonical usage dict, updated in place.
+        :type usage: Any
+        :type meta: dict
+
+        Two Gemini-specific conventions have to be translated, and getting either
+        wrong misstates the call:
+
+        * ``prompt_token_count`` is the *whole* prompt, cached content included.
+          ``cached_content_token_count`` is subtracted out so ``input_tokens`` means
+          fresh input, matching every other backend — otherwise a cached prompt is
+          priced entirely at the fresh-input rate.
+        * ``thoughts_token_count`` is billed at the output rate but reported
+          *outside* ``candidates_token_count``. It is therefore added into
+          ``output_tokens`` and also recorded on its own as ``reasoning_tokens``,
+          which keeps chia's invariant that reasoning tokens are a breakdown of
+          output rather than a fourth billable class.
+        """
+        def _int(name: str) -> int:
+            value = getattr(usage, name, 0) or 0
+            return int(value) if isinstance(value, (int, float)) else 0
+
+        prompt_tokens = _int("prompt_token_count")
+        cached = min(_int("cached_content_token_count"), prompt_tokens)
+        thoughts = _int("thoughts_token_count")
+
+        meta["input_tokens"] += prompt_tokens - cached
+        meta["cache_read_input_tokens"] += cached
+        meta["output_tokens"] += _int("candidates_token_count") + thoughts
+        meta["reasoning_tokens"] += thoughts
 
     @staticmethod
     def _sanitize_schema(schema):

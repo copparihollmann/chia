@@ -334,6 +334,10 @@ class OpenAICompatLLM(LLMCallBase):
 
         profiler = get_profiler()
 
+        # Per-attempt metadata is cleared at the top of each attempt below, so the
+        # tokens a failed attempt burned have to be banked before that happens.
+        self.begin_retry_ledger()
+
         for attempt in range(self.retries):
             try:
                 self._last_metadata = {}
@@ -345,6 +349,9 @@ class OpenAICompatLLM(LLMCallBase):
                      "node_id": getattr(t, "node_id", None)}
                     for t in tools
                 ]
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled and self._last_metadata:
                     profiler.add_info(self._last_metadata)
 
@@ -358,8 +365,9 @@ class OpenAICompatLLM(LLMCallBase):
                 raise
 
             # -- Retry once: a shorter generation may fit --
-            except MaxOutputTokensError:
+            except MaxOutputTokensError as exc:
                 if attempt == 0:
+                    self.note_retry(attempt, exc)
                     self.logger.warning(
                         "Max output tokens on attempt %d/%d, retrying once",
                         attempt + 1, self.retries,
@@ -368,8 +376,9 @@ class OpenAICompatLLM(LLMCallBase):
                 raise
 
             # -- Retry with exponential backoff: transient service issue --
-            except ServerError:
+            except ServerError as exc:
                 backoff = min(5 * 2 ** attempt, 60)
+                self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning(
                     "Server error on attempt %d/%d, backing off %ds",
                     attempt + 1, self.retries, backoff,
@@ -378,17 +387,26 @@ class OpenAICompatLLM(LLMCallBase):
 
             # -- Standard retry for unknown errors --
             except UnknownOpenAIError as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unknown error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
 
             except Exception as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unexpected error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
-        return QueryResult(result="", returncode=-1, stderr="", stream_result="", success=False)
+        # Every attempt failed. The result carries no text, but it must still
+        # carry the accounting: the attempts were billed, and a caller summing
+        # spend over a grid would otherwise record the failures as free.
+        return self.attach_usage(
+            QueryResult(result="", returncode=-1, stderr="",
+                        stream_result="", success=False),
+            meta={},
+        )
 
     def _get_node_id(self) -> str:
         try:
@@ -509,7 +527,8 @@ class OpenAICompatLLM(LLMCallBase):
                 messages.append({"role": "system", "content": self.system_message})
             messages.append({"role": "user", "content": user_message})
 
-            meta = {"input_tokens": 0, "output_tokens": 0, "num_turns": 0}
+            meta = {"input_tokens": 0, "output_tokens": 0, "num_turns": 0,
+                    "cache_read_input_tokens": 0, "reasoning_tokens": 0}
             final_text = ""
 
             for _ in range(self.max_tool_iterations):
@@ -533,8 +552,7 @@ class OpenAICompatLLM(LLMCallBase):
                 meta["num_turns"] += 1
                 usage = getattr(resp, "usage", None)
                 if usage is not None:
-                    meta["input_tokens"] += getattr(usage, "prompt_tokens", 0) or 0
-                    meta["output_tokens"] += getattr(usage, "completion_tokens", 0) or 0
+                    self._record_usage(usage, meta)
 
                 choice = resp.choices[0]
                 msg = choice.message
@@ -630,6 +648,54 @@ class OpenAICompatLLM(LLMCallBase):
             stderr="",
             stream_result="".join(stream_parts),
         )
+
+    @staticmethod
+    def _record_usage(usage, meta: dict) -> None:
+        """Accumulate one completion's ``usage`` object into *meta*.
+
+        :param usage: The ``usage`` field of a chat-completions response. Read via
+            ``getattr`` throughout because the shape differs across the
+            OpenAI-compatible servers this backend targets — vLLM, Ollama,
+            Fireworks, Groq, OpenRouter and Nvidia all omit different parts of it.
+        :param meta: The call's canonical usage dict, updated in place.
+        :type usage: Any
+        :type meta: dict
+
+        Three counters beyond the two totals, each of which changes a number:
+
+        * ``prompt_tokens_details.cached_tokens`` — prompt tokens served from the
+          server's cache, billed at a fraction of the fresh rate. OpenAI counts
+          them *inside* ``prompt_tokens``, so they are subtracted out here to keep
+          the input classes separate (see :mod:`chia.base.usage`); pricing the full
+          prompt at the fresh rate is exactly the overstatement the split exists
+          to prevent.
+        * ``completion_tokens_details.reasoning_tokens`` — recorded as a breakdown,
+          not added: reasoning is already inside ``completion_tokens``.
+        * ``cost`` — OpenRouter reports the actual charge for the generation. A
+          provider-reported figure beats any estimate, so it is passed through as
+          ``cost_usd`` and lands as ``cost_source="billed"``.
+        """
+        def _int(obj, name: str) -> int:
+            value = getattr(obj, name, 0) or 0
+            return int(value) if isinstance(value, (int, float)) else 0
+
+        prompt_tokens = _int(usage, "prompt_tokens")
+        cached = _int(getattr(usage, "prompt_tokens_details", None), "cached_tokens")
+        # Defensive: a server that reports cached_tokens *in addition to*
+        # prompt_tokens rather than inside it would otherwise yield a negative
+        # fresh-input count.
+        cached = min(cached, prompt_tokens)
+
+        meta["input_tokens"] += prompt_tokens - cached
+        meta["cache_read_input_tokens"] += cached
+        meta["output_tokens"] += _int(usage, "completion_tokens")
+        meta["reasoning_tokens"] += _int(
+            getattr(usage, "completion_tokens_details", None), "reasoning_tokens"
+        )
+
+        cost = getattr(usage, "cost", None)
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            meta["cost_usd"] = meta.get("cost_usd", 0.0) + float(cost)
 
     @staticmethod
     def _mcp_result_to_text(result) -> str:
