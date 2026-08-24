@@ -33,13 +33,15 @@ no-ops rather than inventing a path.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from chia.base.usage import BILLING_MODES, TokenUsage, sum_usages
+from chia.trace.stream_telemetry import METADATA_KEY as STREAM_TELEMETRY_KEY
 
 logger = logging.getLogger("chia.aet_sink")
 
@@ -111,6 +113,13 @@ class CallUsage:
     func: str
     ts: float
     usage: TokenUsage
+    # Wall-clock length of the call, used to place this call's activity bands on the
+    # run-wide clock: a stream's own t=0 is the call's start, not the run's.
+    duration_s: float = 0.0
+    # The per-call summary derived on the worker by chia.trace.stream_telemetry — activity
+    # bands, tool counts, per-model usage. Empty when the aet extra is absent or when the
+    # backend is not the Claude Code CLI.
+    telemetry: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -190,6 +199,22 @@ class RunUsage:
             return ""
         return max(totals.items(), key=lambda kv: kv[1])[0]
 
+    def clock_origin(self, mode: str = "per_token") -> Optional[float]:
+        """Wall-clock zero for this run's series: the first call's **start**.
+
+        Not its completion. A call's completion timestamp is the only one the profiler
+        records, so the origin used to be the first *completion* — which put t=0 after the
+        first call's work was already done, and left that call's tool activity at negative
+        time. A run is described as starting when it started.
+
+        Falls back to the first completion when no call duration was recorded, so a run
+        collected before per-call durations existed reconstructs exactly as it did before.
+        """
+        calls = [c for c in self.calls if c.usage.billing_mode == mode]
+        if not calls:
+            return None
+        return calls[0].ts - float(calls[0].duration_s or 0.0)
+
     def trajectory(self, mode: str = "per_token") -> List[dict]:
         """Cumulative per-call samples for one billing mode, oldest first.
 
@@ -212,7 +237,7 @@ class RunUsage:
         calls = [c for c in self.calls if c.usage.billing_mode == mode]
         if not calls:
             return []
-        t0 = calls[0].ts
+        t0 = self.clock_origin(mode)
         # Seeded from the first call rather than from an empty TokenUsage: an empty
         # one carries cost_usd=None, which would poison every running cost (see
         # TokenUsage.__add__).
@@ -298,11 +323,15 @@ def collect_run_usage(events: Iterable[dict]) -> RunUsage:
         if call_id in seen:
             continue
         seen.add(call_id)
+        extra = event.get("extra") or {}
+        telemetry = extra.get(STREAM_TELEMETRY_KEY)
         calls.append(CallUsage(
             call_id=call_id,
             func=str(event.get("func", "") or ""),
             ts=float(event.get("ts", 0.0) or 0.0),
             usage=usage,
+            duration_s=float(extra.get("duration_s", 0.0) or 0.0),
+            telemetry=telemetry if isinstance(telemetry, dict) else {},
         ))
 
     calls.sort(key=lambda c: c.ts)
@@ -448,7 +477,8 @@ def record_run(
             run_path=run_path,
             tracking_mode="local",
         )
-        _write_run(run_logger, run, model=model, extra=extra, run_id=run_id)
+        _write_run(run_logger, run, model=model, extra=extra, run_id=run_id,
+                   run_path=run_path)
         run_logger.finish("completed")
         return True
     except Exception as exc:  # never let telemetry break a run
@@ -457,7 +487,7 @@ def record_run(
 
 
 def _write_run(run_logger, run: RunUsage, *, model: str, extra: Optional[dict],
-               run_id: str = "") -> None:
+               run_id: str = "", run_path=None) -> None:
     """Emit one folded :class:`RunUsage` through an already-started aet logger."""
     metered = run.metered
     subscription = run.subscription
@@ -501,7 +531,8 @@ def _write_run(run_logger, run: RunUsage, *, model: str, extra: Optional[dict],
     run_logger.log_metric(RETRIES_METRIC, run.retries)
 
     _write_per_model(run_logger, run)
-    _write_trajectory(run_logger, run, model=model, run_id=run_id)
+    _write_tool_metrics(run_logger, run)
+    _write_trajectory(run_logger, run, model=model, run_id=run_id, run_path=run_path)
 
 
 def _write_per_model(run_logger, run: RunUsage) -> None:
@@ -525,7 +556,7 @@ def _write_per_model(run_logger, run: RunUsage) -> None:
 
 
 def _write_trajectory(run_logger, run: RunUsage, *, model: str = "",
-                      run_id: str = "") -> None:
+                      run_id: str = "", run_path=None) -> None:
     """Record the cumulative per-call series, which is what ``aet plot`` draws.
 
     Three things go out, not one, because aet's reader needs all three to reconstruct a
@@ -583,6 +614,139 @@ def _write_trajectory(run_logger, run: RunUsage, *, model: str = "",
         run_logger.log_param("aet.traj.summary", summary)
     except Exception as exc:
         logger.debug("aet trajectory summary not recorded: %s", exc)
+
+    # The fast-path artifact, written last because it is the only one that can carry the
+    # activity bands: aet's logs/ reconstruction restores points, rounds and milestones but
+    # documents bands as out of reach ("they belong to tool events"). Everything above is
+    # still written when this is skipped, so a run without the telemetry loses the activity
+    # view and nothing else.
+    if run_path is not None:
+        _write_trajectory_json(run_path, run, summary, points, _activity_bands(run))
+
+
+def _activity_bands(run: RunUsage, mode: str = "per_token") -> List[dict]:
+    """Every call's activity bands, placed on the run-wide clock.
+
+    Each call's stream numbers its tool calls from that call's own t=0, so a run of eight
+    prompts would otherwise stack eight overlapping sets of bands at the start of the
+    figure. The offset is the call's start — its completion timestamp minus its own
+    duration — measured from the first call in the run.
+    """
+    calls = [c for c in run.calls if c.usage.billing_mode == mode]
+    if not calls:
+        return []
+    # The SAME origin the points use (see RunUsage.clock_origin). Bands and the spend curve
+    # are drawn on one x-axis, so they must share a zero — placing bands on a start-time clock
+    # while the curve was on a completion-time clock would slide the activity view relative to
+    # the spend it exists to explain, and would put the first call's tools at negative time.
+    t0 = run.clock_origin(mode)
+    bands: List[dict] = []
+    for call in calls:
+        raw = call.telemetry.get("bands") if call.telemetry else None
+        if not raw:
+            continue
+        # A call with no recorded duration cannot be placed better than at its completion.
+        start = (call.ts - call.duration_s) - t0
+        for band in raw:
+            try:
+                t_start = float(band["t0_s"]) + start
+                t_end = float(band["t1_s"]) + start
+            except (KeyError, TypeError, ValueError):
+                continue
+            if t_end <= 0.0:
+                # Entirely before the run clock's zero. Dropped rather than squashed to
+                # [0, 0]: a zero-length band at the origin is a claim that something
+                # happened there instantaneously, which is not what was measured.
+                continue
+            bands.append({**band, "t0_s": max(0.0, t_start), "t1_s": t_end})
+    bands.sort(key=lambda b: b["t0_s"])
+    return bands
+
+
+def _write_trajectory_json(run_path, run: RunUsage, summary: dict, points: List[dict],
+                           bands: List[dict]) -> bool:
+    """Write ``metrics/trajectory.json`` — the only run-dir artifact that carries bands.
+
+    ``RunTrajectory.from_run_dir`` prefers this file and falls back to replaying ``logs/``.
+    That fallback is documented in aet as unable to restore activity bands ("they belong to
+    tool events"), so a sink that writes only ``logs/`` can never produce an activity view
+    no matter what it records. Writing the fast path is what puts the bands in reach.
+
+    Returns False, quietly, when aet is absent or the write fails: a missing figure must
+    not fail a run, and ``logs/`` has already been written by this point either way.
+    """
+    if not points:
+        return False
+    try:
+        from aet.trajectory.model import ActivityBand, RoundBoundary, RunTrajectory, TrajectoryPoint
+    except Exception:
+        return False
+    try:
+        traj = RunTrajectory(
+            run_id=summary.get("run_id", ""),
+            duration_s=float(summary.get("duration_s", 0.0)),
+            num_rounds=int(summary.get("num_rounds", 1)),
+            points=[TrajectoryPoint(
+                t_s=float(p["t_s"]),
+                cum_input_tokens=float(p["cum_input"]),
+                cum_output_tokens=float(p["cum_output"]),
+                cum_cache_tokens=float(p["cum_cache"]),
+                cum_cache_read_tokens=float(p["cum_cache_read"]),
+                cum_cache_creation_tokens=float(p["cum_cache_creation"]),
+                cum_cost_usd=float(p["cum_cost"]),
+                provisional_cost=bool(p.get("provisional_cost", False)),
+            ) for p in points],
+            bands=[ActivityBand(
+                t0_s=float(b["t0_s"]),
+                t1_s=float(b["t1_s"]),
+                category=str(b.get("category", "bash")),
+                tool_name=str(b.get("tool_name", "")),
+                weight=float(b.get("weight", 1.0)),
+                is_error=bool(b.get("is_error", False)),
+            ) for b in bands],
+            # One round for the whole run, matching what logs/ records. The verdict fields
+            # stay unset: chia runs no oracle, and a 0-of-N would render as a failing run.
+            rounds=[RoundBoundary(index=0, t_start_s=0.0,
+                                  t_end_s=float(summary.get("duration_s", 0.0)))],
+            final_input_tokens=float(summary.get("final_input_tokens", 0.0)),
+            final_output_tokens=float(summary.get("final_output_tokens", 0.0)),
+            final_cache_tokens=float(summary.get("final_cache_tokens", 0.0)),
+            final_cost_usd=float(summary.get("final_cost_usd", 0.0)),
+        )
+        out = Path(run_path) / "metrics" / "trajectory.json"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(".json.partial")
+        tmp.write_text(json.dumps(traj.to_dict(), indent=2, sort_keys=True))
+        tmp.replace(out)                       # write-then-rename: never a half-read figure
+        return True
+    except Exception as exc:
+        logger.debug("aet trajectory.json not written: %s", exc)
+        return False
+
+
+def _write_tool_metrics(run_logger, run: RunUsage) -> None:
+    """Run-level tool counts, so "how much tool use" is answerable without the figure."""
+    totals = {"tool_calls": 0, "tool_errors": 0}
+    tools: set = set()
+    seen_any = False
+    for call in run.calls:
+        t = call.telemetry
+        if not t:
+            continue
+        seen_any = True
+        totals["tool_calls"] += int(t.get("tool_calls", 0) or 0)
+        totals["tool_errors"] += int(t.get("tool_errors", 0) or 0)
+        tools.update(t.get("tools_used") or ())
+    if not seen_any:
+        # No stream telemetry at all is different from a run that used no tools, and
+        # recording 0 would erase that difference.
+        return
+    try:
+        run_logger.log_metric("chia.tool.calls", float(totals["tool_calls"]))
+        run_logger.log_metric("chia.tool.errors", float(totals["tool_errors"]))
+        run_logger.log_param("chia.tool.names", sorted(tools))
+    except Exception as exc:
+        logger.debug("tool metrics not recorded: %s", exc)
 
 
 def _log_point(run_logger, point: dict) -> None:

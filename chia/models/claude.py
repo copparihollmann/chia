@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import threading
@@ -851,6 +852,25 @@ class ClaudeCodeLLM(LLMCallBase):
         if self._call_counter == 0:
             self._call_counter = 1
 
+    def _attach_stream_telemetry(self, raw_events) -> None:
+        """Summarise *raw_events* onto ``self._last_metadata`` for the profiler to carry.
+
+        :param raw_events: ``(monotonic_s, raw_json_line)`` pairs from this call's stdout.
+
+        Best-effort by construction: telemetry is a figure, and a figure must never be able
+        to fail a run. Without the ``aet`` extra installed this is a no-op and the metadata
+        is byte-identical to what it was before this existed.
+        """
+        if not raw_events:
+            return
+        try:
+            from chia.trace.stream_telemetry import merge_into_metadata, summarize_stream
+            summary = summarize_stream(raw_events)
+            if summary:
+                self._last_metadata = merge_into_metadata(self._last_metadata, summary)
+        except Exception as exc:                     # pragma: no cover - defensive
+            self.logger.debug("stream telemetry not attached: %s", exc)
+
     def _capture_transcript(self, cli: ClaudeCodeQueryResult) -> None:
         """Read the on-disk transcript after a run into memory and onto *cli*.
 
@@ -1039,6 +1059,7 @@ class ClaudeCodeLLM(LLMCallBase):
         result_text_parts: list[str] = []
         stderr_parts: list[str] = []
         stream_parts: list[str] = []
+        raw_events: list[tuple[float, str]] = []
         lock = threading.Lock()
 
         class _TeeWriter:
@@ -1091,6 +1112,13 @@ class ClaudeCodeLLM(LLMCallBase):
                 line = line.strip()
                 if line:
                     with lock:
+                        # Keep the raw event next to the rendered one. This is the whole of the
+                        # capture side: aet.tracking.claude_stream.parse_timestamped_stream
+                        # documents this exact ``(timestamp, raw_line)`` loop as its input, and
+                        # _process_event_line below renders the line to prose and discards it —
+                        # so every tool call, its result and its wall-clock duration used to end
+                        # here. The rendered transcript we already keep is the larger of the two.
+                        raw_events.append((time.monotonic(), line))
                         self._process_event_line(line, log_file, result_text_parts)
                         log_file.flush()
 
@@ -1109,6 +1137,11 @@ class ClaudeCodeLLM(LLMCallBase):
         proc.wait()
         t1.join()
         t2.join()
+
+        # Derive the activity summary here, on the worker, where the events already are.
+        # ``prompt`` may run on any Ray worker, so only this summary travels back to the
+        # driver — never the raw lines, which carry prompt text and tool output.
+        self._attach_stream_telemetry(raw_events)
 
         if not result_text_parts:
             log_file.write("[DEBUG] No events parsed.\n")
