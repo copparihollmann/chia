@@ -103,10 +103,10 @@ def _host_load() -> dict:
     return {"load_1m": load[0], "load_5m": load[1], "load_15m": load[2]}
 
 
-def _root_pid(arm: str) -> int | None:
+def _root_pid(arm: str, bwrap_state_root: Path) -> int | None:
     if arm == "bwrap":
-        path = Path(
-            f"/tmp/chia-bwrap/circt_isolation_bwrap_{os.environ['USER']}-0/pid")
+        path = (bwrap_state_root
+                / f"circt_isolation_bwrap_{os.environ['USER']}-0" / "pid")
         try:
             return int(path.read_text())
         except (FileNotFoundError, ValueError):
@@ -190,7 +190,7 @@ def _leaked_processes(identities: dict[str, str]) -> list[int]:
     return leaked
 
 
-def _prepare_bwrap_writable(rootfs: Path, writable_root: Path) -> dict:
+def _prepare_writable_snapshot(rootfs: Path, writable_root: Path) -> dict:
     """Create fresh overlay-equivalent writable trees outside timed startup."""
     start = time.perf_counter()
     rootfs = rootfs.resolve()
@@ -207,13 +207,13 @@ def _prepare_bwrap_writable(rootfs: Path, writable_root: Path) -> dict:
             f"unsafe --bwrap-writable-root {writable_root}; it must be a "
             "dedicated directory outside /, home, the CHIA worktree, and rootfs")
 
-    marker = writable_root / ".chia-bwrap-benchmark-snapshots"
+    marker = writable_root / ".chia-isolation-benchmark-snapshots"
     if writable_root.exists() and any(writable_root.iterdir()) and not marker.is_file():
         raise ValueError(
             f"refusing to clean unmarked writable root {writable_root}; "
             f"expected marker {marker}")
     writable_root.mkdir(parents=True, exist_ok=True)
-    marker.write_text("chia-bwrap-benchmark-snapshots-v1\n")
+    marker.write_text("chia-isolation-benchmark-snapshots-v2\n")
     copied = []
     for source_relative, destination_name in (
         (Path("workspace"), "workspace"),
@@ -239,6 +239,55 @@ def _prepare_bwrap_writable(rootfs: Path, writable_root: Path) -> dict:
     }
 
 
+def _prepare_runtime_tmp(runtime_tmp_root: Path, arm: str) -> list[str]:
+    """Reset only campaign-owned Ray/container temporary directories."""
+    runtime_tmp_root = runtime_tmp_root.resolve()
+    allowed = Path("/scratch/agustin/tmp").resolve()
+    if runtime_tmp_root == allowed or allowed not in runtime_tmp_root.parents:
+        raise ValueError(
+            f"unsafe runtime temp root {runtime_tmp_root}; expected a child of {allowed}")
+    marker = runtime_tmp_root / ".chia-isolation-benchmark-tmp"
+    runtime_tmp_root.mkdir(parents=True, exist_ok=True)
+    if any(runtime_tmp_root.iterdir()) and not marker.is_file():
+        raise ValueError(f"refusing to clean unmarked runtime root {runtime_tmp_root}")
+    marker.write_text("chia-isolation-benchmark-tmp-v1\n")
+    reset = [runtime_tmp_root / "head", runtime_tmp_root / f"{arm}-ray"]
+    if arm == "docker":
+        reset.append(runtime_tmp_root / "docker-tmp")
+    for path in reset:
+        if path.exists():
+            try:
+                shutil.rmtree(path)
+            except PermissionError:
+                # A killed/older Docker arm may have left root-owned Ray log
+                # directories.  Renaming the campaign-owned top-level path is
+                # permitted by its parent and lets the experiment continue;
+                # the quarantined directory is reported for explicit cleanup.
+                quarantine = path.with_name(
+                    f"{path.name}.stale-{time.time_ns()}")
+                path.rename(quarantine)
+        path.mkdir(parents=True)
+    return [str(path) for path in reset]
+
+
+def _record_teardown(record: dict, config: Path) -> None:
+    """Always tear down, including after a partially successful ``chia up``."""
+    start = time.perf_counter()
+    down = _run(["chia", "down", "--yes", str(config)], timeout=600)
+    record.update({
+        "down_seconds": time.perf_counter() - start,
+        "down_returncode": down.returncode,
+        "down_stdout_tail": "\n".join(down.stdout.splitlines()[-80:]),
+        "down_stderr_tail": "\n".join(down.stderr.splitlines()[-80:]),
+        "load_after": _host_load(),
+    })
+    identities = (record.get("process_metrics_before_down") or {}).get(
+        "identities", {})
+    leaked = _leaked_processes(identities)
+    record["leaked_processes"] = leaked
+    record["leaked_process_count"] = len(leaked)
+
+
 def _one_trial(
     arm: str,
     config: Path,
@@ -246,6 +295,7 @@ def _one_trial(
     full_lit: bool,
     repro_script_text: str | None,
     ray_address: str,
+    bwrap_state_root: Path,
 ) -> dict:
     import ray
 
@@ -262,6 +312,7 @@ def _one_trial(
         "up_stderr_tail": "\n".join(up.stderr.splitlines()[-80:]),
     })
     if up.returncode:
+        _record_teardown(record, config)
         return record
 
     try:
@@ -276,23 +327,11 @@ def _one_trial(
             "circt": _circt_primitives.chia_remote_blocking(
                 full_lit, repro_script_text),
         })
-        record["process_metrics_before_down"] = _process_metrics(_root_pid(arm))
+        record["process_metrics_before_down"] = _process_metrics(
+            _root_pid(arm, bwrap_state_root))
     finally:
         ray.shutdown()
-        start = time.perf_counter()
-        down = _run(["chia", "down", "--yes", str(config)], timeout=600)
-        record.update({
-            "down_seconds": time.perf_counter() - start,
-            "down_returncode": down.returncode,
-            "down_stdout_tail": "\n".join(down.stdout.splitlines()[-80:]),
-            "down_stderr_tail": "\n".join(down.stderr.splitlines()[-80:]),
-            "load_after": _host_load(),
-        })
-        identities = (record.get("process_metrics_before_down") or {}).get(
-            "identities", {})
-        leaked = _leaked_processes(identities)
-        record["leaked_processes"] = leaked
-        record["leaked_process_count"] = len(leaked)
+        _record_teardown(record, config)
     return record
 
 
@@ -311,13 +350,24 @@ def main() -> int:
     parser.add_argument("--ray-address", default="127.0.0.1:46379")
     parser.add_argument(
         "--bwrap-rootfs", type=Path,
-        default=Path("/scratch/agustin/cache/chia-bwrap-rootfs/sha256-5c61bd07a4716d2d1f235300138f6c5dd97c42738f7195cb1d3570c9539493c8"))
+        default=Path("/scratch/agustin/projects/chia-experiments/shared/circt-rootfs"))
     parser.add_argument(
         "--bwrap-writable-root", type=Path,
-        default=Path("/scratch/agustin/cache/chia-bwrap-benchmark"))
+        default=Path("/scratch/agustin/projects/chia-experiments/bwrap/bwrap"))
+    parser.add_argument(
+        "--docker-writable-root", type=Path,
+        default=Path("/scratch/agustin/projects/chia-experiments/bwrap/docker"))
+    parser.add_argument(
+        "--runtime-tmp-root", type=Path,
+        default=Path("/scratch/agustin/tmp/r"))
+    parser.add_argument(
+        "--bwrap-state-root", type=Path,
+        default=Path("/scratch/agustin/tmp/r/state"))
     args = parser.parse_args()
     if args.trials < 1 or args.dispatches < 1:
         parser.error("--trials and --dispatches must be positive")
+    if not os.environ.get("CHIA_HEAD"):
+        parser.error("CHIA_HEAD must name the benchmark host (for example, localhost)")
 
     manifest = {
         "event": "manifest", "schema": 1,
@@ -336,10 +386,15 @@ def main() -> int:
         "trials": args.trials, "dispatches": args.dispatches,
         "full_lit": args.full_lit, "seed": args.seed,
         "ray_address": args.ray_address,
+        "prepared_rootfs": str(args.bwrap_rootfs.resolve()),
         "writable_policy": (
-            "Docker gets a fresh container overlay and bwrap gets fresh "
-            "workspace/home reflink-or-copy snapshots before every arm. "
-            "Both begin with the build state baked into the pinned image."),
+            "Docker and bwrap each get distinct fresh workspace/home "
+            "reflink-or-copy snapshots from the same prepared OCI rootfs "
+            "before every arm. Docker bind mounts its snapshot, so build "
+            "writes do not consume the host root filesystem."),
+        "temporary_storage_policy": (
+            "All retained data lives under /scratch/agustin/projects and all "
+            "Ray/container temporary state under /scratch/agustin/tmp."),
         "timing_policy": "snapshot preparation is recorded but excluded from up_seconds",
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -352,20 +407,15 @@ def main() -> int:
             arms = ["docker", "bwrap"]
             rng.shuffle(arms)
             for order, arm in enumerate(arms):
-                prep = (
-                    _prepare_bwrap_writable(
-                        args.bwrap_rootfs, args.bwrap_writable_root)
-                    if arm == "bwrap"
-                    else {
-                        "prep_seconds": 0.0,
-                        "prep_policy": "fresh Docker overlay created by chia up",
-                        "writable_paths": [],
-                    }
-                )
+                writable_root = (args.bwrap_writable_root if arm == "bwrap"
+                                 else args.docker_writable_root)
+                prep = _prepare_writable_snapshot(args.bwrap_rootfs, writable_root)
+                prep["runtime_tmp_paths"] = _prepare_runtime_tmp(
+                    args.runtime_tmp_root, arm)
                 record = _one_trial(
                     arm, configs[arm], args.dispatches, args.full_lit,
                     args.repro_script.read_text() if args.repro_script else None,
-                    args.ray_address)
+                    args.ray_address, args.bwrap_state_root)
                 record["preparation"] = prep
                 record.update({"pair": pair, "pair_order": order})
                 output.write(json.dumps(record, sort_keys=True) + "\n")

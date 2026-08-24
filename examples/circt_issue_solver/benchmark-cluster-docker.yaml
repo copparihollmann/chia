@@ -17,12 +17,18 @@ available_node_types:
             run_options:
                 - --ulimit nofile=65536:65536
                 - --shm-size=10.24gb
+                - "--user $(id -u):$(id -g)"
+                - -e CCACHE_DISABLE=1
+                - --mount type=bind,src=/scratch/agustin/projects/chia-experiments/bwrap/docker/workspace,dst=/workspace
+                - --mount type=bind,src=/scratch/agustin/projects/chia-experiments/bwrap/docker/home-ray,dst=/home/ray
+                - --mount type=bind,src=/scratch/agustin/tmp/r/docker-tmp,dst=/tmp
+                - --mount type=bind,src=/scratch/agustin/tmp/r/docker-ray,dst=/scratch/agustin/tmp/r/head
         worker_setup_commands:
             - git config --global --add safe.directory /workspace/circt || true
 head_env_commands:
     - "source /scratch2/agustin/miniforge3/etc/profile.d/conda.sh && conda activate chia_matrix"
 head_start_ray_commands:
-    - "source /scratch2/agustin/miniforge3/etc/profile.d/conda.sh && conda activate chia_matrix && ray start --head --port=46379 --include-dashboard=False"
+    - "source /scratch2/agustin/miniforge3/etc/profile.d/conda.sh && conda activate chia_matrix && RAY_TMPDIR=/scratch/agustin/tmp/r/head ray start --head --port=46379 --include-dashboard=False"
 worker_start_ray_commands:
     - ray stop
-    - ray start --address=$RAY_HEAD_IP:46379 --dashboard-agent-listen-port=0
+    - RAY_TMPDIR=/scratch/agustin/tmp/r/head ray start --address=$RAY_HEAD_IP:46379 --dashboard-agent-listen-port=0

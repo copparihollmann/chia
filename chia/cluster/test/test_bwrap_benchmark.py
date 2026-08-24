@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import importlib.util
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
 
 import pytest
-
 
 _ROOT = Path(__file__).resolve().parents[3]
 
@@ -44,11 +43,11 @@ def test_snapshot_prep_requires_dedicated_marked_directory(tmp_path: Path) -> No
     (rootfs / "home/ray" / "settings").write_text("baseline")
     writable = tmp_path / "snapshots"
 
-    first = benchmark._prepare_bwrap_writable(rootfs, writable)
+    first = benchmark._prepare_writable_snapshot(rootfs, writable)
     assert first["prep_seconds"] >= 0
-    assert (writable / ".chia-bwrap-benchmark-snapshots").is_file()
+    assert (writable / ".chia-isolation-benchmark-snapshots").is_file()
     (writable / "workspace" / "source").write_text("mutated")
-    benchmark._prepare_bwrap_writable(rootfs, writable)
+    benchmark._prepare_writable_snapshot(rootfs, writable)
     assert (writable / "workspace" / "source").read_text() == "unchanged"
     assert (rootfs / "workspace" / "source").read_text() == "unchanged"
 
@@ -62,12 +61,12 @@ def test_snapshot_prep_refuses_unmarked_or_dangerous_roots(tmp_path: Path) -> No
     (unmarked / "keep").write_text("do not delete")
 
     with pytest.raises(ValueError, match="unmarked"):
-        benchmark._prepare_bwrap_writable(rootfs, unmarked)
+        benchmark._prepare_writable_snapshot(rootfs, unmarked)
     assert (unmarked / "keep").is_file()
     with pytest.raises(ValueError, match="unsafe"):
-        benchmark._prepare_bwrap_writable(rootfs, Path("/"))
+        benchmark._prepare_writable_snapshot(rootfs, Path("/"))
     with pytest.raises(ValueError, match="unsafe"):
-        benchmark._prepare_bwrap_writable(rootfs, rootfs / "nested")
+        benchmark._prepare_writable_snapshot(rootfs, rootfs / "nested")
 
 
 def _record(pair: int, arm: str, representative: float, up: float = 1.0) -> dict:

@@ -1,0 +1,35 @@
+{
+  "bootstrap_samples": 10000,
+  "complete_pairs": 10,
+  "criteria": {
+    "all_trials_successful": true,
+    "enough_pairs": true,
+    "minimum_pairs": 10,
+    "paired_bootstrap_ci_excludes_zero": true,
+    "representative_workload_complete": true,
+    "threshold_met": true,
+    "threshold_percent": 5.0
+  },
+  "decision": "go",
+  "representative_end_to_end": {
+    "bwrap_median_seconds": 53.97495289699873,
+    "docker_median_seconds": 83.01460269163363,
+    "improvement_percent": 34.98137538826235,
+    "median_improvement_seconds": 29.43076990393456,
+    "paired_bootstrap_95_ci_seconds": [
+      27.840519902587403,
+      31.36113999201916
+    ]
+  },
+  "schema": 1,
+  "seed": 10568,
+  "startup_secondary": {
+    "bwrap_median_seconds": 19.53779372345889,
+    "docker_median_seconds": 14.98557914601406,
+    "median_improvement_seconds": -4.7340886985184625,
+    "paired_bootstrap_95_ci_seconds": [
+      -5.187128431512974,
+      -4.284483999945223
+    ]
+  }
+}
