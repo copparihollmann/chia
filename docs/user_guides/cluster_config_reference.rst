@@ -284,7 +284,9 @@ Container config
 ~~~~~~~~~~~~~~~~
 
 A ``docker:`` block may appear cluster-wide at the top level or
-inside any node type; the node-type block overrides the cluster-wide one. 
+inside any node type; the node-type block overrides the cluster-wide one.
+Each block chooses its own ``engine``, so one node type can use ``podman`` while
+the rest of the cluster uses ``docker``.
 
 .. code-block:: yaml
 
@@ -329,6 +331,25 @@ inside any node type; the node-type block overrides the cluster-wide one.
      - ``[]``
      - Commands run inside the container after it starts, before the worker's
        main script (e.g. clone/pull a repo, fix up ``/etc/passwd``).
+   * - ``engine``
+     - ``"docker"``
+     - Container CLI to invoke: ``docker``, ``podman``, or ``nerdctl``. Use
+       ``podman`` to run workers as an unprivileged user on a host where you are
+       not in the ``docker`` group.
+
+.. note::
+
+   ``engine`` selects a **Docker-CLI-compatible** binary. CHIA drives the
+   container with Docker's command grammar (``run -d``, ``exec -i``,
+   ``inspect``, ``rm -f``), so runtimes with a different execution model —
+   Apptainer, bubblewrap — cannot be substituted here and are rejected when the
+   config is parsed. To run workers with no container at all, omit the
+   ``docker:`` block entirely; CHIA then runs the worker script directly over
+   SSH.
+
+   The ``engine`` setting applies to the SSH cluster path (``chia up`` /
+   ``chia down``). Cloud workers provisioned via ``aws_nodes`` / ``gcp_nodes``
+   and FireSim build hosts still invoke ``docker`` directly.
 
 .. note::
 

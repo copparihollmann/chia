@@ -155,6 +155,22 @@ class SSHAuthConfig:
 
 @dataclass
 class DockerConfig:
+    """A per-worker container: which image, and how to run it.
+
+    Attributes:
+        image: Container image URI, pulled on the worker host.
+        container_name: Base name; CHIA appends the worker index so several workers of one node
+            type on the same host do not collide.
+        pull_before_run: Pull the image before starting the container.
+        pull_timeout: Seconds allowed for that pull.
+        run_options: Extra flags spliced verbatim into the ``run`` command (mounts, ulimits,
+            ``--user``, env vars). These are the engine's own flags, not a CHIA abstraction.
+        run_setup_commands: Commands run inside the container once it is up, before the worker
+            script.
+        engine: The container CLI to invoke — one of :data:`SUPPORTED_CONTAINER_ENGINES`.
+            Defaults to ``docker``; ``podman`` lets an unprivileged user run workers on a host
+            where they are not in the ``docker`` group.
+    """
     image: str
     container_name: str
     pull_before_run: bool = True
@@ -277,7 +293,26 @@ class NodeAssignment:
     worker_index: int = 0
 
 
-def _parse_docker(raw: dict, engine: str = "docker") -> DockerConfig:
+#: Container engines CHIA can drive. :class:`~chia.cluster.docker.DockerManager` does not merely
+#: invoke a binary — it builds Docker's *command grammar* (``run -d --name … --net=host
+#: --shm-size=8g``, ``inspect -f '{{.State.Running}}'``, ``exec -i … bash --login``, ``rm -f``,
+#: ``pull``). Only engines that accept that grammar can be substituted, which is why this is an
+#: allow-list rather than a free-form string: a runtime with a different model (Apptainer's
+#: ``instance start``, bubblewrap's per-process namespaces) would fail deep inside cluster bring-up
+#: with a confusing error instead of at config-parse time.
+SUPPORTED_CONTAINER_ENGINES = ("docker", "podman", "nerdctl")
+
+
+def _parse_docker(raw: dict, engine: str = "docker", where: str = "config") -> DockerConfig:
+    engine = raw.get("engine", engine)
+    if engine not in SUPPORTED_CONTAINER_ENGINES:
+        raise ConfigError(
+            f"{where}: unsupported container engine {engine!r}. "
+            f"Supported: {', '.join(SUPPORTED_CONTAINER_ENGINES)}. CHIA drives the container "
+            f"through Docker's CLI grammar (run/exec/inspect/rm), so only a Docker-compatible "
+            f"engine can be swapped in. To run workers with no container at all, omit the "
+            f"'docker:' block entirely — CHIA then runs the worker script directly over SSH."
+        )
     return DockerConfig(
         image=raw["image"],
         container_name=raw.get("container_name", "chia_container"),
@@ -290,9 +325,14 @@ def _parse_docker(raw: dict, engine: str = "docker") -> DockerConfig:
 
 
 def _parse_container_section(raw: dict, where: str) -> DockerConfig | None:
-    """Parse the ``docker:`` section of *raw* (at most one)."""
+    """Parse the ``docker:`` section of *raw* (at most one).
+
+    The section's ``engine`` key selects which Docker-compatible CLI runs the container
+    (see :data:`SUPPORTED_CONTAINER_ENGINES`); it defaults to ``docker``. *where* names the
+    enclosing config location so a bad value points at the block that set it.
+    """
     if "docker" in raw:
-        return _parse_docker(raw["docker"], engine="docker")
+        return _parse_docker(raw["docker"], engine="docker", where=where)
     return None
 
 
