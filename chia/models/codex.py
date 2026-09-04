@@ -508,7 +508,7 @@ class CodexLLM(LLMCallBase):
                 self._finish_aet_recorder("failed")
                 raise
             except MaxOutputTokensError as exc:
-                self._note_failure(exc)
+                self._note_failure(exc, retrying=attempt == 0)
                 if attempt == 0:
                     self.logger.warning("Max output tokens on attempt %d/%d, retrying once",
                                         attempt + 1, self.retries)
@@ -517,19 +517,19 @@ class CodexLLM(LLMCallBase):
                 raise
             except ServerError as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
-                self._note_failure(exc)
                 backoff = min(5 * 2 ** attempt, 60)
+                self._note_failure(exc, retrying=True, backoff_s=backoff)
                 self.logger.warning("Server error on attempt %d/%d, backing off %ds",
                                     attempt + 1, self.retries, backoff)
                 _time.sleep(backoff)
             except (UnknownCodexError, subprocess.TimeoutExpired) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
-                self._note_failure(exc)
+                self._note_failure(exc, retrying=True)
                 self.logger.warning("Codex attempt %d/%d failed: %s",
                                     attempt + 1, self.retries, exc)
             except Exception as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
-                self._note_failure(exc)
+                self._note_failure(exc, retrying=True)
                 self.logger.warning("Unexpected Codex error on attempt %d/%d: %s",
                                     attempt + 1, self.retries, exc)
         self._run_result.status = "failed"
@@ -549,17 +549,33 @@ class CodexLLM(LLMCallBase):
             thread_id=self._run_result.thread_id,
         ), meta={})
 
-    def _note_failure(self, exc: BaseException) -> None:
-        """Tag the most recent attempt with a failure class (best effort)."""
-        if self._run_result and self._run_result.attempts:
-            last = self._run_result.attempts[-1]
-            if last.failure_class is None:
-                last.failure_class = (
-                    "timeout" if isinstance(exc, subprocess.TimeoutExpired)
-                    else getattr(exc, "error_type", type(exc).__name__)
-                )
-            if last.retry_reason is None:
-                last.retry_reason = f"{type(exc).__name__}: {str(exc)[:200]}"
+    def _note_failure(self, exc: BaseException, *, retrying: bool = False,
+                      backoff_s: float = 0.0) -> None:
+        """Tag the most recent attempt with a failure class (best effort).
+
+        When *retrying* is set, the attempt's tokens are also entered in the base
+        retry ledger via :meth:`LLMCallBase.note_retry`. That ledger is what
+        :meth:`LLMCallBase.attach_usage` folds into ``QueryResult.usage``, so
+        without it the public usage would report only the attempt that finally
+        succeeded and a billed failure would look free.
+
+        A typed error the caller re-raises rather than retries is deliberately not
+        entered: it produces no result to carry the accounting, and note_retry's
+        contract reserves the ledger for attempts a retry actually follows.
+        """
+        if not (self._run_result and self._run_result.attempts):
+            return
+        last = self._run_result.attempts[-1]
+        if last.failure_class is None:
+            last.failure_class = (
+                "timeout" if isinstance(exc, subprocess.TimeoutExpired)
+                else getattr(exc, "error_type", type(exc).__name__)
+            )
+        if last.retry_reason is None:
+            last.retry_reason = f"{type(exc).__name__}: {str(exc)[:200]}"
+        if retrying:
+            self.note_retry(len(self._run_result.attempts) - 1, exc,
+                            backoff_s=backoff_s, meta=self._canonical_usage(last))
 
     def _finish_aet_recorder(self, status: str) -> None:
         recorder = getattr(self, "_aet_recorder", None)

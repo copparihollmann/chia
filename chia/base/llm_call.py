@@ -118,6 +118,18 @@ class LLMCallBase(ABC):
         # object). ``None`` means "allow all". Honored only where
         # supports_config is True.
         self.config = None if config is UNSET else config
+        if sandbox_spec is not UNSET and not self.supports_sandbox:
+            warnings.warn(
+                f"{cls} does not support a per-call sandbox; 'sandbox_spec' is "
+                f"ignored. This backend issues its request from this process rather "
+                f"than spawning an agent, so there is no child to isolate.",
+                stacklevel=2,
+            )
+        # What one call may see, and how to enforce it. ``None`` plus
+        # sandbox_backend="none" is the default: unisolated, and recorded as such.
+        self.sandbox_spec: Optional[SandboxSpec] = (
+            None if sandbox_spec is UNSET else sandbox_spec)
+        self.sandbox_backend = sandbox_backend
         # Optional record/replay store; see :meth:`recorded_prompt`. None means no
         # recording, which is the default: a cassette that intercepted every call
         # implicitly would be a surprising thing for a framework to do.
@@ -198,19 +210,6 @@ class LLMCallBase(ABC):
             original_wall_s=time.perf_counter() - started,
         ))
         return result
-
-        if sandbox_spec is not UNSET and not self.supports_sandbox:
-            warnings.warn(
-                f"{cls} does not support a per-call sandbox; 'sandbox_spec' is "
-                f"ignored. This backend issues its request from this process rather "
-                f"than spawning an agent, so there is no child to isolate.",
-                stacklevel=2,
-            )
-        # What one call may see, and how to enforce it. ``None`` plus
-        # sandbox_backend="none" is the default: unisolated, and recorded as such.
-        self.sandbox_spec: Optional[SandboxSpec] = (
-            None if sandbox_spec is UNSET else sandbox_spec)
-        self.sandbox_backend = sandbox_backend
 
     def sandbox_argv(self, argv: Sequence[str]) -> List[str]:
         """Return *argv* wrapped for this instance's sandbox.
