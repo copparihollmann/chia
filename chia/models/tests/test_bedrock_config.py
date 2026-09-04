@@ -165,20 +165,23 @@ def test_apply_to_env_ignores_redundant_base_env():
 
 
 def test_llm_without_bedrock_leaves_env_untouched(monkeypatch):
-    """Default behavior: the subprocess env is os.environ minus CLAUDECODE."""
+    """Default behavior: the child env is os.environ minus every nested-session var."""
+    from chia.models.claude import _NESTED_SESSION_ENV_VARS
+
     monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
     monkeypatch.setenv("CLAUDECODE", "1")
     llm = ClaudeCodeLLM(model="claude-sonnet-4-6")
-    env = llm._subprocess_env()
+    env = llm._child_env()
     assert "CLAUDECODE" not in env
     assert "CLAUDE_CODE_USE_BEDROCK" not in env
     assert "ANTHROPIC_MODEL" not in env
-    # Exactly the passthrough env.
-    expected = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    # Exactly the passthrough env: nothing Bedrock-related is added, and the only
+    # things removed are the nested-session vars the child must not inherit.
+    expected = {k: v for k, v in os.environ.items() if k not in _NESTED_SESSION_ENV_VARS}
     assert env == expected
 
 
-def test_llm_with_bedrock_threads_vars_into_subprocess_env(monkeypatch):
+def test_llm_with_bedrock_threads_vars_into_child_env(monkeypatch):
     monkeypatch.setenv("CLAUDECODE", "1")
     monkeypatch.setenv("SOME_HOST_VAR", "keep-me")
     llm = ClaudeCodeLLM(
@@ -189,7 +192,7 @@ def test_llm_with_bedrock_threads_vars_into_subprocess_env(monkeypatch):
         region="us-west-2",
         bearer_token="tok-123",
     )
-    env = llm._subprocess_env()
+    env = llm._child_env()
     # Bedrock levers present.
     assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
     assert env["AWS_REGION"] == "us-west-2"
@@ -212,7 +215,7 @@ def test_llm_bedrock_tier_overrides_thread_through():
         sonnet_model="my.sonnet",
         haiku_model="my.haiku",
     )
-    env = llm._subprocess_env()
+    env = llm._child_env()
     assert env["ANTHROPIC_MODEL"] == "my.primary"
     assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == "my.opus"
     assert env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "my.sonnet"
@@ -224,7 +227,7 @@ def test_llm_bedrock_tier_overrides_thread_through():
 
 def test_llm_bedrock_defaults_region_when_unset():
     llm = ClaudeCodeLLM(model="opus", use_bedrock=True)
-    env = llm._subprocess_env()
+    env = llm._child_env()
     assert env["AWS_REGION"] == DEFAULT_REGION
     assert "AWS_BEARER_TOKEN_BEDROCK" not in env
 
