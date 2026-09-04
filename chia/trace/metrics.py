@@ -105,11 +105,39 @@ _BACKENDS: dict[str, type[MetricsBackend]] = {
 }
 
 
+def register_backend(name: str, backend_cls: type[MetricsBackend]) -> None:
+    """Make *backend_cls* selectable as ``MetricsLogger(backend=name)``.
+
+    The extension point for a metrics sink that lives outside this package — an experiment
+    harness routing scalars into its own run directory, say. ``MetricsBackend`` is already the
+    documented interface to implement; without this, an out-of-tree backend has to reach into the
+    private ``_BACKENDS`` table to become reachable. Mirrors how ``ChiaTool`` and ``LLMCallBase``
+    are extended by subclassing.
+
+    Re-registering an existing name replaces it, so a module can call this at import time without
+    guarding against double-import.
+
+    Args:
+        name: The string passed to ``MetricsLogger(backend=...)``.
+        backend_cls: A :class:`MetricsBackend` subclass. Its ``__init__`` receives the
+            ``**kwargs`` given to :class:`MetricsLogger`.
+
+    Raises:
+        TypeError: *backend_cls* is not a MetricsBackend subclass.
+    """
+    if not (isinstance(backend_cls, type) and issubclass(backend_cls, MetricsBackend)):
+        raise TypeError(
+            f"backend_cls must be a MetricsBackend subclass, got {backend_cls!r}"
+        )
+    _BACKENDS[name] = backend_cls
+
+
 class MetricsLogger:
     """Backend-agnostic metrics logger.
 
     Args:
-        backend: One of "tensorboard", "wandb", or "none".
+        backend: "tensorboard", "wandb", "none", or any name passed to
+            :func:`register_backend`.
         **kwargs: Forwarded to the backend constructor.
             TensorBoard: log_dir (str), flush_secs (int), ...
             W&B: project (str), run_name (str), entity (str), config (dict), ...
