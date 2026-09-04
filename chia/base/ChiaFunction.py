@@ -690,7 +690,16 @@ def get(
     # can't match any overload when we forward it — suppress here.
     raw = ray.get(ref, timeout=timeout, _use_object_store=_use_object_store)  # type: ignore[call-overload]
     profiler = get_profiler()
-    value = profiler.on_remote_complete(raw)
+    # A batched get resolves to a *list* of _ProfiledResult, which
+    # on_remote_complete() does not look inside — unwrap (and register) each
+    # element so get([...]) honours its Sequence[ObjectRef[R]] -> List[R] overload.
+    # `list` alone is the right test despite the wider Sequence annotation:
+    # ray.get() rejects any other sequence ("'object_refs' must either be an
+    # ObjectRef or a list of ObjectRef"), so nothing else reaches this point.
+    if isinstance(ref, list):
+        value = [profiler.on_remote_complete(r) for r in raw]
+    else:
+        value = profiler.on_remote_complete(raw)
     if callback is not None:
         return callback(value)
     return value
