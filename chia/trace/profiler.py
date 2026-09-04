@@ -442,7 +442,25 @@ class ChiaProfiler:
             event["display_name"] = display_name
         if extra:
             event["extra"] = extra
+            self._maybe_record_aet(extra)
         self._write(event)
+
+    @staticmethod
+    def _maybe_record_aet(extra: dict) -> None:
+        """Forward an LLM call's usage metadata to the aet sink.
+
+        This is the single choke point where every backend's finalized
+        ``_last_metadata`` (surfaced via ``add_info``) flows through, so it is a
+        natural place to bridge chia telemetry into aet. The sink itself is
+        opt-in (``CHIA_AET_SINK=1``) and a no-op when aet is not installed, so
+        this call is cheap and side-effect-free by default.
+        """
+        try:
+            from chia.trace.aet_sink import record_run_usage
+
+            record_run_usage(extra, model=str(extra.get("model", "") or ""))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Local call hooks
@@ -510,6 +528,7 @@ class ChiaProfiler:
         }
         if extra:
             event["extra"] = extra
+            self._maybe_record_aet(extra)
         self._write(event)
         self._register_result(result, info.call_id)
 
