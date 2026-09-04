@@ -1,0 +1,93 @@
+# Offline test matrix across interpreters and dependency-constraint sets.
+#
+# Why this exists: chia pins ray, mcp and pydantic exactly, which forces both downstream
+# consumers into a second virtualenv (see docs/development/dependency_pins.rst). Those
+# pins cannot credibly be relaxed on the strength of one contributor's environment —
+# "it works on my machine with 3.12" is exactly the claim a matrix replaces.
+#
+# It runs the OFFLINE tiers only. The live tiers need a cluster, cloud credentials and
+# real providers; gating a pin decision on them would mean never deciding.
+name: python-matrix
+
+on:
+  pull_request:
+    paths:
+      - "chia/**"
+      - "pyproject.toml"
+      - ".github/workflows/chia-python-matrix.yml"
+  workflow_dispatch:
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    strategy:
+      # Report every cell. A partial matrix is the thing this is meant to replace, so a
+      # single failing cell must not hide the others' results.
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        constraints: [pinned, relaxed]
+        exclude:
+          # The declared floor is >=3.10, but a relaxed resolve on 3.10 pulls whatever
+          # ray publishes for it, which is a different question from "do the relaxed
+          # constraints work". Keep 3.10 on the pins it ships with.
+          - python-version: "3.10"
+            constraints: relaxed
+
+    name: py${{ matrix.python-version }} / ${{ matrix.constraints }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install (pinned)
+        if: matrix.constraints == 'pinned'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Install (relaxed)
+        if: matrix.constraints == 'relaxed'
+        # Overriding after the pinned install rather than editing pyproject.toml, so this
+        # workflow measures the relaxation without asserting it — the pins in the repo
+        # stay whatever they are until a maintainer changes them.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install --upgrade "ray[default]>=2.54,<3" "pydantic>=2.9"
+
+      - name: Record the resolved environment
+        # Printed for every cell, because the matrix's value is knowing WHICH versions
+        # passed, not merely that something did.
+        run: |
+          python - <<'PY'
+          import sys
+          print("python  ", sys.version.split()[0])
+          for name in ("ray", "pydantic", "mcp", "fastapi"):
+              try:
+                  mod = __import__(name)
+                  print(f"{name:8}", getattr(mod, "__version__", None)
+                        or getattr(mod, "VERSION", "?"))
+              except Exception as exc:
+                  print(f"{name:8} NOT IMPORTABLE: {exc}")
+          PY
+
+      - name: Offline test tiers
+        # Each suite runs separately so a collection error in one does not mask the
+        # others, and `|| true` is deliberately NOT used — a regression must fail.
+        run: |
+          pytest chia/models/tests -q
+          pytest chia/trace/test -q
+          pytest chia/cluster/test -q -k "not tunnel"
+
+      - name: Base tier (known-failing, reported not gated)
+        # chia/base/test has 8 failures and 1 error on clean main in every environment
+        # tested so far — a missing test fixture and a cache-actor discovery defect, both
+        # unrelated to dependency versions (see docs/development/dependency_pins.rst).
+        # Gating on them would make this matrix permanently red and therefore ignored;
+        # hiding them entirely would lose the signal if a pin change DID affect them.
+        continue-on-error: true
+        run: pytest chia/base/test -q
