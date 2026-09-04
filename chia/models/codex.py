@@ -201,6 +201,8 @@ class CodexQueryResult(QueryResult):
     thread_id: str | None = None
     #: Path to the last attempt's byte-for-byte raw JSONL, for offline replay.
     raw_event_path: str | None = None
+    #: Path to the last attempt's reader-arrival-timestamped JSONL, when enabled.
+    arrival_timestamped_event_path: str | None = None
 
 
 def parse_session_id(stdout: str) -> str | None:
@@ -378,6 +380,7 @@ class CodexLLM(LLMCallBase):
         resume_session: bool = False,
         auto_compact_token_limit: int | None = 200_000,
         raw_event_dir: str | None = None,
+        capture_arrival_timestamps: bool = False,
         config=UNSET,
     ):
         # codex's bypass also disables the sandbox, so it keeps its own
@@ -404,6 +407,7 @@ class CodexLLM(LLMCallBase):
         self.reasoning_effort = reasoning_effort
         self.auto_compact_token_limit = auto_compact_token_limit
         self.raw_event_dir = raw_event_dir
+        self.capture_arrival_timestamps = capture_arrival_timestamps
         self.logger = logging.getLogger(logging_name)
         self._call_counter = 0
         self._attempt_seq = 0
@@ -631,10 +635,11 @@ class CodexLLM(LLMCallBase):
             self._raw_dir_cache = tempfile.mkdtemp(prefix="codex_events_")
         return self._raw_dir_cache
 
-    def _attempt_paths(self) -> tuple[str, str]:
+    def _attempt_paths(self) -> tuple[str, str, str | None]:
         self._attempt_seq += 1
         base = os.path.join(self._raw_dir(), f"codex_attempt_{self._attempt_seq:04d}")
-        return base + ".events.jsonl", base + ".stderr.log"
+        timestamped = base + ".timestamped.jsonl" if self.capture_arrival_timestamps else None
+        return base + ".events.jsonl", base + ".stderr.log", timestamped
 
     def _canonical_usage(self) -> dict:
         """Cumulative usage across all recorded attempts, in canonical keys.
@@ -668,7 +673,7 @@ class CodexLLM(LLMCallBase):
         assert self._run_result is not None
         fd, output_path = tempfile.mkstemp(suffix=".txt")
         os.close(fd)
-        raw_path, stderr_path = self._attempt_paths()
+        raw_path, stderr_path, timestamped_path = self._attempt_paths()
         index = len(self._run_result.attempts)
         resume_session_id = self._session_id if self._resume_session else None
         cmd = self._build_cmd(
@@ -686,6 +691,7 @@ class CodexLLM(LLMCallBase):
                 timeout=self.timeout_seconds,
                 cwd=self.work_dir or None,
                 env=os.environ.copy(),
+                timestamped_path=timestamped_path,
             )
             parsed = codex_events.parse_events(capture.events)
             parsed.unparsed_lines.extend(capture.unparsed_lines)
@@ -708,6 +714,7 @@ class CodexLLM(LLMCallBase):
                 signal=capture.signal,
                 timeout=capture.timed_out,
                 raw_event_path=raw_path,
+                arrival_timestamped_event_path=timestamped_path,
                 stderr_path=stderr_path,
                 final_output=final_text,
             )
@@ -737,6 +744,7 @@ class CodexLLM(LLMCallBase):
                 run_result=self._run_result,
                 thread_id=self._run_result.thread_id,
                 raw_event_path=raw_path,
+                arrival_timestamped_event_path=timestamped_path,
             )
         finally:
             try:

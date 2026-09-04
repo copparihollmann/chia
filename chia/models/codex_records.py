@@ -101,6 +101,7 @@ class CodexAttempt:
     turns: list[CodexTurnUsage] = field(default_factory=list)
     tools: list[CodexToolCall] = field(default_factory=list)
     raw_event_path: str | None = None
+    arrival_timestamped_event_path: str | None = None
     stderr_path: str | None = None
     final_output: str | None = None
     agent_messages: list[str] = field(default_factory=list)
@@ -125,6 +126,7 @@ class CodexAttempt:
             "turns": [t.as_dict() for t in self.turns],
             "tools": [t.as_dict() for t in self.tools],
             "raw_event_path": self.raw_event_path,
+            "arrival_timestamped_event_path": self.arrival_timestamped_event_path,
             "stderr_path": self.stderr_path,
             "final_output": self.final_output,
             "agent_messages": list(self.agent_messages),
@@ -195,6 +197,7 @@ def attempt_from_parsed(
     timeout: bool = False,
     retry_reason: str | None = None,
     raw_event_path: str | None = None,
+    arrival_timestamped_event_path: str | None = None,
     stderr_path: str | None = None,
     final_output: str | None = None,
     failure_class: str | None = None,
@@ -213,6 +216,7 @@ def attempt_from_parsed(
         turns=list(parsed.turn_usage),
         tools=list(parsed.tool_calls),
         raw_event_path=raw_event_path,
+        arrival_timestamped_event_path=arrival_timestamped_event_path,
         stderr_path=stderr_path,
         final_output=final_output if final_output is not None else parsed.final_text,
         agent_messages=list(parsed.agent_messages),
