@@ -69,8 +69,9 @@ def _fake_stream(monkeypatch, scripts):
     calls: list[dict] = []
 
     def fake(cmd, *, input_text, raw_path, stderr_path, timeout=None,
-             cwd=None, env=None, on_event=None, **_kw):
-        calls.append({"cmd": list(cmd), "input": input_text, "cwd": cwd})
+             cwd=None, env=None, on_event=None, timestamped_path=None, **_kw):
+        calls.append({"cmd": list(cmd), "input": input_text, "cwd": cwd,
+                      "timestamped_path": timestamped_path})
         script = scripts[min(len(calls) - 1, len(scripts) - 1)]
         out_path = cmd[cmd.index("--output-last-message") + 1]
         with open(out_path, "w") as f:
@@ -78,6 +79,11 @@ def _fake_stream(monkeypatch, scripts):
         jsonl = script.get("jsonl", "")
         with open(raw_path, "w") as f:
             f.write(jsonl)
+        if timestamped_path:
+            with open(timestamped_path, "w") as f:
+                for line in jsonl.splitlines():
+                    f.write('{"ts":"2026-01-01T00:00:00+00:00","line":'
+                            + __import__("json").dumps(line) + "}\n")
         events, unparsed = [], []
         for line in jsonl.splitlines():
             ev = parse_line(line)
@@ -274,6 +280,19 @@ def test_prompt_streams_into_typed_run_result(monkeypatch, tmp_path):
     assert llm._last_metadata["cache_read_input_tokens"] == 20
     # Raw JSONL was teed to a durable per-attempt file.
     assert os.path.exists(run.attempts[0].raw_event_path)
+
+
+def test_prompt_optionally_records_arrival_timestamped_events(monkeypatch, tmp_path):
+    _disable_profiler(monkeypatch)
+    calls = _fake_stream(
+        monkeypatch, [{"jsonl": _turn(tid="T-ts", msg="PONG"), "final": "PONG"}])
+    llm = _llm(raw_event_dir=str(tmp_path), capture_arrival_timestamps=True)
+    cli = llm.prompt("say pong", tools=[])
+
+    path = cli.run_result.attempts[0].arrival_timestamped_event_path
+    assert path == cli.arrival_timestamped_event_path
+    assert calls[0]["timestamped_path"] == path
+    assert path is not None and os.path.exists(path)
 
 
 def test_prompt_argv_is_redacted_in_attempt(monkeypatch, tmp_path):
