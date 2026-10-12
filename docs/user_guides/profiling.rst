@@ -122,7 +122,11 @@ session once, and records its model and counters under ``extra.agent_usage``. If
 export succeeds, the default profiler emits separate ``llm_request`` records with child
 ``agent_id`` and ``parent_agent_id``; these records sum to the public result without double
 counting. A missing or unfinished child marks ``subagent_usage_complete=false`` and leaves
-one aggregate request record. OpenCode's session export omits auxiliary requests such as
+one aggregate request record. When the export has message timestamps, each assistant turn
+gets its own timed request record and internal tool spans are emitted without arguments or
+outputs. Model-active time ends at the first tool start when a turn invokes a tool.
+These are CLI message intervals, not provider-reported latency or time to first token.
+OpenCode's session export omits auxiliary requests such as
 automatic title generation, so ``usage_scope=exported_sessions``; use provider-side logs for
 a complete bill comparison.
 

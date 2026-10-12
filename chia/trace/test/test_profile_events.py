@@ -156,6 +156,49 @@ def test_opencode_child_sessions_become_disjoint_per_agent_trace_records(monkeyp
     assert sum(event["output_tokens"] for event in captured) == 6
 
 
+def test_opencode_timed_messages_and_tool_span_keep_request_totals(monkeypatch):
+    captured = []
+
+    class FakeProfiler:
+        enabled = True
+
+        @staticmethod
+        def profile_context():
+            return ProfileContext(call_id="c")
+
+        @staticmethod
+        def log_profile_event(event):
+            captured.append(event)
+
+    monkeypatch.setattr("chia.trace.profiler.get_profiler", lambda: FakeProfiler())
+    llm = _ProfiledFakeLLM(model="fixture/strong", retries=1)
+    llm.begin_retry_ledger()
+    llm.attach_usage(
+        result=QueryResult(result="ok", returncode=0, stderr="", stream_result=""),
+        meta={"input_tokens": 20, "output_tokens": 4,
+              "subagent_usage_complete": True,
+              "agent_usage": [{
+                  "session_id": "root", "model": "fixture/strong",
+                  "input_tokens": 20, "output_tokens": 4,
+                  "num_turns": 2,
+                  "requests": [
+                      {"request_id": "one", "end_ts": 2.0, "duration_s": 1.0,
+                       "input_tokens": 10, "output_tokens": 2},
+                      {"request_id": "two", "end_ts": 4.0, "duration_s": 0.5,
+                       "input_tokens": 10, "output_tokens": 2},
+                  ],
+                  "tools": [{"name": "task", "status": "completed",
+                             "end_ts": 3.0, "duration_s": 1.0}],
+              }]},
+    )
+    requests = [event for event in captured if event["type"] == "llm_request"]
+    tools = [event for event in captured if event["type"] == "tool_activity"]
+    assert [(event["request_id"], event["ts"], event["duration_s"])
+            for event in requests] == [("one", 2.0, 1.0), ("two", 4.0, 0.5)]
+    assert sum(event["input_tokens"] for event in requests) == 20
+    assert len(tools) == 1 and tools[0]["ts"] == 3.0
+
+
 def test_cli_result_folds_all_models_and_cache_classes_without_aet():
     llm = ClaudeCodeLLM(model="sonnet")
     result = {

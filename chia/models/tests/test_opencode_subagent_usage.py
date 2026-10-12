@@ -1,5 +1,7 @@
 """OpenCode child sessions must be counted once or marked incomplete."""
 
+import pytest
+
 from chia.models.opencode import OpenCodeLLM
 
 
@@ -56,3 +58,25 @@ def test_running_child_marks_usage_incomplete_even_when_export_exists(monkeypatc
     )
     assert len(children) == 1
     assert complete is False
+
+
+def test_export_timings_end_model_activity_when_tool_starts():
+    export = {"messages": [{"info": {
+        "role": "assistant", "id": "msg-one",
+        "time": {"created": 1000, "completed": 3000},
+        "tokens": {"input": 10, "output": 2,
+                   "cache": {"read": 7, "write": 3}}, "cost": 0.001,
+    }, "parts": [{"type": "tool", "tool": "task", "state": {
+        "status": "completed", "time": {"start": 2000, "end": 2900},
+    }}]}]}
+    requests, tools = OpenCodeLLM._export_requests_and_tools(export)
+    assert requests == [{
+        "request_id": "msg-one", "start_ts": 1.0, "end_ts": 2.0,
+        "duration_s": 1.0, "input_tokens": 10, "output_tokens": 2,
+        "reasoning_tokens": 0, "cache_read_input_tokens": 7,
+        "cache_creation_input_tokens": 3, "cost_usd": 0.001,
+    }]
+    assert len(tools) == 1
+    assert tools[0]["name"] == "task" and tools[0]["status"] == "completed"
+    assert tools[0]["start_ts"] == 2.0 and tools[0]["end_ts"] == 2.9
+    assert tools[0]["duration_s"] == pytest.approx(0.9)

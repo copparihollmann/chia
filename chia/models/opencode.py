@@ -934,7 +934,8 @@ class OpenCodeLLM(LLMCallBase):
             agent_usage = []
 
             def add_agent(*, session: str, parent: str, agent: str,
-                          model: str, usage: dict) -> None:
+                          model: str, usage: dict, requests: list,
+                          tools: list) -> None:
                 normalized = normalize_usage_keys(usage)
                 counters = {
                     key: normalized.get(key, 0) or 0 for key in (
@@ -945,7 +946,8 @@ class OpenCodeLLM(LLMCallBase):
                 }
                 agent_usage.append({
                     "session_id": session, "parent_session_id": parent,
-                    "agent": agent, "model": model, **counters,
+                    "agent": agent, "model": model, "requests": requests,
+                    "tools": tools, **counters,
                 })
                 if model:
                     per_model = model_usage.setdefault(model, {
@@ -955,9 +957,11 @@ class OpenCodeLLM(LLMCallBase):
                         per_model[key] += value
 
             info = export.get("info") or {}
+            root_requests, root_tools = self._export_requests_and_tools(export)
             add_agent(
                 session=session_id, parent="", agent=str(info.get("agent") or ""),
                 model=self._export_model_id(info), usage=meta,
+                requests=root_requests, tools=root_tools,
             )
             for child in child_usage:
                 add_agent(**child)
@@ -1023,6 +1027,67 @@ class OpenCodeLLM(LLMCallBase):
         name = model.get("id") or model.get("modelID") or ""
         return f"{provider}/{name}" if provider and name else str(name)
 
+    @staticmethod
+    def _export_requests_and_tools(export: dict) -> tuple[list[dict], list[dict]]:
+        """Return privacy-safe assistant counters and internal tool timings.
+
+        OpenCode timestamps are milliseconds since epoch. A tool call can keep
+        its assistant message open while it runs, so the model-active interval
+        ends at the first tool start, when available.
+        """
+        requests, tools = [], []
+        for message in export.get("messages") or []:
+            if not isinstance(message, dict):
+                continue
+            info = message.get("info") or {}
+            if not isinstance(info, dict) or info.get("role") != "assistant":
+                continue
+            parts = message.get("parts") or []
+            tool_starts = []
+            for part in parts:
+                if not isinstance(part, dict) or part.get("type") != "tool":
+                    continue
+                state = part.get("state") or {}
+                time_info = (state.get("time") or {}) if isinstance(state, dict) else {}
+                try:
+                    start = float(time_info.get("start")) / 1000
+                    end = float(time_info.get("end")) / 1000
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                if end < start:
+                    continue
+                tool_starts.append(start)
+                tools.append({"name": str(part.get("tool") or "unknown"),
+                              "status": str(state.get("status") or "unknown"),
+                              "start_ts": start, "end_ts": end,
+                              "duration_s": end - start})
+            times = info.get("time") or {}
+            tokens = info.get("tokens") or {}
+            if not isinstance(tokens, dict):
+                continue
+            cache = tokens.get("cache") or {}
+            if not isinstance(cache, dict):
+                cache = {}
+            try:
+                start = float(times.get("created")) / 1000
+                completed = float(times.get("completed")) / 1000
+            except (TypeError, ValueError, AttributeError):
+                continue
+            end = min([completed, *[t for t in tool_starts if t >= start]])
+            if end < start:
+                continue
+            requests.append({
+                "request_id": str(info.get("id") or ""),
+                "start_ts": start, "end_ts": end, "duration_s": end - start,
+                "input_tokens": tokens.get("input", 0) or 0,
+                "output_tokens": tokens.get("output", 0) or 0,
+                "reasoning_tokens": tokens.get("reasoning", 0) or 0,
+                "cache_read_input_tokens": cache.get("read", 0) or 0,
+                "cache_creation_input_tokens": cache.get("write", 0) or 0,
+                "cost_usd": info.get("cost", 0) or 0,
+            })
+        return requests, tools
+
     def _collect_subagent_usage(self, export: dict, env: dict, *,
                                 root_session_id: str) -> tuple[list[dict], bool]:
         """Follow task-tool child session IDs and export each one exactly once.
@@ -1070,10 +1135,12 @@ class OpenCodeLLM(LLMCallBase):
                     task_input = state.get("input")
                     task_agent = task_input.get("subagent_type") if isinstance(task_input, dict) else ""
                     child_agent = info.get("agent") or task_agent or ""
+                    requests, tools = self._export_requests_and_tools(child_export)
                     children.append({
                         "session": session_id, "parent": parent_session_id,
                         "agent": str(child_agent), "model": self._export_model_id(info),
                         "usage": normalize_usage_keys(child_meta),
+                        "requests": requests, "tools": tools,
                     })
                     pending.append((session_id, child_export))
         return children, complete

@@ -293,7 +293,7 @@ class LLMCallBase(ABC):
         """Mirror one provider attempt into the privacy-safe profile schema."""
         try:
             from dataclasses import replace
-            from chia.trace.profile_events import llm_request_event
+            from chia.trace.profile_events import llm_request_event, tool_activity_event
             from chia.trace.profiler import get_profiler
 
             profiler = get_profiler()
@@ -323,23 +323,52 @@ class LLMCallBase(ABC):
                             if agent.get("parent_session_id") else context.agent_id
                         ),
                     )
-                    profiler.log_profile_event(llm_request_event(
-                        agent_context, provider=(
-                            "aws" if agent_model.startswith(("amazon-bedrock/", "bedrock/", "aws/")) else
-                            "openai" if agent_model.startswith(("openai/", "azure/")) else
-                            "google" if agent_model.startswith(("google/", "vertex/")) else
-                            "anthropic" if agent_model.startswith("anthropic/") else "unknown"
-                        ), model=agent_model, backend=type(self).__name__,
-                        status=status, attempt=attempt,
-                        input_tokens=agent.get("input_tokens", 0),
-                        output_tokens=agent.get("output_tokens", 0),
-                        cache_read_tokens=agent.get("cache_read_input_tokens", 0),
-                        cache_write_tokens=agent.get("cache_creation_input_tokens", 0),
-                        reasoning_tokens=agent.get("reasoning_tokens", 0),
-                        cost_usd=agent.get("cost_usd"),
-                        cost_source=usage.cost_source,
-                        billing_mode=usage.billing_mode, retry=retry,
-                    ))
+                    provider = (
+                        "aws" if agent_model.startswith(("amazon-bedrock/", "bedrock/", "aws/")) else
+                        "openai" if agent_model.startswith(("openai/", "azure/")) else
+                        "google" if agent_model.startswith(("google/", "vertex/")) else
+                        "anthropic" if agent_model.startswith("anthropic/") else "unknown"
+                    )
+                    requests = agent.get("requests")
+                    token_keys = (
+                        "input_tokens", "output_tokens", "reasoning_tokens",
+                        "cache_read_input_tokens", "cache_creation_input_tokens",
+                    )
+                    timed = (isinstance(requests, list) and requests
+                             and len(requests) == agent.get("num_turns")
+                             and all(isinstance(item, dict) and item.get("end_ts")
+                                     and item.get("duration_s") is not None for item in requests)
+                             and all(sum(item.get(key, 0) or 0 for item in requests)
+                                     == (agent.get(key, 0) or 0) for key in token_keys))
+                    for request in requests if timed else [agent]:
+                        event = llm_request_event(
+                            agent_context, provider=provider, model=agent_model,
+                            backend=type(self).__name__, status=status,
+                            request_id=request.get("request_id", ""), attempt=attempt,
+                            duration_s=request.get("duration_s") if timed else None,
+                            input_tokens=request.get("input_tokens", 0),
+                            output_tokens=request.get("output_tokens", 0),
+                            cache_read_tokens=request.get("cache_read_input_tokens", 0),
+                            cache_write_tokens=request.get("cache_creation_input_tokens", 0),
+                            reasoning_tokens=request.get("reasoning_tokens", 0),
+                            cost_usd=request.get("cost_usd"),
+                            cost_source=usage.cost_source,
+                            billing_mode=usage.billing_mode, retry=retry,
+                        )
+                        if timed:
+                            event["ts"] = request["end_ts"]
+                        profiler.log_profile_event(event)
+                    if timed:
+                        for tool in agent.get("tools") or []:
+                            if not isinstance(tool, dict) or not tool.get("end_ts"):
+                                continue
+                            event = tool_activity_event(
+                                agent_context, tool_name=str(tool.get("name") or "unknown"),
+                                status=str(tool.get("status") or "unknown"),
+                                duration_s=tool.get("duration_s"),
+                            )
+                            event["ts"] = tool["end_ts"]
+                            profiler.log_profile_event(event)
                 return
             model = usage.model or str(getattr(self, "model", "") or "")
             # An agent harness can make several provider requests in one Chia
