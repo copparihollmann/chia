@@ -62,6 +62,7 @@ CFG = {
 # install on sys.path) — see the matching note in circt_issue_loop.py.
 _CHIA_PKG = FLOW_DIR.parent.parent / "chia"
 _PY_MODULES = [str(FLOW_DIR / "circt_util.py"),
+               str(FLOW_DIR / "agent_factory.py"),
                str(FLOW_DIR / "review_task.py"),
                str(_CHIA_PKG)]
 _RUNTIME_ENV_EXCLUDES = ["**/__pycache__", "**/*.pyc"]

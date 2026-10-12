@@ -58,8 +58,8 @@ def run_issue_remote(issue_md: str, number: int, cfg: dict,
     """
     import ray
     from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-    from chia.models.claude import ClaudeCodeLLM
     from chia.base.tools.BashTool import BashTool
+    from agent_factory import make_agent
 
     import circt_util
     from chia.chipyard.circt import BuildTool, LitTool
@@ -115,12 +115,7 @@ def run_issue_remote(issue_md: str, number: int, cfg: dict,
                 additional_providers=[gemini], config=perms,
             )
         else:
-            llm = ClaudeCodeLLM(
-                model=cfg["model"], system_message=cfg["system_prompt"],
-                timeout_seconds=cfg["timeouts"][phase],
-                extra_cli_args=["--effort", "max"],
-                resume_session=True, projects_cwd=None,
-            )
+            llm = make_agent(cfg, phase)
         cli = get(llm.prompt.options(resources={"llm": 1.0}).chia_remote(llm, prompt, tools))
         transcript = getattr(cli, "session_transcript", None) or b""
         logs[phase] = {

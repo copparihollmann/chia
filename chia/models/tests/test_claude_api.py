@@ -650,6 +650,33 @@ def test_transcript_path_uses_projects_cwd_and_session_id(tmp_path):
     )
 
 
+def test_child_env_strips_every_nested_session_var(monkeypatch):
+    """A claude spawned from inside a Claude Code session must not inherit that session.
+
+    Leaking CLAUDE_CODE_SSE_PORT/ENTRYPOINT makes the child dial the parent's relay instead of
+    starting its own top-level session; CLAUDE_CODE_SESSION_ID collides with --session-id/--resume.
+    """
+    from chia.models.claude import _NESTED_SESSION_ENV_VARS
+
+    for var in _NESTED_SESSION_ENV_VARS:
+        monkeypatch.setenv(var, "inherited-from-parent")
+    monkeypatch.setenv("CHIA_UNRELATED_VAR", "keep-me")
+
+    env = ClaudeCodeLLM(backend="cli")._child_env()
+
+    assert not [v for v in _NESTED_SESSION_ENV_VARS if v in env]
+    assert env["CHIA_UNRELATED_VAR"] == "keep-me"
+
+
+def test_child_env_applies_extra_env(monkeypatch):
+    """extra_env reaches the subprocess — e.g. CLAUDE_CONFIG_DIR to bill a run to one account."""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    llm = ClaudeCodeLLM(backend="cli", extra_env={"CLAUDE_CONFIG_DIR": "/accounts/arm-a"})
+
+    assert llm._child_env()["CLAUDE_CONFIG_DIR"] == "/accounts/arm-a"
+
+
 def test_default_projects_cwd_is_llm_env_dir():
     llm = ClaudeCodeLLM(backend="cli", resume_session=True)
     assert llm._projects_cwd == "/home/ray/.claude/projects/-home-ray-llm-env"
