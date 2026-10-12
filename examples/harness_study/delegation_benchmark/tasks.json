@@ -1,0 +1,37 @@
+[
+  {
+    "id": "claude_usage",
+    "baseline": "07683d98192cc8d52afd83e1e3660a9283898027",
+    "oracle": "test_claude_usage.py",
+    "expected_baseline_failure": "test_delegated_result_accounts_for_both_models_and_cache_classes",
+    "prompt": "Ask the explorer subagent to locate how Claude Code result events become public token usage. Then fix the accounting so a result with a modelUsage split includes every model and every cache class in the public total. Keep the per-model split. Keep all code changes local to this workspace."
+  },
+  {
+    "id": "opencode_children",
+    "baseline": "07683d98192cc8d52afd83e1e3660a9283898027",
+    "oracle": "test_opencode_children.py",
+    "expected_baseline_failure": "_collect_subagent_usage",
+    "prompt": "Ask the explorer subagent to trace how OpenCode task-tool sessions are exported. Then make the public usage include child sessions exactly once, including nested children, and expose an explicit incomplete flag if a child export is missing. Keep all code changes local to this workspace."
+  },
+  {
+    "id": "mixed_model_profile",
+    "baseline": "07683d98192cc8d52afd83e1e3660a9283898027",
+    "oracle": "test_mixed_model_profile.py",
+    "expected_baseline_failure": "('sonnet', 'anthropic')",
+    "prompt": "Ask the explorer subagent to locate the default Chia llm_request profiler event. Then ensure a folded usage total covering more than one model is labeled mixed rather than attributed entirely to the primary model. Preserve its total counters. Keep all code changes local to this workspace."
+  },
+  {
+    "id": "opencode_activity",
+    "baseline": "be31d5c53343eb259e5b38925f980aa183de4daa",
+    "oracle": "test_opencode_activity.py",
+    "expected_baseline_failure": "_export_requests_and_tools",
+    "prompt": "Ask the explorer subagent to inspect OpenCode's exported assistant messages and tool states. Then make the default Chia profile emit timed assistant-turn records and internal tool spans while preserving the per-agent token totals. A model interval should end when its tool starts. Keep all code changes local to this workspace."
+  },
+  {
+    "id": "claude_child_identity",
+    "baseline": "84e53113b11f2b697cbbc72f2e728d185ec7bc7c",
+    "oracle": "test_claude_child_identity.py",
+    "expected_baseline_failure": "_record_child_profiles",
+    "prompt": "Ask the explorer subagent to find stable Claude Code child identifiers in the CLI event stream. Then record privacy-safe child agent_start and agent_end events in Chia's default profiler, linked to the parent call. Do not claim per-child token classes when the CLI only reports them by model. Keep all code changes local to this workspace."
+  }
+]
