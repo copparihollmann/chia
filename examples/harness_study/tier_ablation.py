@@ -17,10 +17,10 @@ Why the question is narrow, and what that costs
     Set ``CLAUDE_CODE_SUBAGENT_MODEL`` and ``ANTHROPIC_SMALL_FAST_MODEL``. **Not measured in
     this study.** The task is a single-turn code question with no tools, so a subagent model
     is never invoked and varying it would be inert by construction. At the time of the study,
-    chia also lacked per-model CLI stream accounting. The later optional
-    ``chia.trace.stream_telemetry`` integration now records per-model totals when AET is
-    installed; a local CLI fixture verifies the strong → weak → strong route. A proper
-    delegation outcome study still needs a task that actually delegates.
+    chia also lacked per-model CLI stream accounting. The later terminal-``modelUsage`` fold
+    now records all models' counters without AET; optional stream telemetry adds activity
+    bands when AET is installed. A local CLI fixture verifies the strong → weak → strong
+    route. A proper delegation outcome study still needs a task that actually delegates.
 
 That is stated up front because the alternative was to run a tier-mix arm anyway, watch it
 come out identical, and report "no detectable effect from the subagent lever". That sentence

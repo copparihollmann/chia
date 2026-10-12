@@ -18,12 +18,13 @@ that model is a harness difference and nothing else. A non-Anthropic model can o
 ``cli_native``'s column as a hole, and the hole is the finding — that column is exactly
 what the proxy fills.
 
-**This plot was allowed to come out against the proxy, and it did.** At equal model
-opencode sends ~14.4k prompt tokens against the CLI's ~23.7k and costs less per task, and
-it reaches every model here through its own ``amazon-bedrock`` provider. So the proxy
-cannot be justified on cost or on reach; what it uniquely gives is the *Claude Code
-harness* — subagents, hooks, skills, session resume — on a non-Anthropic model. See
-``README.md``.
+At equal model, OpenCode's exported sessions contain ~14.4k prompt tokens against
+the CLI's ~23.7k and report less cost per task. A later local CLI fixture showed
+that OpenCode's session export omits its automatic title request, so this plot
+cannot rank full provider bills. OpenCode reaches every model here through its
+``amazon-bedrock`` provider. The proxy's distinct capability is the *Claude Code
+harness* — subagents, hooks, skills, session resume — on a non-Anthropic model.
+See ``README.md``.
 
 The task
 --------

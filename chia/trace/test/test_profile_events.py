@@ -1,4 +1,5 @@
 import json
+from io import StringIO
 
 import pytest
 
@@ -87,6 +88,92 @@ def test_claude_harness_prefers_explicit_non_anthropic_provider(monkeypatch):
         meta={"provider": "openai"}, status="completed", attempt=1, retry=False,
     )
     assert captured[0]["provider"] == "openai"
+
+
+def test_multi_model_cli_totals_are_not_attributed_to_the_primary_model(monkeypatch):
+    captured = []
+
+    class FakeProfiler:
+        enabled = True
+
+        @staticmethod
+        def profile_context():
+            return ProfileContext(call_id="c")
+
+        @staticmethod
+        def log_profile_event(event):
+            captured.append(event)
+
+    monkeypatch.setattr("chia.trace.profiler.get_profiler", lambda: FakeProfiler())
+    llm = ClaudeCodeLLM(model="sonnet", retries=1)
+    llm.begin_retry_ledger()
+    llm.attach_usage(
+        result=QueryResult(result="ok", returncode=0, stderr="", stream_result=""),
+        meta={"input_tokens": 16, "output_tokens": 9,
+              "model_usage": {"sonnet": {"input_tokens": 13},
+                              "fixture/weak": {"input_tokens": 3}}},
+    )
+    assert captured[0]["model"] == "mixed"
+    assert captured[0]["provider"] == "multiple"
+    assert captured[0]["input_tokens"] == 16
+    assert captured[0]["output_tokens"] == 9
+
+
+def test_opencode_child_sessions_become_disjoint_per_agent_trace_records(monkeypatch):
+    captured = []
+
+    class FakeProfiler:
+        enabled = True
+
+        @staticmethod
+        def profile_context():
+            return ProfileContext(call_id="c", agent_id="lead-scope")
+
+        @staticmethod
+        def log_profile_event(event):
+            captured.append(event)
+
+    monkeypatch.setattr("chia.trace.profiler.get_profiler", lambda: FakeProfiler())
+    llm = _ProfiledFakeLLM(model="fixture/strong", retries=1)
+    llm.begin_retry_ledger()
+    llm.attach_usage(
+        result=QueryResult(result="ok", returncode=0, stderr="", stream_result=""),
+        meta={"input_tokens": 30, "output_tokens": 6,
+              "subagent_usage_complete": True,
+              "agent_usage": [
+                  {"session_id": "root", "agent": "lead", "model": "fixture/strong",
+                   "input_tokens": 20, "output_tokens": 4},
+                  {"session_id": "child", "parent_session_id": "root",
+                   "agent": "explorer", "model": "fixture/weak",
+                   "input_tokens": 10, "output_tokens": 2},
+              ]},
+    )
+    assert len(captured) == 2
+    assert [event["agent_id"] for event in captured] == ["opencode:root", "opencode:child"]
+    assert captured[1]["parent_agent_id"] == "opencode:root"
+    assert [event["model"] for event in captured] == ["fixture/strong", "fixture/weak"]
+    assert sum(event["input_tokens"] for event in captured) == 30
+    assert sum(event["output_tokens"] for event in captured) == 6
+
+
+def test_cli_result_folds_all_models_and_cache_classes_without_aet():
+    llm = ClaudeCodeLLM(model="sonnet")
+    result = {
+        "type": "result", "subtype": "success", "total_cost_usd": 0.05,
+        "usage": {"input_tokens": 10, "output_tokens": 2},
+        "modelUsage": {
+            "sonnet": {"inputTokens": 10, "outputTokens": 2,
+                       "cacheReadInputTokens": 70, "cacheCreationInputTokens": 20},
+            "fixture/weak": {"inputTokens": 7, "outputTokens": 3,
+                             "cacheReadInputTokens": 30, "cacheCreationInputTokens": 0},
+        },
+    }
+    llm._process_event_line(json.dumps(result), StringIO(), [])
+    assert llm._last_metadata["input_tokens"] == 17
+    assert llm._last_metadata["output_tokens"] == 5
+    assert llm._last_metadata["cache_read_input_tokens"] == 100
+    assert llm._last_metadata["cache_creation_input_tokens"] == 20
+    assert llm._last_metadata["model_usage"]["fixture/weak"]["input_tokens"] == 7
 
 
 def test_retry_trace_events_sum_to_the_cumulative_result_once(monkeypatch):

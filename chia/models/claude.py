@@ -1397,17 +1397,54 @@ class ClaudeCodeLLM(LLMCallBase):
             cc_tok = usage.get("cache_creation_input_tokens", 0)
             cr_tok = usage.get("cache_read_input_tokens", 0)
             if in_tok:
-                parts.append(f"Input tokens: {in_tok}")
                 meta["input_tokens"] = in_tok
             if cc_tok:
-                parts.append(f"Cache creation: {cc_tok}")
                 meta["cache_creation_input_tokens"] = cc_tok
             if cr_tok:
-                parts.append(f"Cache read: {cr_tok}")
                 meta["cache_read_input_tokens"] = cr_tok
             if out_tok:
-                parts.append(f"Output tokens: {out_tok}")
                 meta["output_tokens"] = out_tok
+            # ``usage`` can omit child-agent requests. Claude Code's terminal
+            # ``modelUsage`` is the complete split across the primary and any
+            # delegated models, and is available even without the optional AET
+            # stream parser. Fold it before attach_usage() publishes counters to
+            # QueryResult and the default Chia profiler.
+            model_usage = event.get("modelUsage")
+            if isinstance(model_usage, dict) and model_usage:
+                buckets = {
+                    "input_tokens": "inputTokens",
+                    "output_tokens": "outputTokens",
+                    "cache_read_input_tokens": "cacheReadInputTokens",
+                    "cache_creation_input_tokens": "cacheCreationInputTokens",
+                }
+                by_model = {}
+                for model_id, values in model_usage.items():
+                    if not isinstance(values, dict) or not any(
+                        source in values for source in buckets.values()
+                    ):
+                        by_model = {}
+                        break
+                    try:
+                        counters = {
+                            name: max(0, int(values.get(source) or 0))
+                            for name, source in buckets.items()
+                        }
+                    except (TypeError, ValueError):
+                        by_model = {}
+                        break
+                    by_model[str(model_id)] = counters
+                if by_model:
+                    meta["model_usage"] = by_model
+                    for name in buckets:
+                        meta[name] = sum(values[name] for values in by_model.values())
+            for name, label in (
+                ("input_tokens", "Input tokens"),
+                ("cache_creation_input_tokens", "Cache creation"),
+                ("cache_read_input_tokens", "Cache read"),
+                ("output_tokens", "Output tokens"),
+            ):
+                if meta.get(name):
+                    parts.append(f"{label}: {meta[name]}")
             if parts:
                 f.write(f"[Metadata]\n{' | '.join(parts)}\n")
                 f.flush()

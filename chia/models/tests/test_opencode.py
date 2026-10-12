@@ -190,7 +190,8 @@ def test_run_result_carries_usage_and_session_id(monkeypatch):
     )
     cli = llm.prompt("hi", tools=[])
     assert isinstance(cli, OpenCodeQueryResult) and cli.success
-    assert cli.provider_usage == {"input_tokens": 10, "output_tokens": 4, "cost_usd": 0.01, "num_turns": 1}
+    assert cli.provider_usage == {"input_tokens": 10, "output_tokens": 4, "cost_usd": 0.01,
+                                  "num_turns": 1, "usage_scope": "exported_sessions"}
     # The same numbers the profiler sees (plus model/tools) live in _last_metadata.
     assert all(llm._last_metadata[k] == v for k, v in cli.provider_usage.items())
     assert cli.usage.input_tokens == 10 and cli.usage.output_tokens == 4

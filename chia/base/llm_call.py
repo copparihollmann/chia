@@ -304,11 +304,55 @@ class LLMCallBase(ABC):
             session_id = str(raw.get("session_id", "") or getattr(self, "_session_id", "") or "")
             if session_id:
                 context = replace(context, session_id=session_id)
+            # OpenCode exports one session per delegated agent. When all child
+            # exports succeeded, emit those disjoint counters as separate calls
+            # so an external profiler can group by agent without counting the
+            # folded public total again. Incomplete exports keep one aggregate.
+            agent_usage = raw.get("agent_usage")
+            if (raw.get("subagent_usage_complete") is True
+                    and isinstance(agent_usage, list) and agent_usage
+                    and all(isinstance(agent, dict) and agent.get("session_id") for agent in agent_usage)):
+                for agent in agent_usage:
+                    agent_session = str(agent.get("session_id") or "")
+                    agent_model = str(agent.get("model") or "unknown")
+                    agent_context = replace(
+                        context, session_id=agent_session,
+                        agent_id=f"opencode:{agent_session}",
+                        parent_agent_id=(
+                            f"opencode:{agent['parent_session_id']}"
+                            if agent.get("parent_session_id") else context.agent_id
+                        ),
+                    )
+                    profiler.log_profile_event(llm_request_event(
+                        agent_context, provider=(
+                            "aws" if agent_model.startswith(("amazon-bedrock/", "bedrock/", "aws/")) else
+                            "openai" if agent_model.startswith(("openai/", "azure/")) else
+                            "google" if agent_model.startswith(("google/", "vertex/")) else
+                            "anthropic" if agent_model.startswith("anthropic/") else "unknown"
+                        ), model=agent_model, backend=type(self).__name__,
+                        status=status, attempt=attempt,
+                        input_tokens=agent.get("input_tokens", 0),
+                        output_tokens=agent.get("output_tokens", 0),
+                        cache_read_tokens=agent.get("cache_read_input_tokens", 0),
+                        cache_write_tokens=agent.get("cache_creation_input_tokens", 0),
+                        reasoning_tokens=agent.get("reasoning_tokens", 0),
+                        cost_usd=agent.get("cost_usd"),
+                        cost_source=usage.cost_source,
+                        billing_mode=usage.billing_mode, retry=retry,
+                    ))
+                return
             model = usage.model or str(getattr(self, "model", "") or "")
+            # An agent harness can make several provider requests in one Chia
+            # call. Its folded usage must not be attributed to the primary model
+            # when the terminal CLI result reports a multi-model split.
+            if isinstance(raw.get("model_usage"), dict) and len(raw["model_usage"]) > 1:
+                model = "mixed"
             backend = type(self).__name__
             explicit_provider = str(raw.get("provider", "") or "").lower()
             qualified_model = model.lower()
-            if explicit_provider:
+            if model == "mixed":
+                provider = "multiple"
+            elif explicit_provider:
                 provider = explicit_provider
             elif (qualified_model.startswith(("bedrock/", "aws/", "arn:aws:"))
                   or ".anthropic." in qualified_model):

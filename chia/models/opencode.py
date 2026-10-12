@@ -5,8 +5,8 @@ backend, opencode is provider-agnostic: the model is given as ``provider/model``
 ``anthropic/claude-sonnet-4-6``) and opencode runs its own server-side agentic
 tool loop, so there is no client-side MCP loop here.
 
-WARNING: experimental. Only exercised by the tests in
-chia/models/tests/test_opencode.py (mocked unit tests, plus opt-in live tests).
+WARNING: experimental. Exercised by mocked unit tests and an opt-in local
+CLI delegation fixture, plus opt-in live tests.
 Not validated in production. Auth is environment-driven: opencode uses its own
 stored credentials (``opencode auth login``) or provider env vars.
 """
@@ -437,7 +437,9 @@ class OpenCodeQueryResult(QueryResult):
     """:class:`QueryResult` specialised for the opencode CLI.
 
     ``provider_usage`` holds the run's summed metrics from ``opencode export``
-    (the same dict pushed to the profiler as ``_last_metadata``): ``input_tokens``,
+    across the primary and exported child sessions (the same dict pushed to the
+    profiler as ``_last_metadata``). Auxiliary CLI requests such as automatic
+    session titling are absent from that export. Its fields include ``input_tokens``,
     ``output_tokens``, ``reasoning_tokens``, ``cache_read``, ``cache_write``,
     ``cost_usd`` (from opencode's model price table) and ``num_turns``.
     Inherited ``usage`` is Chia's normalized :class:`TokenUsage`.
@@ -533,7 +535,7 @@ class OpenCodeLLM(LLMCallBase):
         self._last_export_error: Optional[dict] = None
 
         self.logger.warning(
-            "OpenCodeLLM is experimental: only exercised by unit tests so far, "
+            "OpenCodeLLM is experimental: exercised by tests and a local CLI fixture, "
             "not validated in production."
         )
 
@@ -923,6 +925,56 @@ class OpenCodeLLM(LLMCallBase):
 
         export = self._run_export(session_id, env)
         final_text, meta, stream, export_error = self._extract_from_export(export)
+        child_usage, child_complete = self._collect_subagent_usage(
+            export, env, root_session_id=session_id,
+        )
+        if child_usage:
+            totals = normalize_usage_keys(meta)
+            model_usage: dict = {}
+            agent_usage = []
+
+            def add_agent(*, session: str, parent: str, agent: str,
+                          model: str, usage: dict) -> None:
+                normalized = normalize_usage_keys(usage)
+                counters = {
+                    key: normalized.get(key, 0) or 0 for key in (
+                        "input_tokens", "output_tokens", "reasoning_tokens",
+                        "cache_read_input_tokens", "cache_creation_input_tokens",
+                        "cost_usd", "num_turns",
+                    )
+                }
+                agent_usage.append({
+                    "session_id": session, "parent_session_id": parent,
+                    "agent": agent, "model": model, **counters,
+                })
+                if model:
+                    per_model = model_usage.setdefault(model, {
+                        key: 0 for key in counters
+                    })
+                    for key, value in counters.items():
+                        per_model[key] += value
+
+            info = export.get("info") or {}
+            add_agent(
+                session=session_id, parent="", agent=str(info.get("agent") or ""),
+                model=self._export_model_id(info), usage=meta,
+            )
+            for child in child_usage:
+                add_agent(**child)
+                for key in ("input_tokens", "output_tokens", "reasoning_tokens",
+                            "cache_read_input_tokens", "cache_creation_input_tokens",
+                            "cost_usd", "num_turns"):
+                    totals[key] = (totals.get(key, 0) or 0) + (child["usage"].get(key, 0) or 0)
+            totals["agent_usage"] = agent_usage
+            totals["model_usage"] = model_usage
+            totals["subagent_usage_complete"] = child_complete
+            meta = totals
+        elif not child_complete:
+            meta["subagent_usage_complete"] = False
+        # A new OpenCode session may make a title request that is not represented
+        # in any session export. Keep the public number's scope explicit; a
+        # provider-side request log is needed for a complete bill comparison.
+        meta["usage_scope"] = "exported_sessions"
         # opencode spells the cache counters `cache.read` / `cache.write`; rename
         # them to the canonical vocabulary so the profiler log and the aet sink see
         # the same key names here as from every other backend.
@@ -961,6 +1013,70 @@ class OpenCodeLLM(LLMCallBase):
             provider_usage=dict(meta) if meta else None,
             session_id=session_id,
         )
+
+    @staticmethod
+    def _export_model_id(info: dict) -> str:
+        model = info.get("model") or {}
+        if not isinstance(model, dict):
+            return ""
+        provider = model.get("providerID") or ""
+        name = model.get("id") or model.get("modelID") or ""
+        return f"{provider}/{name}" if provider and name else str(name)
+
+    def _collect_subagent_usage(self, export: dict, env: dict, *,
+                                root_session_id: str) -> tuple[list[dict], bool]:
+        """Follow task-tool child session IDs and export each one exactly once.
+
+        The parent session export does not include child turns. A missing child
+        export leaves the partial total visible but marks it incomplete.
+        """
+        seen = {root_session_id}
+        pending = [(root_session_id, export)]
+        children = []
+        complete = True
+        while pending:
+            parent_session_id, parent_export = pending.pop()
+            for message in parent_export.get("messages") or []:
+                if not isinstance(message, dict):
+                    continue
+                for part in message.get("parts") or []:
+                    if not isinstance(part, dict) or part.get("type") != "tool" or part.get("tool") != "task":
+                        continue
+                    state = part.get("state") or {}
+                    if not isinstance(state, dict):
+                        complete = False
+                        continue
+                    if state.get("status") != "completed":
+                        complete = False
+                    metadata = state.get("metadata") or {}
+                    if not isinstance(metadata, dict):
+                        complete = False
+                        continue
+                    session_id = metadata.get("sessionId")
+                    if not isinstance(session_id, str) or not session_id:
+                        complete = False
+                        continue
+                    if session_id in seen:
+                        continue
+                    seen.add(session_id)
+                    child_export = self._run_export(session_id, env)
+                    if not child_export:
+                        complete = False
+                        continue
+                    _, child_meta, _, child_error = self._extract_from_export(child_export)
+                    if child_error or not child_meta:
+                        complete = False
+                    info = child_export.get("info") or {}
+                    task_input = state.get("input")
+                    task_agent = task_input.get("subagent_type") if isinstance(task_input, dict) else ""
+                    child_agent = info.get("agent") or task_agent or ""
+                    children.append({
+                        "session": session_id, "parent": parent_session_id,
+                        "agent": str(child_agent), "model": self._export_model_id(info),
+                        "usage": normalize_usage_keys(child_meta),
+                    })
+                    pending.append((session_id, child_export))
+        return children, complete
 
     def _capture(self, cmd: list, env: dict) -> SimpleNamespace:
         """Run *cmd* capturing stdout to a temp FILE and return it.

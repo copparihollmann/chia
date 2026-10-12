@@ -96,23 +96,30 @@ It is a count of tokens, the same count every run, so it needs no statistics to 
 
 ![harness cost](figures/harness_cost.png)
 
-Cost per task, priced from the provider's own token counts, median of 5 runs per cell
+Cost per task from the harness-recorded requests, median of 5 runs per cell
 (the mean would report the cache lifecycle of figure 3 rather than the harness). Cost
 only: the task was solved in **48 of 50** live cells, which is far too few trials to rank
 the harnesses on quality, and drawing 5-trial success rates as bars would invite exactly
 that reading.
 
-## 5. opencode is cheaper than Claude Code at the same model
+**Accounting limit discovered in a later local OpenCode CLI fixture:** its session export
+omits the automatic title request. The figure's OpenCode values therefore cover exported
+session messages, not every provider request made by the CLI. They are lower bounds on
+full provider-side usage and spend. A matched cost ranking requires provider request logs
+for both harnesses.
+
+## 5. OpenCode reports less session cost at the same model
 
 This is the question a reviewer actually asks — *why not just use opencode?* — and the
 answer is not the one the proxy would prefer.
 
-At sonnet, opencode sends 14,440 billed input tokens per task against Claude Code's
-23,726, and costs **$0.0066 against $0.0097** per task. It also reaches every model here
-through its `amazon-bedrock` provider. **On cost and on reach, opencode wins.**
+At sonnet, OpenCode's exported sessions contain 14,440 billed input tokens per task
+against Claude Code's 23,726, and report **$0.0066 against $0.0097** per task.
+OpenCode also reaches every model here through its `amazon-bedrock` provider. Because
+its title request is missing from the export, these numbers cannot establish which
+harness has the lower total provider bill.
 
-So the proxy cannot be justified on cost, and this figure is why. What it uniquely provides
-is narrower and worth stating precisely: it is the only way to drive a non-Anthropic model
+The proxy's distinct capability is narrower and worth stating precisely: it drives a non-Anthropic model
 with **the Claude Code harness** — its subagents, hooks, skills, and
 `--session-id`/`--resume`, which is the machinery chia's `ClaudeCodeLLM` already builds on.
 That is a capability argument, not a cost one.
@@ -243,10 +250,11 @@ would have needed two conditions it did not meet:
   null result would measure the task rather than the feature.
 - **The original study lacked per-model usage.** At the time, `ClaudeCodeLLM._last_metadata`
   carried one folded `model` field, although the CLI could call several models. The later
-  optional `chia.trace.stream_telemetry` integration now records per-model totals from the
-  Claude stream when AET is installed. A local CLI fixture verified strong → weak → strong
-  routing and recorded both models. This does not turn the original single-turn task into a
-  delegation study, or automatically map every internal CLI child to a Chia agent ID.
+  terminal-`modelUsage` fold now records all models' counters without AET; the optional
+  `chia.trace.stream_telemetry` integration adds activity bands when AET is installed. A local
+  CLI fixture verified strong → weak → strong routing and recorded both models. This does not
+  turn the original single-turn task into a delegation study, or automatically map every
+  internal CLI child to a Chia agent ID.
 
 Running a tier-mix arm anyway and reporting "no detectable effect" would have been true and
 worthless. Script: [`tier_ablation.py`](tier_ablation.py). Source: `data/tier_ablation.csv`.
@@ -305,14 +313,14 @@ do I run GLM" is the question the proxy exists to answer.
 
 | route | what runs | mean $/call | input tok | provider calls | cost source |
 |-------|-----------|------------:|----------:|---------------:|-------------|
-| **opencode** | `OpenCodeLLM(model="amazon-bedrock/zai.glm-5")` | **$0.01304** | 12,588 | 1.0 | billed |
+| **opencode** | `OpenCodeLLM(model="amazon-bedrock/zai.glm-5")` | **$0.01304** | 12,588 | 1.0 exported | billed, exported sessions only |
 | **Claude Code + proxy** | CLI via `chia.models.proxy` | $0.03423 | 55,495 | 3.6 | estimated |
 | Claude Code, native | — | **impossible** | — | — | the CLI's Bedrock transport cannot speak Converse |
 | `BedrockLLM` direct | Converse API, no agent loop | $0.00048 | 137 | 1.0 | estimated |
 
 n=5 each, all 5/5 passed.
 
-**With opencode** — the cheaper agent harness, and the simpler one. Nothing to start, no
+**With opencode** — the simpler agent harness. Nothing to start, no
 sidecar:
 
 ```python
@@ -321,9 +329,11 @@ llm = OpenCodeLLM(model="amazon-bedrock/zai.glm-5")     # provider/model, via op
 result = llm.prompt("...", tools=[])                     # amazon-bedrock provider
 ```
 
-At equal model it is **2.62x cheaper than the proxied CLI** and sends a quarter of the prompt
-tokens, because opencode's own loop is leaner than Claude Code's. Its cost is `billed` — the
-figure opencode reports is the figure. Implementation: [`chia/models/opencode.py`](../../chia/models/opencode.py).
+At equal model its *exported-session* cost is 2.62x lower than the proxied CLI figure,
+and its exported session contains about a quarter of the prompt tokens. Its full provider
+bill is not established because the export omits the automatic title request. The `billed`
+cost source identifies how OpenCode prices exported messages; it does not certify full
+request coverage. Implementation: [`chia/models/opencode.py`](../../chia/models/opencode.py).
 Note opencode's catalogue carries no cross-region prefix for some ids where Bedrock does;
 copying a Bedrock id across verbatim is what produced a false "no route to this model" skip in
 an earlier run of this grid. `available_models()` and `diagnose_model()` exist for that.
@@ -346,8 +356,7 @@ env = bedrock_model_env(primary="glm5", subagent="nova-pro",
 The registry entry is `chia/models/bedrock_config.py:121` (`"glm5" → zai.glm-5`), and
 `NON_ANTHROPIC_TIER` there is a worked GLM-5 tier mix.
 
-**So why use the proxy at all, when opencode is cheaper?** Not for cost or for reach —
-opencode wins on both, and this study says so in figure 5. The proxy buys exactly one thing:
+**Why use the proxy?** OpenCode's model reach is already demonstrated. The proxy adds
 the *Claude Code harness* — subagents, hooks, skills, session resume — on a model Claude Code
 cannot otherwise reach. If you do not need those, use opencode.
 
@@ -401,8 +410,8 @@ number, not on lines saved. Source: `data/deletion_ratio.csv`.
   cells passed; the 2 failures were on the two non-Anthropic models.
 - **The tier-mix ablation's other two levers.** Figure 9 measures `ModelTier(primary=...)`.
   Whether delegating *subagent* turns to a cheap model degrades the outcome is still not
-  measured, and cannot be until chia records per-model usage from the CLI stream — see
-  figure 9 for why that is the blocking gap rather than a scope choice.
+  measured. Chia now records Claude CLI per-model totals, and OpenCode child-session
+  totals, but a matched outcome study still needs delegating tasks and provider-side logs.
 - **Leakage.** Whether a sandbox changes an experiment's score, and how often an agent
   reaches a denied path, is the validity claim behind the per-call sandbox. The mechanism
   is covered by tests that run real `bwrap`; the *rate* is not measured.

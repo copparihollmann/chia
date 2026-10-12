@@ -110,6 +110,22 @@ identity, timing, fresh/cache-read/cache-write/output/reasoning token buckets, a
 provenance. Prompts, tool arguments/results, file contents, environment values, and credentials are
 never included.
 
+For a Claude Code CLI call that delegates to several models, the terminal ``modelUsage`` split is
+folded into the public ``QueryResult.usage`` and the default profiler's token totals, even when
+AET is not installed. The per-model counters also appear under ``extra.model_usage``. The one
+``llm_request`` record for the CLI invocation uses ``model="mixed"`` when multiple models were
+used, so the aggregate is not falsely attributed to its primary model. This does not identify
+individual internal Claude Code subagents; ``agent_scope`` covers agents orchestrated by Chia.
+
+For OpenCode, Chia follows the ``task`` tool's child session IDs, exports each delegated
+session once, and records its model and counters under ``extra.agent_usage``. If every child
+export succeeds, the default profiler emits separate ``llm_request`` records with child
+``agent_id`` and ``parent_agent_id``; these records sum to the public result without double
+counting. A missing or unfinished child marks ``subagent_usage_complete=false`` and leaves
+one aggregate request record. OpenCode's session export omits auxiliary requests such as
+automatic title generation, so ``usage_scope=exported_sessions``; use provider-side logs for
+a complete bill comparison.
+
 External profilers can consume the collector JSONL directly. AET understands it as a native import:
 
 .. code-block:: console

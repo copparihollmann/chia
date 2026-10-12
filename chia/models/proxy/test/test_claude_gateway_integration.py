@@ -148,6 +148,9 @@ def test_real_cli_delegates_to_the_configured_weaker_model(tmp_path, mode):
     assert "weak" in models
     assert "sonnet" in models[-1]
     if mode != "plain":
+        assert llm._last_metadata["input_tokens"] == 16
+        assert llm._last_metadata["output_tokens"] == 9
+        assert llm._last_metadata["model_usage"]["fixture/weak"]["input_tokens"] == 3
         try:
             import aet.tracking.claude_stream  # noqa: F401
         except ImportError:
