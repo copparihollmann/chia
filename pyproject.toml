@@ -45,6 +45,13 @@ Issues = "https://github.com/ucb-bar/chia/issues"
 
 [project.optional-dependencies]
 test = ["pytest==9.0.3"]
+# chia.trace.aet_sink bridges a run's telemetry into the aet eval harness. aet is
+# imported lazily and the sink is a no-op without it, so this stays optional — but
+# it has to be *declarable*, otherwise the sink's tests can only ever importorskip
+# and CI never runs them. A direct reference rather than a bare name because aet is
+# not published to an index. Note aet requires Python >= 3.11, one minor above
+# chia's own floor, so this extra is not installable on a 3.10 interpreter.
+aet = ["aet @ git+https://github.com/ucb-bar/agentic-eval-tool.git"]
 tensorboard = ["tensorboardX>=2.6", "tensorboard>=2.14"]
 wandb = ["wandb>=0.15"]
 metrics = ["tensorboardX>=2.6", "wandb>=0.15"]

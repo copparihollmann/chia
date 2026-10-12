@@ -28,6 +28,7 @@ import ray
 
 from chia.base.ChiaFunction import ChiaFunction
 from chia.base.llm_call import QueryResult, LLMCallBase
+from chia.base.usage import normalize_usage_keys
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
@@ -412,6 +413,10 @@ class OpenCodeLLM(LLMCallBase):
 
         profiler = get_profiler()
 
+        # Per-attempt metadata is cleared at the top of each attempt below, so the
+        # tokens a failed attempt burned have to be banked before that happens.
+        self.begin_retry_ledger()
+
         for attempt in range(self.retries):
             try:
                 self._last_metadata = {}
@@ -424,6 +429,9 @@ class OpenCodeLLM(LLMCallBase):
                      "node_id": getattr(t, "node_id", None)}
                     for t in tools
                 ]
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled and self._last_metadata:
                     profiler.add_info(self._last_metadata)
 
@@ -439,8 +447,9 @@ class OpenCodeLLM(LLMCallBase):
                 raise
 
             # -- Retry once: stochastic generation may produce shorter output --
-            except MaxOutputTokensError:
+            except MaxOutputTokensError as exc:
                 if attempt == 0:
+                    self.note_retry(attempt, exc)
                     self.logger.warning(
                         "Max output tokens on attempt %d/%d, retrying once",
                         attempt + 1, self.retries,
@@ -449,8 +458,9 @@ class OpenCodeLLM(LLMCallBase):
                 raise
 
             # -- Retry with exponential backoff: transient service issue --
-            except ServerError:
+            except ServerError as exc:
                 backoff = min(5 * 2 ** attempt, 60)
+                self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning(
                     "Server error on attempt %d/%d, backing off %ds",
                     attempt + 1, self.retries, backoff,
@@ -458,22 +468,30 @@ class OpenCodeLLM(LLMCallBase):
                 _time.sleep(backoff)
 
             except UnknownOpenCodeError as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unknown error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
 
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Timeout on attempt %d/%d", attempt + 1, self.retries,
                 )
 
             except Exception as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unexpected error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
-        return OpenCodeQueryResult(result="", returncode=-1, stderr="", stream_result="", success=False)
+        # Carry failed-attempt usage while keeping the backend-specific result.
+        return self.attach_usage(
+            OpenCodeQueryResult(result="", returncode=-1, stderr="",
+                                stream_result="", success=False),
+            meta={},
+        )
 
     def _get_node_id(self) -> str:
         try:
@@ -700,7 +718,10 @@ class OpenCodeLLM(LLMCallBase):
 
         export = self._run_export(session_id, env)
         final_text, meta, stream, export_error = self._extract_from_export(export)
-        self._last_metadata = meta
+        # opencode spells the cache counters `cache.read` / `cache.write`; rename
+        # them to the canonical vocabulary so the profiler log and the aet sink see
+        # the same key names here as from every other backend.
+        self._last_metadata = normalize_usage_keys(meta)
         # Prefer the export's error (richer — full responseHeaders); fall back to
         # the run-stream error for pre-request failures the export never records.
         self._last_export_error = export_error or run_error

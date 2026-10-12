@@ -310,6 +310,10 @@ class AntigravityLLM(LLMCallBase):
         from chia.trace.profiler import get_profiler
 
         profiler = get_profiler()
+        # Per-attempt metadata is cleared at the top of each attempt below, so the
+        # tokens a failed attempt burned have to be banked before that happens.
+        self.begin_retry_ledger()
+
         for attempt in range(self.retries):
             try:
                 tool_list = tools or []
@@ -329,6 +333,9 @@ class AntigravityLLM(LLMCallBase):
                         for t in tool_list
                     ],
                 })
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled:
                     profiler.add_info(self._last_metadata)
                 self._classify_error(cli)
@@ -337,25 +344,34 @@ class AntigravityLLM(LLMCallBase):
                 return cli
             except (RateLimitError, AuthenticationError, BillingError, InvalidRequestError):
                 raise
-            except MaxOutputTokensError:
+            except MaxOutputTokensError as exc:
                 if attempt == 0:
+                    self.note_retry(attempt, exc)
                     self.logger.warning("Max output tokens on attempt %d/%d, retrying once",
                                         attempt + 1, self.retries)
                     continue
                 raise
-            except ServerError:
+            except ServerError as exc:
                 backoff = min(5 * 2 ** attempt, 60)
+                self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning("Server error on attempt %d/%d, backing off %ds",
                                     attempt + 1, self.retries, backoff)
                 _time.sleep(backoff)
             except (UnknownAntigravityError, subprocess.TimeoutExpired) as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning("Antigravity attempt %d/%d failed: %s",
                                     attempt + 1, self.retries, exc)
             except Exception as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning("Unexpected Antigravity error on attempt %d/%d: %s",
                                     attempt + 1, self.retries, exc)
-        return AntigravityQueryResult(result="", returncode=-1, stderr="", stream_result="",
-                                      success=False)
+        # Keep the backend-specific result so session tracking can inspect it,
+        # while carrying usage from every failed attempt to the caller.
+        return self.attach_usage(
+            AntigravityQueryResult(result="", returncode=-1, stderr="",
+                                   stream_result="", success=False),
+            meta={},
+        )
 
     def _sync_transcript(self, cli: AntigravityQueryResult) -> AntigravityQueryResult:
         """Copy a worker-captured conversation off *cli* onto this instance.
@@ -446,7 +462,6 @@ class AntigravityLLM(LLMCallBase):
         self._session_transcript_path = path
         cli.session_transcript = data
         cli.session_transcript_path = path
-
     def _get_node_id(self) -> str:
         try:
             return ray.get_runtime_context().get_node_id()

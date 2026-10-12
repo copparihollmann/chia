@@ -50,6 +50,18 @@ LLM Call
 
 .. automodule:: chia.base.llm_call
 
+Token Usage
+-----------
+
+Every :class:`~chia.base.llm_call.QueryResult` carries a
+:class:`~chia.base.usage.TokenUsage`, so a caller reads a call's token counts and
+cost off the public result rather than a backend's private metadata. The module
+docstring explains the three accounting rules it enforces — separate input
+classes, an unknown price that is ``None`` rather than zero, and subscription
+quota that is never summed with metered spend.
+
+.. automodule:: chia.base.usage
+
 MCP tool servers
 ----------------
 

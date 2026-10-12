@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import threading
@@ -16,9 +17,44 @@ import ray
 
 from chia.base.ChiaFunction import ChiaFunction, ObjectRefCallback
 from chia.base.llm_call import QueryResult, LLMCallBase, UNSET
+from chia.base.usage import BillingMode
 
 if TYPE_CHECKING:
     from chia.base.tools.ChiaTool import ChiaTool
+
+
+#: Variables Claude Code exports to the processes it spawns. A chia loop is very often launched
+#: from *inside* a Claude Code session, in which case a ``claude`` subprocess inherits these and
+#: behaves as a nested child of that session instead of a fresh top-level run. Strip them all.
+#:
+#: The first group changes behaviour and is the reason this exists:
+#:
+#: - ``CLAUDECODE``, ``CLAUDE_CODE_CHILD_SESSION`` — mark the process as a nested child.
+#: - ``CLAUDE_CODE_SSE_PORT`` — the child dials the parent's SSE relay, which is gone as soon as
+#:   the parent's turn ends.
+#: - ``CLAUDE_CODE_SESSION_ID`` — collides with the ``--session-id``/``--resume`` this class
+#:   manages itself, so cross-worker session resume silently targets the wrong session.
+#: - ``CLAUDE_CODE_EXECPATH`` — resolves ``claude`` to the parent's binary rather than the one on
+#:   the worker's PATH, which on a heterogeneous cluster is a different version.
+#: - ``CLAUDE_EFFORT`` — silently overrides the effort the caller asked for.
+#:
+#: The second group is inherited *metadata* rather than routing. It is stripped for
+#: reproducibility: a run's environment should not depend on whether a human or another agent
+#: launched it.
+#:
+#: - ``CLAUDE_CODE_ENTRYPOINT``, ``AI_AGENT`` — describe how the parent was started.
+_NESTED_SESSION_ENV_VARS = (
+    # behaviour-changing
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_EFFORT",
+    # inherited metadata
+    "CLAUDE_CODE_ENTRYPOINT",
+    "AI_AGENT",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +384,18 @@ class ClaudeCodeLLM(LLMCallBase):
     # it's left out for now rather than shoehorned in.
     supports_dangerously_skip_permissions = True
 
+    # Env vars whose presence means the CLI is authenticating against a metered
+    # endpoint rather than spending a subscription seat's quota. Checked in the
+    # process that actually runs the CLI (a Ray worker), which is why this is a
+    # property and not decided in __init__ on the driver.
+    _METERED_AUTH_ENV_VARS = (
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "AWS_BEARER_TOKEN_BEDROCK",
+    )
+
     def __init__(
         self,
         model: str = "claude-sonnet-4-6",
@@ -360,6 +408,7 @@ class ClaudeCodeLLM(LLMCallBase):
         resume_session: bool = False,
         projects_cwd: Optional[str] = "/home/ray/.claude/projects/-home-ray-llm-env",
         extra_cli_args: Optional[List[str]] = None,
+        extra_env: Optional[dict] = None,
         log_stream: bool = True,
         log_all: bool = False,
         backend: str = "cli",
@@ -379,6 +428,7 @@ class ClaudeCodeLLM(LLMCallBase):
         self.timeout_seconds = timeout_seconds
         self.model = model
         self.extra_cli_args = extra_cli_args or []
+        self.extra_env = dict(extra_env or {})
         self.logger = logging.getLogger(logging_name)
         self.log_stream = log_stream
         self.log_all = log_all
@@ -445,6 +495,26 @@ class ClaudeCodeLLM(LLMCallBase):
     # Public API
     # ------------------------------------------------------------------
 
+    @property
+    def billing_mode(self) -> BillingMode:
+        """Whether this call's cost is metered spend or subscription quota.
+
+        :rtype: str
+
+        The CLI reports ``total_cost_usd`` on every run regardless of how it
+        authenticated, so the figure alone cannot tell the two apart. Under a
+        subscription seat it is the *metered-equivalent* of the quota consumed, not
+        money — hence ``"subscription"``, which
+        :meth:`chia.base.usage.TokenUsage.__add__` then refuses to add to real
+        charges. The ``api`` backend and any of :data:`_METERED_AUTH_ENV_VARS` in the
+        worker's environment mean genuine per-token billing.
+        """
+        if self.backend == "api" or self.api_key:
+            return "per_token"
+        if any(os.environ.get(var) for var in self._METERED_AUTH_ENV_VARS):
+            return "per_token"
+        return "subscription"
+
     @_session_tracked
     @ChiaFunction(resources={"claude_creds": 0.01})
     def prompt(
@@ -472,6 +542,9 @@ class ClaudeCodeLLM(LLMCallBase):
         from chia.trace.profiler import get_profiler
 
         profiler = get_profiler()
+        # Per-attempt metadata is cleared at the top of each attempt below, so the
+        # tokens a failed attempt burned have to be banked before that happens.
+        self.begin_retry_ledger()
 
         for attempt in range(self.retries):
             try:
@@ -496,6 +569,9 @@ class ClaudeCodeLLM(LLMCallBase):
                     for t in tools
                 ]
 
+                # Publish this call's accounting on the public result, so callers read
+                # QueryResult.usage instead of the private _last_metadata dict.
+                self.attach_usage(cli)
                 if profiler.enabled and self._last_metadata:
                     profiler.add_info(self._last_metadata)
 
@@ -514,8 +590,9 @@ class ClaudeCodeLLM(LLMCallBase):
                 raise
 
             # -- Retry once: stochastic generation may produce shorter output --
-            except MaxOutputTokensError:
+            except MaxOutputTokensError as exc:
                 if attempt == 0:
+                    self.note_retry(attempt, exc)
                     self.logger.warning(
                         "Max output tokens on attempt %d/%d, retrying once",
                         attempt + 1, self.retries,
@@ -524,8 +601,9 @@ class ClaudeCodeLLM(LLMCallBase):
                 raise
 
             # -- Retry with exponential backoff: transient API issue --
-            except ServerError:
+            except ServerError as exc:
                 backoff = min(5 * 2 ** attempt, 60)
+                self.note_retry(attempt, exc, backoff_s=backoff)
                 self.logger.warning(
                     "Server error on attempt %d/%d, backing off %ds",
                     attempt + 1, self.retries, backoff,
@@ -534,26 +612,36 @@ class ClaudeCodeLLM(LLMCallBase):
 
             # -- Standard retry for unknown errors --
             except UnknownClaudeError as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unknown error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
 
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
                 # A timeout means the session was likely created;
                 # switch to --resume for subsequent attempts.
                 if self._session_id is not None and self._call_counter == 0:
                     self._call_counter = 1
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Timeout on attempt %d/%d", attempt + 1, self.retries,
                 )
 
             except Exception as exc:
+                self.note_retry(attempt, exc)
                 self.logger.warning(
                     "Unexpected error on attempt %d/%d: %s",
                     attempt + 1, self.retries, exc,
                 )
-        return ClaudeCodeQueryResult(result="", returncode=-1, stderr="", stream_result="", success=False)
+        # Every attempt failed. The result carries no text, but it must still carry
+        # the accounting: the attempts were billed, and a caller summing spend over
+        # a grid would otherwise record the failures as free.
+        return self.attach_usage(
+            ClaudeCodeQueryResult(result="", returncode=-1, stderr="",
+                                  stream_result="", success=False),
+            meta={},
+        )
 
     def _sync_transcript(self, cli: ClaudeCodeQueryResult) -> ClaudeCodeQueryResult:
         """Copy a worker-captured transcript off *cli* onto this instance.
@@ -726,6 +814,41 @@ class ClaudeCodeLLM(LLMCallBase):
         if self._call_counter == 0:
             self._call_counter = 1
 
+    def _attach_stream_telemetry(self, raw_events) -> None:
+        """Summarise *raw_events* onto ``self._last_metadata`` for the profiler to carry.
+
+        :param raw_events: ``(monotonic_s, raw_json_line)`` pairs from this call's stdout.
+
+        Best-effort by construction: telemetry is a figure, and a figure must never be able
+        to fail a run. Without the ``aet`` extra installed this is a no-op and the metadata
+        is byte-identical to what it was before this existed.
+        """
+        if not raw_events:
+            return
+        try:
+            from chia.trace.stream_telemetry import merge_into_metadata, summarize_stream
+            summary = summarize_stream(raw_events)
+            if summary:
+                self._last_metadata = merge_into_metadata(self._last_metadata, summary)
+                # Emit one privacy-safe event per tool. Bands contain only the
+                # fixed tool name/category, timing and error bit; raw inputs and
+                # outputs remain worker-local.
+                from chia.trace.profile_events import tool_activity_event
+                from chia.trace.profiler import get_profiler
+
+                profiler = get_profiler()
+                for band in summary.get("bands", ()):
+                    profiler.log_profile_event(tool_activity_event(
+                        profiler.profile_context(),
+                        tool_name=str(band.get("tool_name", "tool")),
+                        category=str(band.get("category", "tool")),
+                        status="failed" if band.get("is_error") else "completed",
+                        duration_s=max(0.0, float(band.get("t1_s", 0.0))
+                                       - float(band.get("t0_s", 0.0))),
+                    ))
+        except Exception as exc:                     # pragma: no cover - defensive
+            self.logger.debug("stream telemetry not attached: %s", exc)
+
     def _capture_transcript(self, cli: ClaudeCodeQueryResult) -> None:
         """Read the on-disk transcript after a run into memory and onto *cli*.
 
@@ -814,6 +937,17 @@ class ClaudeCodeLLM(LLMCallBase):
         cmd += ["-p", "-"]
         return cmd
 
+    def _child_env(self) -> dict:
+        """Environment for the ``claude`` subprocess.
+
+        Drops :data:`_NESTED_SESSION_ENV_VARS` so the child is a fresh top-level session rather
+        than a nested child of whatever Claude Code session spawned this process, then applies
+        ``extra_env`` (e.g. ``CLAUDE_CONFIG_DIR`` to bill a run to a specific account).
+        """
+        env = {k: v for k, v in os.environ.items() if k not in _NESTED_SESSION_ENV_VARS}
+        env.update(self.extra_env)
+        return env
+
     def _run_claude(
         self,
         user_message: str,
@@ -822,7 +956,7 @@ class ClaudeCodeLLM(LLMCallBase):
         """Run claude with simple capture (no event streaming)."""
         cmd = self._build_cmd(tools)
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
-        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env = self._child_env()
 
         result = subprocess.run(
             cmd,
@@ -876,11 +1010,12 @@ class ClaudeCodeLLM(LLMCallBase):
         """
         cmd = self._build_cmd(tools)
         self.logger.info("Running: %s", " ".join(cmd[:6]) + " ...")
-        env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env = self._child_env()
 
         result_text_parts: list[str] = []
         stderr_parts: list[str] = []
         stream_parts: list[str] = []
+        raw_events: list[tuple[float, str]] = []
         lock = threading.Lock()
 
         class _TeeWriter:
@@ -933,6 +1068,13 @@ class ClaudeCodeLLM(LLMCallBase):
                 line = line.strip()
                 if line:
                     with lock:
+                        # Keep the raw event next to the rendered one. This is the whole of the
+                        # capture side: aet.tracking.claude_stream.parse_timestamped_stream
+                        # documents this exact ``(timestamp, raw_line)`` loop as its input, and
+                        # _process_event_line below renders the line to prose and discards it —
+                        # so every tool call, its result and its wall-clock duration used to end
+                        # here. The rendered transcript we already keep is the larger of the two.
+                        raw_events.append((time.monotonic(), line))
                         self._process_event_line(line, log_file, result_text_parts)
                         log_file.flush()
 
@@ -951,6 +1093,11 @@ class ClaudeCodeLLM(LLMCallBase):
         proc.wait()
         t1.join()
         t2.join()
+
+        # Derive the activity summary here, on the worker, where the events already are.
+        # ``prompt`` may run on any Ray worker, so only this summary travels back to the
+        # driver — never the raw lines, which carry prompt text and tool output.
+        self._attach_stream_telemetry(raw_events)
 
         if not result_text_parts:
             log_file.write("[DEBUG] No events parsed.\n")
@@ -1408,4 +1555,3 @@ class ClaudeCodeLLM(LLMCallBase):
             return UnknownClaudeError(node_id=node_id, raw_message=msg, stderr=msg)
 
         return None
-

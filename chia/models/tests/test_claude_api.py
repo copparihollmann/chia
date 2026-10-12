@@ -272,6 +272,55 @@ def test_prompt_routes_to_cli_backend(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Billing mode — subscription quota vs metered spend
+# ---------------------------------------------------------------------------
+#
+# The CLI reports ``total_cost_usd`` on every run regardless of how it
+# authenticated, so the figure alone cannot say whether it is money or quota.
+# ``billing_mode`` records which, and ``TokenUsage.__add__`` then refuses to mix
+# them. These tests pin the detection, since getting it wrong silently inflates a
+# reported bill by whatever the subscription runs consumed.
+
+
+@pytest.fixture
+def no_auth_env(monkeypatch):
+    """Strip every credential var so the CLI backend looks seat-authenticated."""
+    for var in ClaudeCodeLLM._METERED_AUTH_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_cli_backend_without_credentials_is_subscription(no_auth_env):
+    assert ClaudeCodeLLM(backend="cli").billing_mode == "subscription"
+
+
+def test_api_backend_is_always_metered(no_auth_env):
+    assert ClaudeCodeLLM(backend="api").billing_mode == "per_token"
+
+
+def test_an_explicit_api_key_is_metered(no_auth_env):
+    assert ClaudeCodeLLM(backend="cli", api_key="sk-test").billing_mode == "per_token"
+
+
+@pytest.mark.parametrize("var", ClaudeCodeLLM._METERED_AUTH_ENV_VARS)
+def test_any_metered_auth_var_flips_the_cli_to_per_token(no_auth_env, monkeypatch, var):
+    """Each of these means the CLI is billing a metered endpoint, not a seat."""
+    monkeypatch.setenv(var, "1")
+
+    assert ClaudeCodeLLM(backend="cli").billing_mode == "per_token"
+
+
+def test_billing_mode_is_read_where_the_cli_runs(no_auth_env, monkeypatch):
+    """It is a property, not a constructor decision: the credentials that matter
+    are the ones in the process that spawns the CLI (a Ray worker), which need not
+    match the driver's."""
+    llm = ClaudeCodeLLM(backend="cli")
+    assert llm.billing_mode == "subscription"
+
+    monkeypatch.setenv("CLAUDE_CODE_USE_BEDROCK", "1")
+    assert llm.billing_mode == "per_token"
+
+
+# ---------------------------------------------------------------------------
 # Mocked-loop tests (fake anthropic; no network, no SDK required)
 # ---------------------------------------------------------------------------
 
@@ -310,6 +359,31 @@ def test_api_no_tools_request_shaping_and_result(monkeypatch):
     assert llm._last_metadata["output_tokens"] == 5
     assert llm._last_metadata["num_turns"] == 1
     assert llm._last_metadata["model"] == "claude-sonnet-4-6"
+
+
+def test_api_attaches_the_four_input_classes_to_the_result(monkeypatch):
+    """Prompt caching is on by default for this backend (the system block carries
+    a cache breakpoint), so the cache counters are the normal case, not an edge
+    one — and they must reach the caller separately from fresh input."""
+    capture = {"calls": []}
+    _install_fake_anthropic(
+        monkeypatch,
+        [_response([_text_block("PONG")], "end_turn",
+                   _usage(inp=10, out=5, cc=900, cr=15_345))],
+        capture,
+    )
+
+    llm = ClaudeCodeLLM(backend="api", api_key="sk-test")
+    cli = llm.prompt("ping", tools=[])
+
+    assert cli.usage.input_tokens == 10
+    assert cli.usage.output_tokens == 5
+    assert cli.usage.cache_creation_input_tokens == 900
+    assert cli.usage.cache_read_input_tokens == 15_345
+    assert cli.usage.billed_input_tokens == 16_255
+    assert cli.usage.cache_hit_ratio == pytest.approx(15_345 / 16_255)
+    # An explicit api_key is metered, whatever the CLI would have been.
+    assert cli.usage.billing_mode == "per_token"
 
 
 def test_api_thinking_disabled_omits_param(monkeypatch):
@@ -648,6 +722,33 @@ def test_transcript_path_uses_projects_cwd_and_session_id(tmp_path):
     assert llm._transcript_path() == os.path.join(
         str(tmp_path), f"{llm._session_id}.jsonl"
     )
+
+
+def test_child_env_strips_every_nested_session_var(monkeypatch):
+    """A claude spawned from inside a Claude Code session must not inherit that session.
+
+    Leaking CLAUDE_CODE_SSE_PORT/ENTRYPOINT makes the child dial the parent's relay instead of
+    starting its own top-level session; CLAUDE_CODE_SESSION_ID collides with --session-id/--resume.
+    """
+    from chia.models.claude import _NESTED_SESSION_ENV_VARS
+
+    for var in _NESTED_SESSION_ENV_VARS:
+        monkeypatch.setenv(var, "inherited-from-parent")
+    monkeypatch.setenv("CHIA_UNRELATED_VAR", "keep-me")
+
+    env = ClaudeCodeLLM(backend="cli")._child_env()
+
+    assert not [v for v in _NESTED_SESSION_ENV_VARS if v in env]
+    assert env["CHIA_UNRELATED_VAR"] == "keep-me"
+
+
+def test_child_env_applies_extra_env(monkeypatch):
+    """extra_env reaches the subprocess — e.g. CLAUDE_CONFIG_DIR to bill a run to one account."""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+    llm = ClaudeCodeLLM(backend="cli", extra_env={"CLAUDE_CONFIG_DIR": "/accounts/arm-a"})
+
+    assert llm._child_env()["CLAUDE_CONFIG_DIR"] == "/accounts/arm-a"
 
 
 def test_default_projects_cwd_is_llm_env_dir():
