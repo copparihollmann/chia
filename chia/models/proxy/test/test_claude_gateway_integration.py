@@ -13,6 +13,7 @@ import socket
 import subprocess
 import threading
 import time
+from pathlib import Path
 from urllib import request as urllib_request
 
 import pytest
@@ -81,8 +82,13 @@ class _DelegatingFixture:
                 "stop_reason": "end_turn", "usage": {"input_tokens": 3, "output_tokens": 2}}
 
 
-def test_real_cli_delegates_to_the_configured_weaker_model(tmp_path):
+@pytest.mark.parametrize("mode", ["plain", "stream", "otel"])
+def test_real_cli_delegates_to_the_configured_weaker_model(tmp_path, mode):
     import uvicorn
+
+    if mode == "otel":
+        pytest.importorskip("aet.tracking.otel_sink")
+        from chia.models.aet_claude import AetClaudeCodeLLM
 
     fixture = _DelegatingFixture()
     app = build_gateway_app(ProviderRouter({"fixture": fixture}, default_provider="fixture"))
@@ -106,9 +112,11 @@ def test_real_cli_delegates_to_the_configured_weaker_model(tmp_path):
             AgentDefinition("explorer", "Inspect files", "Return concise evidence.",
                             model=ModelRef("fixture", "weak"), tools=("Read", "Glob", "Grep")),
         ]
-        llm = ClaudeCodeLLM(
+        llm_class = AetClaudeCodeLLM if mode == "otel" else ClaudeCodeLLM
+        llm = llm_class(
             model="sonnet", agents=agents, primary_agent="lead",
-            log_stream=False, timeout_seconds=15,
+            log_stream=mode != "plain", timeout_seconds=15,
+            **({"telemetry_dir": str(tmp_path / "otel")} if mode == "otel" else {}),
             extra_cli_args=["--debug", "api", "--debug-file", str(tmp_path / "claude.log")],
             extra_env={
                 "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
@@ -119,7 +127,8 @@ def test_real_cli_delegates_to_the_configured_weaker_model(tmp_path):
             },
         )
         try:
-            result = llm._run_claude("Delegate one repository lookup, then report its evidence.", [])
+            run = llm._run_claude if mode == "plain" else llm._run_claude_streaming
+            result = run("Delegate one repository lookup, then report its evidence.", [])
         except subprocess.TimeoutExpired as exc:
             summary = [(model, len(body.get("messages") or []))
                        for model, body in fixture.requests]
@@ -138,3 +147,18 @@ def test_real_cli_delegates_to_the_configured_weaker_model(tmp_path):
     assert "sonnet" in models[0]
     assert "weak" in models
     assert "sonnet" in models[-1]
+    if mode != "plain":
+        try:
+            import aet.tracking.claude_stream  # noqa: F401
+        except ImportError:
+            assert "stream_telemetry" not in llm._last_metadata
+        else:
+            telemetry = llm._last_metadata["stream_telemetry"]
+            per_model = telemetry["per_model"]
+            assert any("weak" in item["model"] for item in per_model), per_model
+            assert any("sonnet" in item["model"] for item in per_model), per_model
+            assert telemetry["tool_calls"] >= 1
+            assert any(band["tool_name"] == "Agent" for band in telemetry["bands"])
+    if mode == "otel":
+        assert len(llm.otel_captures) == 1
+        assert Path(llm.otel_captures[0]).stat().st_size > 0

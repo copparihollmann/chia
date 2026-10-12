@@ -235,20 +235,18 @@ is a floor on "neither arm is broken" and nothing more.
 ### What this does not measure, and why not
 
 `ModelTier` has three levers and this measures **one**. `subagent` and `background` set
-`CLAUDE_CODE_SUBAGENT_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL`, and measuring them would need
-two things that are not true here:
+`CLAUDE_CODE_SUBAGENT_MODEL` and `ANTHROPIC_SMALL_FAST_MODEL`. Measuring them in this study
+would have needed two conditions it did not meet:
 
 - **The task would have to delegate.** This one is a single-turn code question with no tools,
   so a subagent model is never invoked. Varying it would be inert by construction, and the
   null result would measure the task rather than the feature.
-- **chia would have to record per-model usage.** It does not.
-  `ClaudeCodeLLM._last_metadata` carries one `model` field and one set of token counts, folded
-  across every model the CLI called — and the CLI *does* call more than one, sending a separate
-  cheap request for the session title. So even on a delegating task, chia's own telemetry
-  cannot say which tier served which call. `aet.tracking.claude_stream.ModelUsage` exists for
-  precisely this shape and chia does not populate it. **That gap is the finding here**: the
-  subagent and background levers are currently unfalsifiable through chia's telemetry, which
-  is a stronger reason to fix the telemetry than to run an arm that could not have failed.
+- **The original study lacked per-model usage.** At the time, `ClaudeCodeLLM._last_metadata`
+  carried one folded `model` field, although the CLI could call several models. The later
+  optional `chia.trace.stream_telemetry` integration now records per-model totals from the
+  Claude stream when AET is installed. A local CLI fixture verified strong → weak → strong
+  routing and recorded both models. This does not turn the original single-turn task into a
+  delegation study, or automatically map every internal CLI child to a Chia agent ID.
 
 Running a tier-mix arm anyway and reporting "no detectable effect" would have been true and
 worthless. Script: [`tier_ablation.py`](tier_ablation.py). Source: `data/tier_ablation.csv`.

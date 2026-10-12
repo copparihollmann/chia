@@ -14,16 +14,13 @@ Why the question is narrow, and what that costs
     Sets the CLI's ``--model``. Measurable: it changes which model answers, so cost and
     correctness both move, and both are recorded per call.
 ``subagent`` / ``background``
-    Set ``CLAUDE_CODE_SUBAGENT_MODEL`` and ``ANTHROPIC_SMALL_FAST_MODEL``. **Not measured, and
-    the reason is a real gap rather than a scope choice.** Two things would have to be true
-    and neither is: the task would have to delegate (this one is a single-turn code question
-    with no tools, so a subagent model is never invoked and varying it would be inert by
-    construction), and chia would have to record *per-model* usage from the CLI's stream so
-    the routing could be observed. It does not. ``ClaudeCodeLLM``'s ``_last_metadata`` carries
-    one ``model`` field and one set of token counts, folded across every model the CLI called
-    — so even on a delegating task, chia's own telemetry cannot say which tier served which
-    call. ``aet.tracking.claude_stream.ModelUsage`` exists for exactly this and chia does not
-    populate it.
+    Set ``CLAUDE_CODE_SUBAGENT_MODEL`` and ``ANTHROPIC_SMALL_FAST_MODEL``. **Not measured in
+    this study.** The task is a single-turn code question with no tools, so a subagent model
+    is never invoked and varying it would be inert by construction. At the time of the study,
+    chia also lacked per-model CLI stream accounting. The later optional
+    ``chia.trace.stream_telemetry`` integration now records per-model totals when AET is
+    installed; a local CLI fixture verifies the strong → weak → strong route. A proper
+    delegation outcome study still needs a task that actually delegates.
 
 That is stated up front because the alternative was to run a tier-mix arm anyway, watch it
 come out identical, and report "no detectable effect from the subagent lever". That sentence
