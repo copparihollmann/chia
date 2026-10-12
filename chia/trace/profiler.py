@@ -217,6 +217,10 @@ def get_collector(namespace: Optional[str] = None):
     if _collector_override is not None:
         return _collector_override
     import ray as _ray
+    # ray.get_actor() auto-initializes Ray. Local calls should remain local
+    # unless the driver explicitly started Ray and the profile collector.
+    if not _ray.is_initialized():
+        return None
     lookup_kwargs = {"namespace": namespace} if namespace else {}
     try:
         return _ray.get_actor(_COLLECTOR_ACTOR_NAME, **lookup_kwargs)
