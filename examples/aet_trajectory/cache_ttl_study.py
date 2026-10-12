@@ -17,6 +17,7 @@ import random
 import statistics
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 
 import httpx
@@ -138,8 +139,10 @@ async def run_study(args) -> None:
         raise ValueError(f"preflight upper bound ${maximum:.2f} exceeds cap "
                          f"${args.cap_usd:.2f}; reduce arms/prefix or raise cap")
     output = Path(args.output)
-    if not output.parent.is_dir() or output.exists():
-        raise ValueError("output parent must exist and output must be new")
+    temporary = os.environ.get("TMPDIR")
+    if (not temporary or not output.resolve().is_relative_to(Path(temporary).resolve())
+            or not output.parent.is_dir() or output.exists()):
+        raise ValueError("output must be a new file under the managed task TMPDIR")
     print(json.dumps({"run_id": run_id, "arms": len(arms),
                       "requests_at_most": 3 * len(arms),
                       "preflight_upper_usd": round(maximum, 4),
@@ -191,20 +194,30 @@ def summarize(path: Path) -> dict:
     for row in rows:
         grouped.setdefault(row["arm_id"], {})[row["phase"]] = row
     by_gap = {}
+    excluded = Counter()
     for arm in grouped.values():
+        warm = arm.get("warm")
+        validate = arm.get("validate")
         delayed = arm.get("delayed")
-        if not delayed or delayed.get("error"):
+        if any(event and event.get("error") for event in (warm, validate, delayed)):
+            excluded["request_error"] += 1
             continue
-        warm = arm["warm"]
-        validate = arm["validate"]
-        if (warm["usage"]["cache_creation_input_tokens"] == 0 or
-                validate["usage"]["cache_read_input_tokens"] == 0):
+        if warm is None or validate is None or delayed is None:
+            excluded["incomplete"] += 1
+            continue
+        if warm["usage"]["cache_creation_input_tokens"] == 0:
+            excluded["no_initial_write"] += 1
+            continue
+        if validate["usage"]["cache_read_input_tokens"] == 0:
+            excluded["no_initial_read"] += 1
             continue
         target = GAPS[delayed["gap"]]
         if abs(delayed["actual_gap_seconds"] - target) > max(5, target * 0.05):
+            excluded["gap_off_target"] += 1
             continue
         by_gap.setdefault(delayed["gap"], []).append(delayed)
     return {"requests": len(rows), "arms": len(grouped),
+            "excluded_arms_by_reason": dict(excluded),
             "measured_cost_usd": round(sum(row.get("cost_usd", 0) for row in rows), 6),
             "gaps": {gap: {
                 "valid_arms": len(items),

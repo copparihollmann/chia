@@ -4,6 +4,8 @@ import asyncio
 import importlib.util
 import json
 import math
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -76,3 +78,71 @@ def test_paid_run_rejects_nonfinite_cap_before_request(monkeypatch):
                            cap_usd=math.nan)
     with pytest.raises(ValueError):
         asyncio.run(study.run_study(args))
+
+
+def test_full_http_study_uses_independent_prefixes_and_logs_only_usage(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-only")
+    monkeypatch.setattr(study, "GAPS", {"short": 0.05, "past_5m": 0.08,
+                                        "simulation": 0.12})
+    calls = {}
+    lock = threading.Lock()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            assert self.path == "/v1/messages"
+            assert self.headers["x-api-key"] == "fixture-only"
+            body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+            assert body["max_tokens"] == 0
+            prefix = body["system"][0]["text"]
+            assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
+            with lock:
+                calls[prefix] = calls.get(prefix, 0) + 1
+                number = calls[prefix]
+            if number == 1 or (number == 3 and "-short-" not in prefix):
+                read, write = 0, 5000
+            else:
+                read, write = 5000, 0
+            response = json.dumps({
+                "id": f"msg_{number}",
+                "usage": {"input_tokens": 10, "output_tokens": 0,
+                          "cache_read_input_tokens": read,
+                          "cache_creation_input_tokens": write},
+            }).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("request-id", f"req_{number}")
+            self.send_header("content-length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    output = tmp_path / "usage.jsonl"
+    args = SimpleNamespace(
+        seed=20261012, repetitions=1, model="fixture-model", lines=4,
+        cap_usd=1.0, concurrency=3,
+        base_url=f"http://127.0.0.1:{server.server_address[1]}",
+        output=output, price_input=0.001, price_read=0.001,
+        price_write=0.001, price_output=0.001,
+    )
+    try:
+        asyncio.run(study.run_study(args))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=3)
+    assert len(calls) == 3 and set(calls.values()) == {3}
+    result = study.summarize(output)
+    assert result["requests"] == 9 and result["arms"] == 3
+    assert result["gaps"]["short"]["cache_read_arms"] == 1
+    assert result["gaps"]["past_5m"]["cache_read_arms"] == 0
+    assert result["gaps"]["simulation"]["cache_read_arms"] == 0
+    logged = output.read_text()
+    assert "fixture-only" not in logged
+    assert "Cache study arm" not in logged
+    assert len({json.loads(row)["prefix_sha256"] for row in logged.splitlines()}) == 3
