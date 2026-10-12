@@ -49,6 +49,18 @@ pilot. This host currently has no configured paid provider key, and **no paid
 arm has run**. See the task's `deliverables/REMAINING_STUDIES.md` for the
 comparison and cache-TTL analysis plan.
 
+An optional dated OpenAI candidate is
+[`prices_openai_gpt41_2026-10-12.json`](prices_openai_gpt41_2026-10-12.json):
+`gpt-4.1-2025-04-14` for the lead and `gpt-4.1-mini-2025-04-14` for the
+explorer. Both pinned snapshots support Chat Completions, tool calling, and
+streaming according to the [GPT-4.1 model page](https://developers.openai.com/api/docs/models/gpt-4.1)
+and [GPT-4.1 mini model page](https://developers.openai.com/api/docs/models/gpt-4.1-mini).
+The table uses their listed standard input, cached-input, and output prices;
+cache writes use the base input rate because [OpenAI's caching guide](https://developers.openai.com/api/docs/guides/prompt-caching)
+says earlier models have no additional write charge. Verify availability and
+prices again before a paid run. This candidate is not a measured harness result
+or an approved budget.
+
 After a complete run, `analyze.py <run-directory>` checks the 25 matched
 pairs. It counts an outcome as delegated success only if the held-out oracle
 passes **and** the weak model was called. It reports a paired success
