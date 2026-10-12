@@ -59,10 +59,15 @@ def _print_plan(config: ClusterConfig, assignments: list[NodeAssignment],
     print(f"Head:    {config.head_ip}")
     print(f"Workers:")
     for a in assignments:
-        docker_str = f" [{a.node_type.docker.engine}: {a.node_type.docker.image}]" if a.node_type.docker else ""
+        backend, backend_config = config.get_worker_backend(a.node_type)
+        docker = backend_config if backend == "docker" else None
+        bwrap = backend_config if backend == "bwrap" else None
+        docker_str = f" [{docker.engine}: {docker.image}]" if docker else ""
+        bwrap_str = (
+            f" [bwrap: {bwrap.image or bwrap.rootfs}]" if bwrap else "")
         tunnel_str = " [tunneled]" if config.is_tunneled(a.ip) else ""
         print(f"  {a.ip} -> {a.node_type.name} "
-              f"(resources: {a.resources}){docker_str}{tunnel_str}{_tailnet_tag(a)}")
+              f"(resources: {a.resources}){docker_str}{bwrap_str}{tunnel_str}{_tailnet_tag(a)}")
 
     worker_tunnels = allocate_worker_tunnels(config, assignments)
     if worker_tunnels:
@@ -110,9 +115,13 @@ def _print_plan(config: ClusterConfig, assignments: list[NodeAssignment],
                 head_ip=head_ip_for_scripts if tc else None,
                 tailnet_alloc=ta,
             )
-            docker_str = f" [{a.node_type.docker.engine}: {a.node_type.docker.container_name}]" if a.node_type.docker else ""
+            backend, backend_config = config.get_worker_backend(a.node_type)
+            docker = backend_config if backend == "docker" else None
+            bwrap = backend_config if backend == "bwrap" else None
+            docker_str = f" [{docker.engine}: {docker.container_name}]" if docker else ""
+            bwrap_str = f" [bwrap: {bwrap.worker_name}]" if bwrap else ""
             tunnel_str = " [tunneled]" if config.is_tunneled(a.ip) else ""
-            print(f"--- Script for worker {a.ip} ({a.node_type.name}){docker_str}{tunnel_str}{_tailnet_tag(a)} ---")
+            print(f"--- Script for worker {a.ip} ({a.node_type.name}){docker_str}{bwrap_str}{tunnel_str}{_tailnet_tag(a)} ---")
             for line in worker_script:
                 print(f"  {line}")
             print()
@@ -127,10 +136,14 @@ def _print_add_plan(config: ClusterConfig,
     print(f"Workers:")
     for a in all_assignments:
         status = "NEW" if id(a) in new_ids else "EXISTS"
-        docker_str = (f" [{a.node_type.docker.engine}: {a.node_type.docker.image}]"
-                      if a.node_type.docker else "")
+        backend, backend_config = config.get_worker_backend(a.node_type)
+        docker = backend_config if backend == "docker" else None
+        bwrap = backend_config if backend == "bwrap" else None
+        docker_str = f" [{docker.engine}: {docker.image}]" if docker else ""
+        bwrap_str = (
+            f" [bwrap: {bwrap.image or bwrap.rootfs}]" if bwrap else "")
         print(f"  [{status}] {a.ip} -> {a.node_type.name} "
-              f"(resources: {a.resources}){docker_str}")
+              f"(resources: {a.resources}){docker_str}{bwrap_str}")
     print(f"\nWill add {len(new_assignments)} new worker(s), "
           f"skip {len(all_assignments) - len(new_assignments)} existing worker(s)")
     print()

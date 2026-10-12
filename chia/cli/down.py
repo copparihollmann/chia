@@ -18,9 +18,13 @@ def _print_teardown_plan(config: ClusterConfig, assignments: list[NodeAssignment
     print(f"Head:    {config.head_ip}")
     print(f"Workers to tear down:")
     for a in assignments:
-        docker_str = f" [{a.node_type.docker.engine}: {a.node_type.docker.container_name}-{a.worker_index}]" if a.node_type.docker else ""
+        backend, backend_config = config.get_worker_backend(a.node_type)
+        docker = backend_config if backend == "docker" else None
+        bwrap = backend_config if backend == "bwrap" else None
+        docker_str = f" [{docker.engine}: {docker.container_name}-{a.worker_index}]" if docker else ""
+        bwrap_str = f" [bwrap: {bwrap.worker_name}-{a.worker_index}]" if bwrap else ""
         tunnel_str = " [tunneled]" if config.is_tunneled(a.ip) else ""
-        print(f"  {a.ip} -> {a.node_type.name}{docker_str}{tunnel_str}")
+        print(f"  {a.ip} -> {a.node_type.name}{docker_str}{bwrap_str}{tunnel_str}")
 
     tunneled_ips = [ip for ip in config.worker_ips if config.is_tunneled(ip)]
     if tunneled_ips:

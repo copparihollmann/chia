@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "issue_number": 10568,
+  "title": "[CombToSynth] Assertion failure in CompressorTree construction for comb.mul lowering",
+  "source_url": "https://github.com/llvm/circt/issues/10568",
+  "source_created_at": "2026-06-01T02:10:32Z",
+  "source_updated_at": "2026-06-07T22:01:03Z",
+  "source_body_sha256": "c55f618f9f90a694c63bfaa35fbb53456083d9a88cd9178e965b7825906b763e",
+  "normalized_mlir_sha256": "5e06e48506b2bffa1322f048c42a1065035e602f8daef24c40ac1a3c771e94ba",
+  "command": "circt-opt issue-10568.mlir -convert-comb-to-synth",
+  "expected_clean_image_exit_code": 0,
+  "observation": "The pinned benchmark image completes successfully; the historical assertion is retained as a stable representative command, not as a live crash.",
+  "expected_failure_substring": "Assertion `addends.size() > 2' failed",
+  "image_id": "sha256:5c61bd07a4716d2d1f235300138f6c5dd97c42738f7195cb1d3570c9539493c8",
+  "image_registry_digest": "sha256:09e59dfa30035b773dd978a84e5c3c76b9326eb9e846ced025093cdeca96145d"
+}
