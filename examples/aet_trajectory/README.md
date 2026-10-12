@@ -151,3 +151,29 @@ reuses the cold arm's cache.
 - `pip install 'chia[aet]'` for the sink; `pip install 'aet[viz]'` in a separate venv for `aet plot`.
 - Bedrock credentials (`AWS_BEARER_TOKEN_BEDROCK`, `AWS_REGION`) for the live path only.
 - The `--replay` path needs neither.
+
+# Controlled cache-TTL follow-up
+
+`cache_ttl_study.py` prepares a provider-side follow-up to the committed cold/warm
+trajectory. `plan` is offline:
+
+```bash
+python examples/aet_trajectory/cache_ttl_study.py plan --seed 20261012 --repetitions 3
+```
+
+The fixed schedule has three independent arms at each of 30 seconds, six
+minutes, and 65 minutes. Each arm writes a unique explicit cache prefix, then
+checks for an immediate cache read before timing the gap from that read
+request's **start**. Arms run concurrently while waiting. The `run` command
+is deliberately separate from `plan`: it requires an API key, model ID,
+current per-million-token prices for fresh/read/write/output classes, a dollar
+cap, and a new output path under the managed task. It makes up to 27 paid
+Anthropic Messages requests; it has **not** been run for this update. The
+script checks a conservative cost bound before the first request, makes no
+automatic retry, and logs only timings, response IDs, prefix hashes and usage.
+
+An immediate read validates a cacheable prefix. A read-to-no-read change after
+the stated TTL is evidence of *probable* expiry, not a direct observation of
+eviction. Aggregate provider usage cannot show physical KV-cache occupancy or
+the hit/miss state of every individual token. See
+`deliverables/REMAINING_STUDIES.md` in the managed task for the full protocol.
