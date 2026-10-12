@@ -2,7 +2,8 @@ Example: Agentic RoCC Accelerator (MemCpy)
 ==========================================
 
 A worked, end-to-end example of an agentic hardware-design loop: an LLM
-(Claude Code) designs a RISC-V RoCC accelerator in Chisel, CHIA builds it
+(Claude Code by default; OpenCode or Google Antigravity via ``--llm``) designs
+a RISC-V RoCC accelerator in Chisel, CHIA builds it
 into a MegaBoom SoC, runs it against a bare-metal test, and, on any failure, 
 feeds the error back to the LLM to debug and retry until the test passes.
 
@@ -63,10 +64,11 @@ Components
        ``build/memcpy.riscv`` + ``build/memcpy.dump``, and reads them back.
        Runs on the chipyard container.
    * - ``llm.py``
-     - The implement + debug LLM nodes (Claude Code or OpenCode, chosen with
-       ``--llm``) and the failure-feedback formatters. LLM calls are dispatched
-       onto the chosen backend's node (``llm`` for Claude Code, ``opencode`` for
-       OpenCode); Claude Code shares one resumable session across the calls.
+     - The implement + debug LLM nodes (Claude Code, OpenCode or Antigravity,
+       chosen with ``--llm``) and the failure-feedback formatters. LLM calls are
+       dispatched onto the chosen backend's node (``llm`` / ``opencode`` /
+       ``antigravity``); Claude Code and Antigravity share one resumable
+       session across the calls.
    * - ``helpers.py``
      - Run-outcome classification (``classify_run``), the ``out/`` dumper, the
        chipyard git-diff node (``collect_diff``), and dramsim-ini loading.
@@ -76,8 +78,8 @@ Components
    * - ``constants.py``
      - Every tunable knob (loop counts, configs, paths, timeouts, resources).
    * - ``cluster.yaml``
-     - Minimal cluster: one chisel-build, one verilator, one claude (``llm``)
-       node.
+     - Minimal cluster: one chisel-build, one verilator, and one node per LLM
+       backend (``llm``, ``opencode``, ``antigravity``) — keep the ones you use.
    * - ``memcpy.c``
      - The bare-metal test: issues the two RoCC instructions and checks the copy.
 
@@ -102,11 +104,15 @@ Running it
 ----------
 
 The bundled ``cluster.yaml`` brings up a chisel-build (``chipyard``) node, a
-verilator (``verilator_run``) node, and an LLM node. The implement/debug LLM
-can be either **Claude Code** (the ``llm`` node) or **OpenCode** (the
-``opencode`` node) — keep both up and pick per run with ``--llm`` (default
-``claude``), or comment out the one you don't use. Each backend reads its
-credentials from the mounts shown at the top of ``cluster.yaml``.
+verilator (``verilator_run``) node, and one node per LLM backend. The
+implement/debug LLM can be **Claude Code** (``llm`` node), **OpenCode**
+(``opencode`` node) or **Google Antigravity** (``antigravity`` node, Gemini via
+the ``agy`` CLI) — keep them up and pick per run with ``--llm`` (default
+``claude``), or comment out the ones you don't use. Each backend reads its
+credentials from the mounts shown at the top of ``cluster.yaml`` (Antigravity
+mounts your ``~/.gemini`` sign-in; choose the ``global`` location at sign-in so
+Gemini Pro is available). See :doc:`google_auth` for the sign-in and mount
+details of the two Gemini backends.
 
 .. code-block:: bash
 
@@ -115,17 +121,30 @@ credentials from the mounts shown at the top of ``cluster.yaml``.
    # pick the backend with --llm (claude is the default); run from the repo root:
    chia job submit -- python $PWD/examples/memcpy/memcpy_loop.py --llm claude
    chia job submit -- python $PWD/examples/memcpy/memcpy_loop.py --llm opencode
+   chia job submit -- python $PWD/examples/memcpy/memcpy_loop.py --llm antigravity
    chia down examples/memcpy/cluster.yaml
+
+Ray jobs do not inherit your shell environment, so ``MEMCPY_*`` knobs go through
+the job's runtime env. OpenCode is provider-agnostic (``MEMCPY_OPENCODE_MODEL``
+is any ``provider/model``); Gemini on Vertex AI is the wired-up example — it needs
+Google ADC on the host and a GCP project:
+
+.. code-block:: bash
+
+   export GOOGLE_CLOUD_PROJECT=<project>      # before `chia up` (the opencode node forwards it)
+   chia job submit \
+     --runtime-env-json "{\"env_vars\": {\"MEMCPY_OPENCODE_MODEL\": \"google-vertex/gemini-3.1-pro-preview\", \"GOOGLE_CLOUD_PROJECT\": \"$GOOGLE_CLOUD_PROJECT\"}}" \
+     -- python $PWD/examples/memcpy/memcpy_loop.py --llm opencode
 
 Pass the absolute path to ``memcpy_loop.py``. The driver runs on the cluster head,
 where the repo lives, so ``out/`` is written into the real
 ``examples/memcpy/out``.
 
-Both backends edit the chipyard checkout through the same ``chipyard_bash`` MCP
+All backends edit the chipyard checkout through the same ``chipyard_bash`` MCP
 tool. ``prompt`` is a ``ChiaFunction`` on each backend, so the loop dispatches it
-onto the chosen worker (``llm`` for Claude Code, ``opencode`` for OpenCode).
-Claude Code additionally threads its session transcript from each call into the
-next so the debugger resumes the implement conversation; session persistence for
+onto the chosen worker (``llm``, ``opencode`` or ``antigravity``). Claude Code
+and Antigravity thread their session transcript from each call into the next so
+the debugger resumes the implement conversation; session persistence for
 OpenCode is in development (each OpenCode call is currently independent).
 
 Tunable parameters
@@ -158,7 +177,7 @@ All knobs live in ``constants.py``; container paths and cluster knobs are
 Debug feedback
 --------------
 
-On a failure the debug node (the same Claude session, resumed) receives:
+On a failure the debug node (the same LLM session, resumed for Claude Code and Antigravity) receives:
 
 * **Build failure** — build stderr tail plus stdout windowed on the first
   ``error``.

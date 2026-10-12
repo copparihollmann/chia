@@ -100,9 +100,30 @@ LLM_TIMEOUT_SECONDS = int(os.environ.get("MEMCPY_LLM_TIMEOUT_SECONDS", "1800"))
 LLM_EXTRA_CLI_ARGS = ["--effort", "max"]
 
 # OpenCode backend (selected with `--llm opencode`; dispatched onto the opencode
-# node, resource opencode_creds). Model is opencode's `provider/model` form;
-# leave empty to use opencode's own configured default.
+# node, resource opencode_creds). opencode is provider-agnostic: the model is its
+# `provider/model` form — e.g. "anthropic/claude-opus-4-6", "openai/gpt-5",
+# "google-vertex/gemini-3.1-pro-preview" — and the provider's credentials must
+# be available on the opencode node (see the opencode node in cluster.yaml).
+# Leave empty to use opencode's own configured default.
 OPENCODE_MODEL = os.environ.get("MEMCPY_OPENCODE_MODEL", "") or None
+
+# Provider-specific opencode config. Most providers need nothing beyond their
+# credential; the ones that do are listed here and applied by llm.py only when
+# OPENCODE_MODEL selects that provider.
+#   google-vertex/…  (Gemini on Vertex AI): GCP project + location, pinned in the
+#   opencode config so the model is served from the intended endpoint (Gemini Pro
+#   is only served from `global`). Site-specific -> from the environment, like
+#   the other credentials; auth is Google ADC mounted onto the opencode node.
+OPENCODE_VERTEX_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT") or None
+OPENCODE_VERTEX_LOCATION = os.environ.get("MEMCPY_OPENCODE_VERTEX_LOCATION", "global")
+
+# Antigravity backend (selected with `--llm antigravity`; dispatched onto the
+# antigravity node, resource antigravity_creds). Google's `agy` CLI, Gemini.
+# Default is the newest Gemini Pro; the -high suffix is agy's effort tier. Pro
+# is only served from the `global` location — pick it at `agy` sign-in (or set
+# gcp.location "global" in ~/.gemini/antigravity-cli/settings.json), otherwise
+# agy fails with "Selected model is not supported in the selected location".
+ANTIGRAVITY_MODEL = os.environ.get("MEMCPY_ANTIGRAVITY_MODEL", "gemini-3.1-pro-high")
 
 # ---------------------------------------------------------------------------
 # Loop control
@@ -158,6 +179,7 @@ VERILATOR_RUN_RESOURCE = float(os.environ.get("MEMCPY_VERILATOR_RUN_RESOURCE", "
 # The implement + debug LLM calls are dispatched onto the dedicated claude or opencode nodes
 LLM_RESOURCE = float(os.environ.get("MEMCPY_LLM_RESOURCE", "1.0"))
 OPENCODE_RESOURCE = float(os.environ.get("MEMCPY_OPENCODE_RESOURCE", "1.0"))
+ANTIGRAVITY_RESOURCE = float(os.environ.get("MEMCPY_ANTIGRAVITY_RESOURCE", "1.0"))
 
 # ---------------------------------------------------------------------------
 # Chisel diff capture

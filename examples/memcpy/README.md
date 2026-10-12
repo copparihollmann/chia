@@ -41,10 +41,10 @@ test build  (parallel)        implement  (parallel)
 |------|------|
 | `memcpy_loop.py` | Main orchestration: parallel test-build + implement, then the build→run→debug loop. Dumps all collateral to `out/`. |
 | `test_build.py` | `build_test` ChiaFunction — copies `memcpy.c` into `$chipyard/tests`, registers a CMake target, builds `build/memcpy.riscv` + `build/memcpy.dump`, reads them back. Runs on the chipyard container. |
-| `llm.py` | The implement + debug LLM nodes (Claude Code or OpenCode), correctness classification, and failure-feedback formatting. The LLM calls are dispatched onto the chosen LLM node (claude `llm` or opencode `opencode_creds`). Claude shares one resumable session across implement + debug (transcript threaded across calls); session persistence for other backends is in development. |
+| `llm.py` | The implement + debug LLM nodes (Claude Code, OpenCode or Antigravity), correctness classification, and failure-feedback formatting. The LLM calls are dispatched onto the chosen LLM node (claude `llm`, opencode `opencode_creds` or antigravity `antigravity_creds`). Claude and Antigravity share one resumable session across implement + debug (transcript threaded across calls); session persistence for OpenCode is in development. |
 | `prompts/` | The implement (`implement.md`) and debug (`debug.md`) prompt text, with `${VAR}` placeholders substituted from `constants` at load time. |
 | `constants.py` | Every tunable knob (loop counts, configs, paths, timeouts, resource tokens). |
-| `cluster.yaml` | Minimal single-machine cluster: one chisel-build, one verilator, and an LLM node — a claude (`llm`) **and/or** opencode (`opencode_creds`) node (pick one, or keep both and select per run), all on `${THIS_MACHINE}`. |
+| `cluster.yaml` | Minimal single-machine cluster: one chisel-build, one verilator, and one node per LLM backend — claude (`llm`), opencode (`opencode_creds`), antigravity (`antigravity_creds`); keep the ones you use and select per run — all on `${THIS_MACHINE}`. |
 | `memcpy.c` | The bare-metal test: issues two RoCC custom instructions and checks the copy. |
 | `out/` | Per-run dump of node results + collateral (git-ignored). |
 
@@ -140,24 +140,74 @@ resolve. Do **not** pass `--working-dir`: the loop's `RUNTIME_ENV` already sets
 fail to merge the two runtime envs. The driver runs on the cluster head, where
 the repo lives, so `out/` is written into the real `examples/memcpy/out`.
 
-### Choosing the LLM backend
-
-The implement/debug nodes can run on **Claude Code** or **OpenCode**, selected
-per run with `--llm`:
+**Passing `MEMCPY_*` knobs (and other env) to the loop.** The driver runs as a
+Ray job, which does *not* inherit your shell's environment — so `FOO=1 chia job
+submit …` has no effect. Forward variables through the job's runtime env instead:
 
 ```bash
-chia job submit -- python "$(pwd)/examples/memcpy/memcpy_loop.py" --llm claude    # default
-chia job submit -- python "$(pwd)/examples/memcpy/memcpy_loop.py" --llm opencode
+chia job submit \
+  --runtime-env-json '{"env_vars": {"MEMCPY_NUM_DEBUG_ATTEMPTS": "5"}}' \
+  -- python "$(pwd)/examples/memcpy/memcpy_loop.py"
 ```
 
-`cluster.yaml` defines both an `llm` (Claude Code) node and an `opencode`
-(OpenCode) node — keep both up and pick per run with `--llm`, or comment out the
-one you won't use. The chosen backend's node must be running, or the dispatch
-will block waiting for its resource (`llm` / `opencode_creds`). Both backends
-edit the chipyard checkout through the same `chipyard_bash` MCP tool (for
-OpenCode its built-in file tools are disabled via a `permission` block, so edits
-land on the chipyard container and not the opencode worker's own filesystem).
-Claude shares one resumable session across implement + debug; session
-persistence for OpenCode is in development (each opencode call is currently
-independent, with the full failure context re-supplied inline to every debug
-call).
+(`env_vars` merges with the loop's own `RUNTIME_ENV`, unlike `--working-dir`.)
+
+### Choosing the LLM backend
+
+The implement/debug nodes can run on **Claude Code**, **OpenCode** or **Google
+Antigravity** (Gemini), selected per run with `--llm`:
+
+```bash
+chia job submit -- python "$(pwd)/examples/memcpy/memcpy_loop.py" --llm claude       # default
+chia job submit -- python "$(pwd)/examples/memcpy/memcpy_loop.py" --llm opencode
+chia job submit -- python "$(pwd)/examples/memcpy/memcpy_loop.py" --llm antigravity
+```
+
+`cluster.yaml` defines one node per backend — `llm` (Claude Code), `opencode`
+(OpenCode) and `antigravity` (Antigravity CLI, mounting your `agy` sign-in from
+`${HOME}/.gemini`) — keep them all up and pick per run with `--llm`, or
+comment out the ones you won't use. The chosen backend's node must be running, or
+the dispatch will block waiting for its resource (`llm` / `opencode_creds` /
+`antigravity_creds`). All backends edit the chipyard checkout through the same
+`chipyard_bash` MCP tool (for OpenCode its built-in file tools are disabled via a
+`permission` block, so edits land on the chipyard container and not the opencode
+worker's own filesystem). Models: `MEMCPY_LLM_MODEL` (Claude, default
+`claude-opus-4-6`), `MEMCPY_OPENCODE_MODEL` (opencode `provider/model`, see
+below), `MEMCPY_ANTIGRAVITY_MODEL` (default `gemini-3.1-pro-high` — Gemini Pro is
+only served from the `global` location, so choose that at `agy` sign-in).
+Claude and Antigravity each share one resumable session across implement +
+debug (Claude via `--resume`, Antigravity via `--conversation`, with the
+transcript carried across workers in both cases); (each opencode call is currently independent). The
+full failure context is re-supplied inline to every debug call regardless.
+
+#### OpenCode: any provider, e.g. Gemini on Vertex AI
+
+OpenCode is provider-agnostic: `MEMCPY_OPENCODE_MODEL` is any `provider/model`
+opencode knows (`anthropic/claude-opus-4-6`, `openai/gpt-5`,
+`google-vertex/gemini-3.1-pro-preview`, a custom endpoint, …), and the
+**opencode node** must carry that provider's credentials — mount opencode's own
+`opencode auth login` state, pass an API key, etc. The `opencode` node in
+`cluster.yaml` has a "Provider credentials" block with examples. Most providers
+need nothing else; providers that need extra config are handled in `llm.py`
+(`_OPENCODE_PROVIDER_CONFIG`) and applied only when the chosen model uses them.
+
+Worked example — Gemini on Vertex AI (the one wired up out of the box):
+
+1. Host: `gcloud auth application-default login`, then
+   `gcloud auth application-default set-quota-project <project>`; Vertex AI API
+   enabled on that project. Note ADC is independent of the `gcloud` CLI's active
+   account — check which identity it carries with
+   `curl "https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=$(gcloud auth application-default print-access-token)"`.
+2. `export GOOGLE_CLOUD_PROJECT=<project>` before `chia up` (the cluster mounts
+   `${HOME}/.config/gcloud` for ADC and forwards the project).
+3. Submit with the model and project in the job env:
+
+```bash
+chia job submit \
+  --runtime-env-json "{\"env_vars\": {\"MEMCPY_OPENCODE_MODEL\": \"google-vertex/gemini-3.1-pro-preview\", \"GOOGLE_CLOUD_PROJECT\": \"$GOOGLE_CLOUD_PROJECT\"}}" \
+  -- python "$(pwd)/examples/memcpy/memcpy_loop.py" --llm opencode
+```
+
+`llm.py` pins the project and location (`MEMCPY_OPENCODE_VERTEX_LOCATION`,
+default `global` — Gemini Pro is only served there) into the opencode config so
+the model is served from the intended endpoint regardless of the container env.

@@ -2,10 +2,15 @@
 
   chia up cluster.yaml                            # 2 LLM + 2 CIRCT workers (1 host)
   GITHUB_TOKEN=... ./fix_issues_submit.sh --max-issues 5
+  chia up cluster_antigravity.yaml                # same, but Gemini via Antigravity
+  GITHUB_TOKEN=... ./fix_issues_submit.sh --max-issues 5 --backend antigravity
+  chia up cluster_opencode_vertex.yaml            # same, but OpenCode + Gemini on Vertex
+  GITHUB_TOKEN=... ./fix_issues_submit.sh --max-issues 5 --backend opencode
 
 Triage open issues (from config.GITHUB_REPO) on the head, fan one
 run_issue_remote task per candidate across the CIRCT containers, prompt via
-chia.models.claude (dispatched onto the llm workers), and persist the local diff
+chia.models.claude (or chia.models.antigravity / chia.models.opencode via
+--backend; either way dispatched onto the llm workers), and persist the local diff
 + the PR writeup it WOULD submit. No GitHub writes.
 """
 from __future__ import annotations
@@ -13,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from pathlib import Path
 
 import ray
@@ -46,7 +52,27 @@ TRIAGE_POOL   = 2000  # cover the full open backlog (~857); listed w/o comments,
 TRIAGE_LABELS = []   # no label gate — the assess phase decides bug-ness per issue
 REQUIRE_REPRO = True
 
+LLM_BACKEND = "claude"       # --backend: "claude" (default) | "antigravity" | "opencode"
 LLM_MODEL  = "claude-opus-4-6"
+# Newest Gemini Pro exposed by the Antigravity CLI (`agy models`); the suffix is
+# agy's reasoning-effort tier, so no separate --effort flag is needed. Pro is
+# only served from the `global` endpoint: with ~/.gemini/antigravity-cli/
+# settings.json pinned to gcp.location "us"/"eu" agy fails with "Selected model
+# is not supported in the selected location" (Flash models work everywhere).
+# Set "location": "global" there, or log out/in and pick global.
+ANTIGRAVITY_MODEL = "gemini-3.1-pro-high"
+# OpenCode (chia.models.opencode) with Gemini on Vertex AI: opencode's built-in
+# `google-vertex` provider, model given as provider/model. The project +
+# location are pinned in the opencode config we write (not just env) so Pro is
+# served from `global` regardless of the container env. Auth is Google ADC
+# mounted into the llm containers (see cluster_opencode_vertex.yaml). The GCP
+# project is site-specific, so like GITHUB_TOKEN it comes from the environment
+# (GOOGLE_CLOUD_PROJECT, also what the cluster yaml forwards) or --vertex-project.
+OPENCODE_MODEL           = "google-vertex/gemini-3.1-pro-preview"
+OPENCODE_VERTEX_PROJECT  = os.environ.get("GOOGLE_CLOUD_PROJECT")
+OPENCODE_VERTEX_LOCATION = "global"
+BACKEND_DEFAULT_MODEL = {"claude": LLM_MODEL, "antigravity": ANTIGRAVITY_MODEL,
+                         "opencode": OPENCODE_MODEL}
 BUILD_JOBS = 16
 TIMEOUTS   = {"assess": 1800, "repro": 1800, "fix": 7200, "regression": 3600, "writeup": 1200}
 PENDING_TIMEOUT_S = 1800      # chia_wait stuck-task detection / retry threshold
@@ -58,7 +84,9 @@ _P = FLOW_DIR / "prompts"
 CFG = {
     "tag": CIRCT_TAG, "tool_targets": TOOL_TARGETS, "repro_dir": REPRO_DIR,
     "repro_path": REPRO_PATH, "require_repro": REQUIRE_REPRO,
-    "model": LLM_MODEL, "build_jobs": BUILD_JOBS, "timeouts": TIMEOUTS,
+    "backend": LLM_BACKEND, "model": LLM_MODEL,
+    "vertex": {"project": OPENCODE_VERTEX_PROJECT, "location": OPENCODE_VERTEX_LOCATION},
+    "build_jobs": BUILD_JOBS, "timeouts": TIMEOUTS,
     "system_prompt":  (_P / "system.md").read_text(),
     "assess_prompt":  (_P / "assess.md").read_text(),
     "repro_prompt":   (_P / "reproduce.md").read_text(),
@@ -98,19 +126,25 @@ def _persist(issue, res: dict) -> None:
         art.joinpath("fix.diff").write_text(res["diff"])
     if res.get("writeup"):
         art.joinpath("pr_writeup.md").write_text(res["writeup"])
-    art.joinpath("verdict.json").write_text(json.dumps(
-        {k: res.get(k) for k in ("status", "reproduced", "build_ok", "fixed",
-                                 "lit_ok", "lit_passed", "lit_failed",
-                                 "lit_failures", "added", "removed", "test_paths",
-                                 "notes")},
-        indent=2))
+    verdict = {k: res.get(k) for k in ("status", "reproduced", "build_ok", "fixed",
+                                       "lit_ok", "lit_passed", "lit_failed",
+                                       "lit_failures", "added", "removed", "test_paths",
+                                       "notes")}
+    # Per-phase token/cost usage for backends that report it (antigravity, opencode).
+    usage = {phase: blob["usage"] for phase, blob in (res.get("logs") or {}).items()
+             if blob.get("usage")}
+    if usage:
+        verdict["llm_usage"] = usage
+    art.joinpath("verdict.json").write_text(json.dumps(verdict, indent=2))
     for phase, blob in (res.get("logs") or {}).items():
         art.joinpath(f"llm_{phase}.md").write_text(blob.get("stream") or blob.get("result") or "")
         if blob.get("stderr"):
             art.joinpath(f"llm_{phase}.stderr").write_text(blob["stderr"])
         tr = blob.get("transcript")
         if isinstance(tr, (bytes, bytearray)) and tr:
-            art.joinpath(f"llm_{phase}.jsonl").write_bytes(tr)   # full raw session transcript
+            # full raw session transcript: claude .jsonl / antigravity SQLite .db
+            ext = blob.get("transcript_ext", "jsonl")
+            art.joinpath(f"llm_{phase}.{ext}").write_bytes(tr)
     rf = res.get("repro_files") or {}
     if rf:
         rdir = art / "repro"
@@ -125,7 +159,7 @@ def _persist(issue, res: dict) -> None:
         art.joinpath("verify_repro.log").write_text(res["repro_tail"])
     if res.get("lit_tail"):
         art.joinpath("verify_lit.log").write_text(res["lit_tail"])
-    db.record(issue, res, LLM_MODEL, str(art))
+    db.record(issue, res, CFG["model"], str(art))
     logger.info("issue #%d -> %s  (+%s/-%s, lit_ok=%s)", issue.number, res.get("status"),
                 res.get("added"), res.get("removed"), res.get("lit_ok"))
 
@@ -140,7 +174,33 @@ def main() -> None:
     ap.add_argument("--assess-only", type=int, default=None, metavar="N",
                     help="run ONLY the assess turn for issue N; print the decision "
                          "and exit. Writes nothing to issue_logs or the DB.")
+    ap.add_argument("--backend", choices=sorted(BACKEND_DEFAULT_MODEL), default=None,
+                    help="LLM backend: claude (default; cluster.yaml), antigravity "
+                         "(Google Antigravity CLI / Gemini; cluster_antigravity.yaml) "
+                         "or opencode (OpenCode CLI with Gemini on Vertex AI; "
+                         "cluster_opencode_vertex.yaml)")
+    ap.add_argument("--antigravity", action="store_true", help="alias for --backend antigravity")
+    ap.add_argument("--model", default=None,
+                    help="override the model id for the chosen backend (defaults: "
+                         + ", ".join(f"{k}={v}" for k, v in BACKEND_DEFAULT_MODEL.items()) + ")")
+    ap.add_argument("--vertex-project", default=None,
+                    help="opencode backend: GCP project for Vertex AI (default: $GOOGLE_CLOUD_PROJECT)")
+    ap.add_argument("--vertex-location", default=None,
+                    help=f"opencode backend: Vertex AI location (default {OPENCODE_VERTEX_LOCATION}; "
+                         "Gemini Pro is served from `global` only)")
     args = ap.parse_args()
+
+    backend = args.backend or ("antigravity" if args.antigravity else LLM_BACKEND)
+    CFG["backend"], CFG["model"] = backend, BACKEND_DEFAULT_MODEL[backend]
+    if args.model:
+        CFG["model"] = args.model
+    if args.vertex_project:
+        CFG["vertex"]["project"] = args.vertex_project
+    if args.vertex_location:
+        CFG["vertex"]["location"] = args.vertex_location
+    if backend == "opencode" and not CFG["vertex"]["project"]:
+        ap.error("--backend opencode needs a GCP project: pass --vertex-project or set GOOGLE_CLOUD_PROJECT")
+    logger.info("LLM backend=%s model=%s", CFG["backend"], CFG["model"])
 
     ray.init(address="auto",
              runtime_env={"py_modules": _PY_MODULES,

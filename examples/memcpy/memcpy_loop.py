@@ -313,10 +313,12 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="MemCpy RoCC agentic build/run/debug loop")
     parser.add_argument(
-        "--llm", choices=["claude", "opencode"], default="claude",
+        "--llm", choices=["claude", "opencode", "antigravity"], default="claude",
         help="LLM backend for the implement/debug nodes: 'claude' (Claude Code, "
-             "dispatched to the llm node, default) or 'opencode' (dispatched to "
-             "the opencode node). The chosen backend's node must be up in the cluster.",
+             "dispatched to the llm node, default), 'opencode' (dispatched to "
+             "the opencode node) or 'antigravity' (Google Antigravity CLI / Gemini, "
+             "dispatched to the antigravity node). The chosen backend's node must "
+             "be up in the cluster.",
     )
     args = parser.parse_args()
     run_loop(llm_backend=args.llm)

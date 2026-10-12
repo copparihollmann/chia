@@ -1,0 +1,86 @@
+# Fully managed tailnet cluster, GCP edition: CHIA runs tailscale on EVERY
+# machine — the head (which also hosts a colocated worker), an on-prem
+# worker, and a Compute Engine worker — no manual tailscaled anywhere.
+# The gcp_nodes analog of cluster_ec2_fullymanaged.yaml. Environment
+# variables to set before `chia up` / `chia down`:
+#   HEAD_IP      how CHIA SSHes to the head (its real IP/hostname)
+#   WORKER_IP    the on-prem worker's real IP/hostname (NOT its tailscale
+#                address — tailscale can't be bootstrapped over tailscale,
+#                so managed machines must be ordinarily SSH-reachable)
+#   TS_AUTHKEY   reusable tailscale auth key, e.g.:
+#                export TS_AUTHKEY=$(cat examples/tailscale/keyfile)
+#   GCP_PROJECT  the GCP project the VM is created (and billed) in
+#   GCP_SSH_KEY  private key whose .pub is injected into the VM's metadata
+#                and which CHIA's SSH client uses, e.g. ${HOME}/.ssh/id_ed25519
+#
+# GCP API access comes from Application Default Credentials on the machine
+# running `chia up`: `gcloud auth application-default login` (+ `gcloud auth
+# application-default set-quota-project $GCP_PROJECT`), or point
+# GOOGLE_APPLICATION_CREDENTIALS at a service-account key. Needs
+# `pip install google-cloud-compute`, the Compute Engine API enabled, and an
+# identity that can create instances and firewall rules in the project.
+# Unlike EC2 there is no cloud-registered key pair: CHIA injects
+# `<ssh_user>:<GCP_SSH_KEY>.pub` via instance metadata and the guest agent
+# creates the user (set `use_os_login: true` instead if your org enforces OS
+# Login — then register the key with `gcloud compute os-login ssh-keys add`
+# and set ssh_user to your OS Login posix username).
+
+cluster_name: TailscaleFullyManagedGCP
+
+tailnet:
+    manage_all: true
+    auth_key: ${TS_AUTHKEY}
+    # head_tailnet_ip is omitted — discovered when CHIA joins the head.
+    # A non-default proxy port keeps this cluster's daemons fully
+    # independent of any personally-run tailscaled (which typically
+    # serves 1055). Binaries/state live in /tmp/<cluster_name>/tailscale.
+    socks_proxy: 127.0.0.1:1155
+
+provider:
+    head_ip: ${HEAD_IP}
+
+auth:
+    ssh_user: ${USER}
+
+gcp_nodes:
+    project: ${GCP_PROJECT}
+    zone: us-central1-a               # default zone; per-type `zone:` overrides
+    # network / subnetwork default to the project's `default` VPC.
+    gcp_worker:
+        machine_type: e2-small
+        count: 1
+        image: projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts
+        disk_size_gb: 24
+        spot: false                   # true = Spot VM (cheaper, may be reclaimed)
+        ssh_user: chia                # local user the guest agent creates on the VM
+        ssh_private_key: ${GCP_PRIVATE_KEY_PATH} # public key can be derived from the private key
+
+available_node_types:
+
+    head_worker:
+        resources: {"head_worker": 4}
+        num_workers: 1
+        compatible_ips: ["${HEAD_IP}"]
+        worker_env_commands: ["source ~/.bashrc && conda activate chia_env"]
+
+    tailscale_worker:
+        resources: {"tailscale_worker": 4}
+        num_workers: 1
+        compatible_ips: ["${WORKER_IP}"]
+        worker_env_commands: ["source ~/.bashrc && conda activate chia_env"]
+
+    gcp_worker:
+        resources: {"gcp_worker": 2}
+        num_workers: 1
+        compatible_ips: ["@gcp_worker:0"]
+        worker_env_commands: ["source ~/.bashrc && conda activate chia_env"]
+
+head_env_commands: ["source ~/.bashrc && conda activate chia_env"]
+
+head_start_ray_commands:
+    - ray stop
+    - ray start --head --port=6379 --dashboard-agent-listen-port=0 --resources='{"head":4}'
+
+worker_start_ray_commands:
+    - ray stop
+    - ray start --address=$RAY_HEAD_IP:6379 --dashboard-agent-listen-port=0

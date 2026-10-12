@@ -8,6 +8,7 @@ name: CIRCT Image
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 env:
   IMAGE: ghcr.io/ucb-bar/chia-circt
@@ -33,6 +34,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # On a tag push this adds the tag verbatim (v1.2.3), so every image
+      # carries the same version string as the released chialoops.
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=build-${{ github.run_id }}
+            type=ref,event=tag
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
@@ -42,9 +55,10 @@ jobs:
           # build-chia-circt-base.yml should propagate to the next build.
           pull: true
           push: true
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:build-${{ github.run_id }}
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            CHIA_REVISION=${{ github.sha }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
 

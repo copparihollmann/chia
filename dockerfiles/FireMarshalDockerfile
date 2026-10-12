@@ -7,7 +7,8 @@
 # requiring a prebuilt one. Run the worker --privileged (loop-mount compose).
 #
 #   docker build -f dockerfiles/FireMarshalDockerfile -t chia-firemarshal:local .
-FROM ghcr.io/ucb-bar/chia-chisel-build:latest
+ARG BASE_IMAGE=ghcr.io/ucb-bar/chia-chisel-build:latest
+FROM ${BASE_IMAGE}
 
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \

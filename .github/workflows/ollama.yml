@@ -2,6 +2,7 @@ name: Ollama Image
 
 on:
   workflow_dispatch:
+  workflow_call:
 
 env:
   IMAGE: ghcr.io/ucb-bar/chia-ollama
@@ -81,10 +82,21 @@ jobs:
             dated="${IMAGE}:${sfx}-build-${{ github.run_id }}"
             cache="${IMAGE}:${sfx}-buildcache"
           fi
+          # On a release tag each variant also gets the version (:v1.2.3 /
+          # :rocm-v1.2.3), so both can be pinned alongside the other images.
+          versioned=""
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            if [ -z "$sfx" ]; then
+              versioned="${IMAGE}:${{ github.ref_name }}"
+            else
+              versioned="${IMAGE}:${sfx}-${{ github.ref_name }}"
+            fi
+          fi
           {
             echo "tags<<TAGS_EOF"
             echo "$rolling"
             echo "$dated"
+            if [ -n "$versioned" ]; then echo "$versioned"; fi
             echo "TAGS_EOF"
             echo "cache=$cache"
           } >> "$GITHUB_OUTPUT"
@@ -96,8 +108,12 @@ jobs:
           context: .
           push: true
           build-args: |
+            CHIA_REVISION=${{ github.sha }}
             OLLAMA_BASE=${{ matrix.ollama_base }}
           tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/ucb-bar/chia
           # Separate buildcache per variant so the NVIDIA and ROCm bases don't
           # clobber each other's layers.
           cache-from: type=registry,ref=${{ steps.tags.outputs.cache }}

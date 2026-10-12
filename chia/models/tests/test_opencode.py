@@ -36,6 +36,7 @@ import pytest
 
 from chia.models import opencode as oc_mod
 from chia.models.opencode import (
+    OpenCodeQueryResult,
     AuthenticationError,
     BillingError,
     QueryResult,
@@ -162,6 +163,39 @@ def _install_fake_subprocess(monkeypatch, *, run_stdout, export_obj,
 # ---------------------------------------------------------------------------
 # Offline unit tests
 # ---------------------------------------------------------------------------
+
+
+def test_export_renders_per_step_usage_and_result_summary():
+    llm = OpenCodeLLM(model="anthropic/claude-sonnet-4-6")
+    text, meta, stream, err = llm._extract_from_export(_export_obj(tool="bash"))
+    assert err is None and text == "PONG"
+    # Per-step metrics from the step-finish part, in the transcript...
+    assert '[Usage]\n{"input": 3, "output": 6, "reasoning": 0, "cache": {"read": 8280, "write": 0}, "cost_usd": 0.0026}' in stream
+    # ...after the tool call/result and response of that step...
+    assert stream.index("[Tool Result]") < stream.index("[Usage]")
+    assert stream.index("[Response]") < stream.index("[Usage]")
+    # ...and a closing summary carrying the run totals.
+    assert stream.rstrip().endswith("[Result]\n" + json.dumps(meta))
+    assert meta == {"input_tokens": 3, "output_tokens": 6, "cache_read": 8280,
+                    "cost_usd": 0.0026, "num_turns": 1}
+
+
+def test_run_result_carries_usage_and_session_id(monkeypatch):
+    llm = OpenCodeLLM(model="anthropic/claude-sonnet-4-6")
+    _install_fake_subprocess(
+        monkeypatch,
+        run_stdout=_step_start("ses_test123"),
+        export_obj=_export_obj(tokens={"input": 10, "output": 4}, cost=0.01),
+        capture={"calls": []},
+    )
+    cli = llm.prompt("hi", tools=[])
+    assert isinstance(cli, OpenCodeQueryResult) and cli.success
+    assert cli.provider_usage == {"input_tokens": 10, "output_tokens": 4, "cost_usd": 0.01, "num_turns": 1}
+    # The same numbers the profiler sees (plus model/tools) live in _last_metadata.
+    assert all(llm._last_metadata[k] == v for k, v in cli.provider_usage.items())
+    assert cli.usage.input_tokens == 10 and cli.usage.output_tokens == 4
+    assert cli.session_id == "ses_test123"
+    assert "[Usage]" in cli.stream_result and "[Result]" in cli.stream_result
 
 
 def test_constructor_defaults():

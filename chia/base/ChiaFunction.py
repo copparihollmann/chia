@@ -391,6 +391,18 @@ def _try_proxy(func, opts, bypass_state, hooks, args, kwargs, display_name):
         func, full_opts, bypass_state, hooks, profile, args, kwargs)
 
 
+def _setup_worker_logging() -> None:
+    """Show a task's INFO logs: a Ray worker has no log handler, so Python drops
+    everything below WARNING. Adds one handler per worker."""
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(levelname)s [%(name)s] %(message)s"))
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
+
+
 def _chia_trampoline(func, _chia_bypass_state_, _chia_hooks_, *args, **kwargs):
     """Trampoline function used by ChiaFunction to dispatch remote calls.
 
@@ -400,6 +412,7 @@ def _chia_trampoline(func, _chia_bypass_state_, _chia_hooks_, *args, **kwargs):
     callables. Both are attached by chia_remote() and named with underscores to
     avoid collisions with user function parameters.
     """
+    _setup_worker_logging()
     _restore_bypass(_chia_bypass_state_)
     from chia.base.pid_registry import _pid_tracking_scope
     _run_chia_setup(_chia_hooks_)
@@ -417,6 +430,7 @@ def _chia_trampoline_profiled(func, call_id, dispatch_meta, _chia_bypass_state_,
     event at function end, both from the worker.  Returns a
     ``_ProfiledResult`` that ``get()`` unwraps transparently.
     """
+    _setup_worker_logging()
     _restore_bypass(_chia_bypass_state_)
     import time as _time
     from chia.trace.profiler import _ProfiledResult, get_profiler

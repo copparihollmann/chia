@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import os
 import json
 import re
 import shlex
@@ -181,8 +182,7 @@ def add_nodes_to_cluster(
     if config.tailnet_config is not None:
         raise RuntimeError(
             "chia up --add is not yet supported for tailnet clusters — "
-            "re-run a full 'chia up' instead (existing workers are detected "
-            "and skipped).")
+            "run a full 'chia down' and 'chia up' instead")
 
     logger.info(f"Adding {len(new_assignments)} new worker(s) to cluster")
 
@@ -340,12 +340,21 @@ def allocate_worker_tunnels(
     next_addr = ipaddress.IPv4Address("127.0.0.2")
     ip_worker_count: dict[str, int] = defaultdict(int)
     global_tool_index = 0
+    # Another cluster on this head allocates from the same ranges: skip what its tunnels hold.
+    foreign = _foreign_tunnel_binds(tunneled_ips)
+    head_addr = socket.gethostbyname(config.head_ip)
 
     for a in assignments:
         if a.ip not in tunneled_ips:
             continue
 
         base_tc = config.get_tunnel_config(a.ip) or TunnelConfig()
+        while any(addr == str(next_addr) for addr, _ in foreign):
+            next_addr += 1
+        while any((head_addr, port) in foreign for port in range(
+                base_tc.tool_port_min + global_tool_index * _PORT_STEP_DEFAULT,
+                base_tc.tool_port_max + global_tool_index * _PORT_STEP_DEFAULT + 1)):
+            global_tool_index += 1
         # Per-IP offset for Ray/GCS ports (bind on unique tun_ip per worker).
         ray_offset = ip_worker_count[a.ip] * _PORT_STEP_DEFAULT
         worker_offset = ip_worker_count[a.ip] * _PORT_STEP_WORKER
@@ -371,6 +380,24 @@ def allocate_worker_tunnels(
             next_addr += 1
 
     return result
+
+
+def _foreign_tunnel_binds(own_ips: set[str]) -> set[tuple[str, int]]:
+    """Head-side (address, port) binds of live ``ssh -N`` tunnels to machines outside *own_ips*."""
+    binds: set[tuple[str, int]] = set()
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                args = [a for a in f.read().decode().split("\0") if a]
+        except OSError:
+            continue
+        if args[:2] != ["ssh", "-N"] or args[-1].rsplit("@", 1)[-1] in own_ips:
+            continue
+        for flag, spec in zip(args, args[1:]):
+            if flag == "-L":
+                addr, port = spec.split(":")[:2]
+                binds.add((addr, int(port)))
+    return binds
 
 
 def _make_ssh(config: ClusterConfig, ip: str) -> SSHClient:
@@ -399,17 +426,27 @@ def _rsync_file_mounts(ssh: SSHClient, config: ClusterConfig) -> None:
         )
 
 
-def _grpc_proxy_exports(tn, own_advertise_ip: str) -> list[str]:
+def _grpc_proxy_exports(tn, no_proxy_ips: str) -> list[str]:
     """Env exports that route Ray's gRPC through the per-machine CONNECT
-    proxy. ``no_grpc_proxy`` excludes this participant's own advertise
-    IP so same-machine self-dials go direct to the wildcard bind — which
-    also lets the head's Ray start before its proxy is up (it does no
-    cross-machine dials until workers join).
+    proxy. ``no_grpc_proxy`` (a single IP or comma-separated list)
+    excludes this participant's local advertise IP(s) so same-machine
+    dials go direct to the wildcard bind — which also lets the head's
+    Ray start before its proxy is up (it does no cross-machine dials
+    until workers join).
+
+    ``127.0.0.1``/``localhost`` are always excluded too: grpc_proxy
+    applies to EVERY gRPC channel in the process, including Ray's
+    node-local agent dials (e.g. each worker's metrics exporter dials
+    the dashboard agent at 127.0.0.1:<port>). Those destinations are
+    never in the relay's routes — proxied, they die with "502 No Route"
+    (surfacing as "Failed to establish connection to the metrics
+    exporter agent", rpc_code 14) — and a dial to literal 127.0.0.1 is
+    by definition node-local, so direct is always correct.
     """
     return [
         "export RAY_grpc_enable_http_proxy=1",
         f"export grpc_proxy=http://127.0.0.1:{tn.connect_proxy_port}",
-        f"export no_grpc_proxy={own_advertise_ip}",
+        f"export no_grpc_proxy={no_proxy_ips},127.0.0.1,localhost",
     ]
 
 
@@ -483,7 +520,10 @@ def build_worker_script(
     When *tailnet_alloc* is provided the worker joins over the tailscale
     network: it registers under its advertised loopback IP, dials the
     head GCS at the head's advertised loopback IP (served by the local
-    relay), and pins its ports to the allocated block.
+    relay), and pins its ports to the allocated block.  Workers
+    colocated on the head machine get an alloc too — for them the head
+    advertise IP is a local bind, so it is added to ``no_grpc_proxy``
+    and dialed directly.
 
     Non-tunneled workers let Ray auto-assign ports to avoid conflicts
     (especially when multiple --net=host containers share the same host).
@@ -514,7 +554,11 @@ def build_worker_script(
         # Tools on this worker advertise its loopback IP — reachable from
         # every machine in the cluster via the relays (no rewrite/relay-host needed).
         script.append(f"export CHIA_TOOL_ADVERTISE_HOST={adv_ip}")
-        script.extend(_grpc_proxy_exports(tn, adv_ip))
+        # A head-colocated worker shares the machine with the head, so
+        # the head's advertise IP is a local wildcard bind too — dial it
+        # direct rather than hairpinning GCS traffic through the relay.
+        no_proxy = f"{adv_ip},{tn.head_advertise_ip}" if is_head_ip else adv_ip
+        script.extend(_grpc_proxy_exports(tn, no_proxy))
     elif tunnel_config is not None:
         tun_ip = tunnel_config.tunnel_ip
         script.append(f"export RAY_HEAD_IP={tun_ip}")
@@ -792,7 +836,11 @@ def bring_up_cluster(config: ClusterConfig) -> TunnelManager | None:
     # Relays are addressed by CLUSTER address (SSH), which for managed
     # cloud machines differs from their tailnet IP.
     if tailnet_allocs:
-        tailnet_host_ips = sorted({key[0] for key in tailnet_allocs})
+        # Head-colocated workers are served by the head relay (started
+        # below with host_ip=None) — starting a second relay for the
+        # head's IP would pkill and replace it.
+        tailnet_host_ips = sorted(
+            {key[0] for key in tailnet_allocs} - {config.head_ip})
         with log_phase(logger, f"Starting tailnet relay on head {config.head_ip}"):
             start_relay(_make_ssh(config, config.head_ip),
                         build_relay_spec(config, tailnet_allocs, None))

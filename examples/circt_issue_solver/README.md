@@ -46,7 +46,8 @@ If you have a non-default claude credential install location, change the first p
      failing tests to repair without un-fixing the bug.
    - **writeup** — the PR description it would submit.
 3. **Persist** (head): `issue_logs/issue_<N>/` (`fix.diff`, `pr_writeup.md`,
-   `verdict.json`, per-phase `llm_*.md` / `.jsonl`) + a row in `issues.db`.
+   `verdict.json`, per-phase `llm_*.md` + the raw session transcript — `.jsonl`
+   for Claude, agy's SQLite `.db` for Antigravity) + a row in `issues.db`.
 
 ### Review flow (`review_loop.py` → `review_task.py`)
 `./review_submit.sh --pr <PR#>:<ISSUE#>` reconstructs the PR (its current diff
@@ -58,6 +59,33 @@ over the reviewer comments *and* failing CI checks. A PR that is simply red in C
 Prompting uses `chia.models.claude`: each per-issue task dispatches
 its `prompt` onto an `llm` worker (1.0/call), while the bash/build/lit MCP servers
 stay on the CIRCT worker and are reached over HTTP.
+
+**Other backends (`--backend`):** the default is Claude (`cluster.yaml`).
+- `--backend antigravity` (alias `--antigravity`) prompts through `chia.models.antigravity`
+  (Google's `agy` CLI) with the newest Gemini Pro (`gemini-3.1-pro-high`). Bring the
+  cluster up with `cluster_antigravity.yaml` — it swaps the llm containers to
+  `chia-antigravity` and mounts `~/.gemini` (sign in with `agy` on the host first).
+  Pro is served from Google's `global` endpoint: if
+  `~/.gemini/antigravity-cli/settings.json` has `"gcp": {"location": "us"}`
+  agy fails with *"Selected model is not supported in the selected location"* — set
+  `"location": "global"` (or `agy` log out/in and choose global).
+- `--backend opencode` prompts through `chia.models.opencode` (the OpenCode CLI) using
+  its built-in `google-vertex` provider — Gemini on Vertex AI, default model
+  `google-vertex/gemini-3.1-pro-preview`, project/location from
+  `--vertex-project` or the OPENCODE_VERTEX_PROJECT var in circt_issue_loop.py / `--vertex-location` 
+  (default `global`). Bring
+  the cluster up with `cluster_opencode_vertex.yaml`: `chia-opencode` llm containers
+  with the host's `~/.config/gcloud` (ADC) mounted. Host prep:
+  `gcloud auth application-default login` +
+  `gcloud auth application-default set-quota-project <project>`, Vertex AI API
+  enabled on the project. Note ADC is independent of the `gcloud` CLI's active
+  account (`gcloud auth list`); check which identity ADC really carries with
+  `curl "https://www.googleapis.com/oauth2/v3/tokeninfo?access_token=$(gcloud auth application-default print-access-token)"`. OpenCode's own file/shell tools are denied so the agent
+  only acts through the bash/build/lit MCP tools on the CIRCT worker.
+
+`--model <id>` overrides the model of whichever backend is selected. Bring the cluster up with `cluster_antigravity.yaml` instead
+of `cluster.yaml` — it swaps the llm containers to `chia-antigravity` and mounts
+`~/.gemini` (sign in with `agy` on the host first).
 
 ## Layout
 
@@ -72,7 +100,9 @@ stay on the CIRCT worker and are reached over HTTP.
 | `circt_util.py` | circt worker | flow-specific CIRCT ops (git reset/apply/diff, repro, lit-gate policy); re-exports the build/test primitives from `chia/chia/chipyard/circt.py` |
 | `chia/chia/chipyard/circt.py` | circt worker (pkg) | canonical CIRCT primitives + the `BuildTool` / `LitTool` MCP tools (ships in the chia package) |
 | `prompts/` | head (read) | per-phase prompts (assess/reproduce/fix/regression/writeup/review*) |
-| `cluster.yaml` | — | single-machine: 2 LLM + 2 CIRCT containers |
+| `cluster.yaml` | — | single-machine: 2 LLM (Claude) + 2 CIRCT containers |
+| `cluster_antigravity.yaml` | — | same, LLM containers run Antigravity/Gemini (`--backend antigravity`) |
+| `cluster_opencode_vertex.yaml` | — | same, LLM containers run OpenCode + Gemini on Vertex (`--backend opencode`) |
 
 `circt_util.py` (and the chia package itself) ship to workers via `runtime_env`
 `py_modules`, so head-side edits reach workers on the next submit — no image

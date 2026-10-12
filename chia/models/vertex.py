@@ -151,7 +151,8 @@ class UnknownVertexError(VertexError):
 
 class ContentBlockedError(VertexError):
     """The model returned no usable content because the prompt or the response
-    was blocked (safety, recitation, blocklist, ...).
+    was blocked (safety, recitation, blocklist, ...) or the response was
+    unusable (a malformed function call).
 
     This is NOT an HTTP/API error — Gemini reports it as a 200-OK response whose
     candidate carries a blocking ``finish_reason`` (or whose ``prompt_feedback``
@@ -173,7 +174,7 @@ class ContentBlockedError(VertexError):
 # separately as MaxOutputTokensError).
 _BLOCK_FINISH_REASONS = frozenset({
     "SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII",
-    "IMAGE_SAFETY",
+    "IMAGE_SAFETY", "MALFORMED_FUNCTION_CALL",
 })
 
 
@@ -210,6 +211,11 @@ class VertexGeminiLLM(LLMCallBase):
     Returns the same :class:`QueryResult` shape as the other backends so callers
     are interchangeable; ``returncode`` is synthesised (0 on success, -1 when
     every retry fails) and ``stderr`` is unused.
+
+    ``generation_config`` passes further ``GenerateContentConfig`` fields
+    (``temperature``, ``response_mime_type``, ``thinking_config``, ...); the
+    node's own arguments (``max_tokens``, ``system_message``, tools) take
+    precedence over it.
     """
 
     def __init__(
@@ -226,6 +232,7 @@ class VertexGeminiLLM(LLMCallBase):
         max_tokens: int = 16000,
         max_tool_iterations: int = 100,
         client_kwargs: Optional[dict] = None,
+        generation_config: Optional[dict] = None,
         dangerously_skip_permissions=UNSET,
         config=UNSET,
     ):
@@ -248,6 +255,7 @@ class VertexGeminiLLM(LLMCallBase):
         self.max_tokens = max_tokens
         self.max_tool_iterations = max_tool_iterations
         self.client_kwargs = client_kwargs or {}
+        self.generation_config = generation_config or {}
         self.logger = logging.getLogger(logging_name)
         self._last_metadata: dict = {}
 
@@ -461,6 +469,7 @@ class VertexGeminiLLM(LLMCallBase):
                     dispatch[api_name] = (session, fn.name)
 
             config_kwargs: dict = {
+                **self.generation_config,
                 "max_output_tokens": self.max_tokens,
                 # We run the loop ourselves; don't let the SDK auto-call.
                 "automatic_function_calling": types.AutomaticFunctionCallingConfig(
@@ -477,7 +486,8 @@ class VertexGeminiLLM(LLMCallBase):
                 role="user", parts=[types.Part.from_text(text=user_message)]
             )]
             meta = {"input_tokens": 0, "output_tokens": 0, "num_turns": 0,
-                    "cache_read_input_tokens": 0, "reasoning_tokens": 0}
+                    "cache_read_input_tokens": 0, "reasoning_tokens": 0,
+                    "thinking_tokens": 0}
             final_text = ""
 
             for _ in range(self.max_tool_iterations):
@@ -645,6 +655,7 @@ class VertexGeminiLLM(LLMCallBase):
         meta["cache_read_input_tokens"] += cached
         meta["output_tokens"] += _int("candidates_token_count") + thoughts
         meta["reasoning_tokens"] += thoughts
+        meta["thinking_tokens"] += thoughts
 
     @staticmethod
     def _sanitize_schema(schema):

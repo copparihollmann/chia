@@ -2,6 +2,9 @@ name: Chia Image
 
 on:
   workflow_dispatch:
+  # Release builds come through release-images.yml, which orders this ahead of
+  # the images that derive from it; a tag trigger here would race them.
+  workflow_call:
 
 env:
   IMAGE: ghcr.io/ucb-bar/chia
@@ -48,15 +51,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # On a tag push this adds the tag verbatim (v1.2.3), so every image
+      # carries the same version string as the released chialoops.
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=build-${{ github.run_id }}
+            type=ref,event=tag
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           file: dockerfiles/ChiaDockerfile
           context: .
           push: true
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:build-${{ github.run_id }}
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            CHIA_REVISION=${{ github.sha }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache
           cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache,mode=max
 

@@ -1,5 +1,12 @@
-from dataclasses import dataclass, field
+import json
+import os
+import subprocess
+import tempfile
+from dataclasses import dataclass, field, replace
 from enum import Enum
+
+from chia.aws import AWS_CREDS_RESOURCE
+from chia.base.ChiaFunction import ChiaFunction
 
 
 class BuildTarget(str, Enum):
@@ -60,6 +67,11 @@ class BuildArtifact:
         generated_src_files: ``(filename, contents)`` pairs of generated
             ``.v``/``.sv`` and ``.top.mems.conf`` collateral: populated only
             when the build was run with ``collect_generated_src=True``.
+        runtime_libs: ``(filename, contents)`` shared libraries staged beside
+            the binary at run time - libriscv.so above all. Populated by a
+            dynamic ``golden_model`` build; empty otherwise.
+        golden_model_digest: sha256 of the libriscv the simulator was built
+            against; ``""`` when unknown.
     """
     name: str # default "chipyard"
     simulator_binary_content: bytes  # raw ELF bytes of the compiled simulator binary
@@ -72,6 +84,15 @@ class BuildArtifact:
     stderr: str
     returncode: int
     generated_src_files: list[tuple[str, str]] = field(default_factory=list)  # [(filename, contents)]
+    # Kept inside the simulator's artifact on purpose: an artifact is one
+    # deployable unit, so a binary can never travel without the libraries it
+    # was linked against or be re-paired with a different golden model. A
+    # (sim, spike) bundle type would keep that pairing only by convention -
+    # any caller could assemble mismatched halves - and runtime_libs is not
+    # spike state anyway: it is the binary's own dependency closure per ldd
+    # (libdramsim and libatomic ride along with libriscv).
+    runtime_libs: list[tuple[str, bytes]] = field(default_factory=list)      # [(filename, contents)]: shared libs staged beside the binary
+    golden_model_digest: str = ""                                            # sha256 of the libriscv linked in; "" when unknown
 
 
 @dataclass
@@ -114,12 +135,14 @@ class ProgramBuildArtifact:
         stdout: Captured stdout of the build command.
         stderr: Captured stderr (includes a timeout note on expiry).
         returncode: Exit code of the build command; ``-1`` on timeout.
+        modes: Permission bits of ``files``, same keys.
     """
     files: dict[str, bytes]
     success: bool
     stdout: str
     stderr: str
     returncode: int
+    modes: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -247,20 +270,60 @@ class SpikeResult:
 
 @dataclass
 class SpikeBuildArtifact:
-    """Result of (re)building the Spike simulator binary from source.
+    """Result of a :meth:`SpikeBuildNode.build`: Spike as a shipped artifact,
+    a build input to :class:`ChiselBuildNode` and a runtime input to the
+    worker that runs the simulator.
 
     Attributes:
-        success: True iff ``make`` + install succeeded and the binary exists.
-        spike_bin: Path to the (re)built spike binary (in-container).
+        success: True iff ``make`` produced the library and it is newer than the
+            sources it was built from.
+        lib_name: Filename of the shared library, i.e. ``"libriscv.so"``.
+        lib_content: Raw bytes of the shared library, stripped unless the build
+            was run with ``strip=False``. Empty (``b""``) on failure.
+        static_archives: ``(filename, contents)`` pairs of the archives a static
+            link of the golden model needs - ``libriscv.a`` plus the libraries
+            it does not contain: softfloat above all (libriscv.a carries ~900
+            undefined softfloat references; the *shared* library only looks
+            self-contained because it absorbed them at its own link time), and
+            disasm/fdt. For
+            ``ChiselBuildNode(static_golden_model=True)`` from a container other
+            than the one that built spike. Empty unless the build was run with
+            ``collect_static=True``: these run to ~300MB, and a build that links
+            in the container it built in reads them off disk.
+        tools: ``(filename, contents)`` pairs of spike executables, notably
+            ``spike-dasm``: the run worker disassembles the DUT trace with it,
+            so a custom instruction stays un-disassembled unless the matching
+            one travels with the model. Empty unless ``collect_tools=True``.
+        headers_tar: gzipped tar of ``$RISCV/include/riscv``, needed only to
+            stage this model into a *different* container than the one that
+            built it (cospike compiles against these headers). Empty unless
+            ``collect_headers=True``.
+        source_sha: ``git rev-parse HEAD`` of the riscv-isa-sim checkout, or
+            ``""`` when it is not a git tree.
+        source_dirty: True iff that checkout has uncommitted changes - the
+            normal case while a loop is editing spike, and the reason
+            ``source_sha`` alone does not identify a model.
+        digest: sha256 of ``lib_content``. This, not the SHA, is the golden
+            model's identity: it is what a :class:`BuildArtifact` records and
+            what makes two runs comparable.
+        spike_bin: Path to the spike build directory's library, in-container.
         stdout: Captured stdout of the build command.
         stderr: Captured stderr of the build command.
-        returncode: Exit code of the build command.
+        returncode: Exit code of the build command; ``-1`` on timeout.
     """
-    success: bool          # make+install succeeded and the binary exists
-    spike_bin: str         # path to the (re)built spike binary (in-container)
+    success: bool          # make produced the library and it is newer than its sources
+    lib_name: str          # "libriscv.so"
+    lib_content: bytes     # raw bytes of the shared library (stripped by default)
+    digest: str            # sha256(lib_content): the golden model's identity
+    spike_bin: str         # path to the built library (in-container)
     stdout: str
     stderr: str
     returncode: int
+    static_archives: list[tuple[str, bytes]] = field(default_factory=list)  # [(name, contents)]; empty unless collect_static
+    tools: list[tuple[str, bytes]] = field(default_factory=list)  # [(name, contents)]: spike-dasm etc
+    headers_tar: bytes = b""                                # gz tar of $RISCV/include/riscv; "" unless collect_headers
+    source_sha: str = ""                                    # riscv-isa-sim HEAD; "" when not a git tree
+    source_dirty: bool = False                              # that checkout has uncommitted changes
 
 
 class TortureMode(str, Enum):
@@ -345,34 +408,93 @@ class TortureResult:
 
 @dataclass
 class FireMarshalArtifact:
-    """Result of a :meth:`FireMarshalNode.build_image`: a bootable workload
-    packaged as one portable archive.
+    """A FireSim workload: a sparse gzip tar of its descriptor (``.json``) and
+    the rootfs and boot binary the descriptor names.
 
-    The rootfs, boot binary, and FireSim workload descriptor are packed into a
-    single sparse-aware gzip tar (``archive``) and carried by value, so they move
-    between nodes over Ray with no shared filesystem and no S3. For very large
-    rootfs images, prefer chia's worker-pinned chunked streaming (as
-    ``verilator_run_node`` uses for VCDs) over inlining here.
+    The archive travels by value (``archive``) or by reference (``archive_uri``,
+    an ``s3://`` URI or a local path). A multi-job workload is :meth:`split`
+    into one single-job workload per FPGA; :meth:`publish` stores the archive
+    in S3. For very large rootfs images, prefer chia's worker-pinned chunked
+    streaming (as ``verilator_run_node`` uses for VCDs) over inlining here.
 
     Attributes:
-        archive: ``tar --sparse -czf`` of the ``.img`` + ``-bin`` + ``.json``;
-            ``b""`` on failure. Unpack with ``tar -xzf``.
+        archive: The archive bytes; ``b""`` on failure or when ``archive_uri``
+            carries it.
         img_name: rootfs member filename (``<name>.img``).
         bin_name: boot-binary member filename (``<name>-bin``).
-        json_name: FireSim workload-descriptor member filename (``<name>.json``).
+        json_name: Descriptor member filename (``<name>.json``); found in the
+            archive when empty.
         success: True iff the archive was produced.
         stdout: Captured stdout of the compose/package.
         stderr: Captured stderr (includes a timeout note on expiry).
         returncode: Exit code; ``-1`` on timeout.
+        archive_uri: Where the archive is, when it is not carried by value.
     """
-    archive: bytes
-    img_name: str
-    bin_name: str
-    json_name: str
-    success: bool
-    stdout: str
-    stderr: str
-    returncode: int
+    archive: bytes = b""
+    img_name: str = ""
+    bin_name: str = ""
+    json_name: str = ""
+    success: bool = True
+    stdout: str = ""
+    stderr: str = ""
+    returncode: int = 0
+    archive_uri: "str | None" = None
+
+    def unpack(self, dest: str) -> dict:
+        """Extract the archive into ``dest`` and return its descriptor."""
+        data = self.archive or _read(self.archive_uri)
+        subprocess.run(["tar", "-xzf", "-", "-C", dest], input=data, check=True)
+        json_name = self.json_name or next(f for f in os.listdir(dest) if f.endswith(".json"))
+        with open(os.path.join(dest, json_name)) as f:
+            return json.load(f)
+
+    def split(self) -> "list[FireMarshalArtifact]":
+        """One single-job workload per job; a single-job workload is returned as is."""
+        with tempfile.TemporaryDirectory() as work:
+            descriptor = self.unpack(work)
+            if "workloads" not in descriptor:
+                return [self]
+            jobs = []
+            for job in descriptor["workloads"]:
+                json_name = f"{job['name']}.json"
+                with open(os.path.join(work, json_name), "w") as f:
+                    json.dump({
+                        "benchmark_name": job["name"],
+                        "common_rootfs": job["rootfs"],
+                        "common_bootbinary": job["bootbinary"],
+                        "common_outputs": job.get("outputs", descriptor.get("common_outputs", [])),
+                        "common_simulation_outputs": descriptor.get(
+                            "common_simulation_outputs", ["uartlog"]),
+                    }, f, indent=2)
+                archive = subprocess.run(
+                    ["tar", "--sparse", "-czf", "-", "-C", work,
+                     json_name, job["rootfs"], job["bootbinary"]],
+                    capture_output=True, check=True).stdout
+                jobs.append(FireMarshalArtifact(archive, job["rootfs"], job["bootbinary"], json_name))
+            return jobs
+
+    @ChiaFunction(resources={AWS_CREDS_RESOURCE: 0.01})
+    def publish(self, bucket: str, prefix: str) -> "FireMarshalArtifact":
+        """Upload the archive to ``s3://<bucket>/<prefix>/<name>.tar.gz`` and
+        return a copy that references it."""
+        if not self.archive:
+            return self
+        from chia.aws.s3 import S3Node
+
+        key = f"{prefix.strip('/')}/{os.path.splitext(self.json_name)[0]}.tar.gz"
+        S3Node(bucket).put_bytes(key, self.archive)
+        return replace(self, archive=b"", archive_uri=f"s3://{bucket}/{key}")
+
+
+def _read(uri: str) -> bytes:
+    """Bytes of an ``s3://`` URI or a local path."""
+    if uri.startswith("s3://"):
+        from chia.aws.s3 import S3Node
+
+        bucket, key = uri[len("s3://"):].split("/", 1)
+        return S3Node(bucket).get_bytes(key)
+    with open(uri, "rb") as f:
+        return f.read()
 
 
 @dataclass

@@ -342,6 +342,21 @@ def test_generate_usage_is_absent_field_tolerant(monkeypatch):
     assert cli.usage.cache_read_input_tokens == 0
     assert cli.usage.reasoning_tokens == 0
 
+def test_generation_config_is_passed_through(monkeypatch):
+    capture = {"calls": []}
+    _install_fake_genai(monkeypatch, [_resp([_text_part("{}")])], capture)
+    llm = VertexGeminiLLM(model="m", max_tokens=1234, generation_config={
+        "temperature": 0.7, "response_mime_type": "application/json",
+        "thinking_config": {"thinking_budget": 1024}, "max_output_tokens": 9,
+    })
+    llm.prompt("hi", tools=[])
+    config = capture["calls"][0]["config"]
+    assert config.temperature == 0.7
+    assert config.response_mime_type == "application/json"
+    assert config.thinking_config.thinking_budget == 1024
+    assert config.max_output_tokens == 1234
+    assert config.automatic_function_calling.disable is True
+
 
 def test_generate_tool_loop_executes_mcp_and_feeds_results(monkeypatch):
     capture = {"calls": [], "urls": [], "tool_calls": []}
@@ -378,6 +393,19 @@ def test_generate_tool_loop_executes_mcp_and_feeds_results(monkeypatch):
 
     assert llm._last_metadata["num_turns"] == 2
     assert llm._last_metadata["input_tokens"] == 13
+
+def test_thinking_tokens_count_as_output_and_apart(monkeypatch):
+    # Thinking-model usage reports thoughts_token_count beside candidates_token_count;
+    # the provider bills thoughts as output. They must be in output_tokens (the bill)
+    # and in thinking_tokens (their own line), not silently dropped.
+    capture = {"calls": []}
+    _install_fake_genai(monkeypatch, [_resp([_text_part("ok")], in_tok=10, out_tok=5, thoughts_tok=7)], capture)
+    llm = VertexGeminiLLM(model="m")
+    llm.prompt("hi", tools=[])
+    assert llm._last_metadata["input_tokens"] == 10
+    assert llm._last_metadata["output_tokens"] == 12
+    assert llm._last_metadata["thinking_tokens"] == 7
+
 
 
 def test_generate_unknown_tool_reports_error(monkeypatch):
@@ -439,7 +467,8 @@ def _prompt_block_resp(reason="SAFETY"):
     )
 
 
-@pytest.mark.parametrize("reason", ["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT"])
+@pytest.mark.parametrize("reason", ["SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT",
+                                    "MALFORMED_FUNCTION_CALL"])
 def test_content_block_finish_reason_raises(monkeypatch, reason):
     capture = {"calls": []}
     # Candidate with a blocking finish_reason and no usable parts.

@@ -10,7 +10,14 @@
 #   docker build -f dockerfiles/VerilatorRunDockerfile \
 #       -t ghcr.io/ucb-bar/chia-verilator-run:latest .
 #
-FROM ghcr.io/ucb-bar/chia:latest
+# Both pinned to the released images on a release build: the spike/DRAMSim
+# artifacts copied below must come from the same chipyard build this runs on.
+ARG CHISEL_BUILD_IMAGE=ghcr.io/ucb-bar/chia-chisel-build:latest
+ARG BASE_IMAGE=ghcr.io/ucb-bar/chia:latest
+
+FROM ${CHISEL_BUILD_IMAGE} AS chisel_build
+
+FROM ${BASE_IMAGE}
 
 USER root
 
@@ -47,14 +54,14 @@ RUN add-apt-repository -y ppa:ubuntu-toolchain-r/test \
 # riscv-isa-sim/DRAMSim2 did exactly that): a skewed spike can crash sims or,
 # worse, silently diverge from the one embedded in cospike simulators —
 # libriscv.so IS the golden model.
-COPY --from=ghcr.io/ucb-bar/chia-chisel-build:latest \
+COPY --from=chisel_build \
     /home/ray/chipyard/.conda-env/riscv-tools/lib/libriscv.so \
     /home/ray/chipyard/.conda-env/riscv-tools/lib/libsoftfloat.so \
     /home/ray/chipyard/.conda-env/riscv-tools/lib/libdramsim.so \
     /home/ray/chipyard/.conda-env/riscv-tools/lib/libcustomext.so \
     /home/ray/chipyard/.conda-env/riscv-tools/lib/libspikedevices.so \
     /usr/local/lib/
-COPY --from=ghcr.io/ucb-bar/chia-chisel-build:latest \
+COPY --from=chisel_build \
     /home/ray/chipyard/.conda-env/riscv-tools/bin/spike \
     /home/ray/chipyard/.conda-env/riscv-tools/bin/spike-dasm \
     /usr/local/bin/

@@ -104,3 +104,9 @@ ENV ESP_ROOT=${ESP_HOME}
 ENV PATH="/home/ray/anaconda3/envs/py_worker/bin:${PATH}"
 ENV HOME=/home/espuser
 WORKDIR /home/espuser
+
+# Which chia commit this image carries. Last, so a new revision does not
+# invalidate the install layers above. Reachable from inside a running worker
+# as $CHIA_REVISION; on the manifest as org.opencontainers.image.revision.
+ARG CHIA_REVISION=unknown
+ENV CHIA_REVISION=${CHIA_REVISION}

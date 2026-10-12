@@ -45,3 +45,9 @@ RUN pip install /tmp/chia && rm -rf /tmp/chia
 USER ray
 ENV HOME=/home/ray
 WORKDIR /home/ray
+
+# Which chia commit this image carries. Last, so a new revision does not
+# invalidate the install layers above. Reachable from inside a running worker
+# as $CHIA_REVISION; on the manifest as org.opencontainers.image.revision.
+ARG CHIA_REVISION=unknown
+ENV CHIA_REVISION=${CHIA_REVISION}

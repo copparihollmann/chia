@@ -186,19 +186,22 @@ def stop_collector() -> None:
     """Kill the profile collector actor started by ``start_collector()``.
     Call from the driver once all profiled work is done. Idempotent.
 
-    This is also the flush point for the optional aet sink: the collector holds
-    every call's usage, and its shutdown is the one moment a chia run is known to be
-    complete, which is what makes a *run*-scoped record possible (see
-    :mod:`chia.trace.aet_sink`). The flush is opt-in (``CHIA_AET_SINK=1``) and
-    guarded, so it can neither run by default nor prevent the actor from dying.
+    Events reach the actor as fire-and-forget calls, so this first waits for
+    the ones already sent to land in the log. Then the optional aet sink flushes
+    the complete run before the actor is killed and the profiler is reset.
     """
     global _collector_override
     import ray as _ray
 
     if _collector_override is not None:
+        try:
+            _ray.get(_collector_override.get_events.remote())
+        except Exception:
+            pass
         _flush_aet_sink()
         _ray.kill(_collector_override)
         _collector_override = None
+        reset_profiler()
 
 
 def _flush_aet_sink() -> None:

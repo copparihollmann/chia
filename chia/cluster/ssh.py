@@ -222,13 +222,13 @@ class SSHClient:
         last_error = "connection attempt timed out"
         while True:
             try:
-                result = self.run("echo ok", timeout=10, check=False)
+                result = self.run("echo ok", timeout=30, check=False)
                 if result.returncode == 0:
                     logger.debug(f"[{self.ip}] SSH ready")
                     return
                 if result.stderr.strip():
                     last_error = result.stderr.strip().splitlines()[-1]
-            except subprocess.TimeoutExpired:
+            except (subprocess.TimeoutExpired, SSHError):
                 last_error = "connection attempt timed out"
             if time.monotonic() >= deadline:
                 raise SSHError(

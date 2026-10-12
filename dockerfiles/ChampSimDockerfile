@@ -128,6 +128,12 @@ print('Smoke test PASSED'); \
 COPY --chown=ray:ray . /tmp/chia
 RUN pip install /tmp/chia && rm -rf /tmp/chia
 
+# Which chia commit this image carries. Last, so a new revision does not
+# invalidate the install layers above. Reachable from inside a running worker
+# as $CHIA_REVISION; on the manifest as org.opencontainers.image.revision.
+ARG CHIA_REVISION=unknown
+ENV CHIA_REVISION=${CHIA_REVISION}
+
 # ---- Optional: local dev evolve-flows from --build-context ----
 # Extends champsim-base with local skydiscover and evolve-flows packages.
 # Use --target champsim-evolve-local --build-context evolve-flows=path/to/evolve-flows

@@ -48,6 +48,13 @@ def _gcp_default_auth(raw) -> tuple[str | None, str | None]:
 def _print_plan(config: ClusterConfig, assignments: list[NodeAssignment],
                 show_scripts: bool = False):
 
+    def _tailnet_tag(a: NodeAssignment) -> str:
+        if config.is_tailnet(a.ip):
+            return " [tailnet]"
+        if config.tailnet_config is not None and a.ip == config.head_ip:
+            return " [tailnet head-local]"
+        return ""
+
     print(f"Cluster: {config.cluster_name}")
     print(f"Head:    {config.head_ip}")
     print(f"Workers:")
@@ -59,9 +66,8 @@ def _print_plan(config: ClusterConfig, assignments: list[NodeAssignment],
         bwrap_str = (
             f" [bwrap: {bwrap.image or bwrap.rootfs}]" if bwrap else "")
         tunnel_str = " [tunneled]" if config.is_tunneled(a.ip) else ""
-        tailnet_str = " [tailnet]" if config.is_tailnet(a.ip) else ""
         print(f"  {a.ip} -> {a.node_type.name} "
-              f"(resources: {a.resources}){docker_str}{bwrap_str}{tunnel_str}{tailnet_str}")
+              f"(resources: {a.resources}){docker_str}{bwrap_str}{tunnel_str}{_tailnet_tag(a)}")
 
     worker_tunnels = allocate_worker_tunnels(config, assignments)
     if worker_tunnels:
@@ -115,8 +121,7 @@ def _print_plan(config: ClusterConfig, assignments: list[NodeAssignment],
             docker_str = f" [{docker.engine}: {docker.container_name}]" if docker else ""
             bwrap_str = f" [bwrap: {bwrap.worker_name}]" if bwrap else ""
             tunnel_str = " [tunneled]" if config.is_tunneled(a.ip) else ""
-            tailnet_str = " [tailnet]" if config.is_tailnet(a.ip) else ""
-            print(f"--- Script for worker {a.ip} ({a.node_type.name}){docker_str}{bwrap_str}{tunnel_str}{tailnet_str} ---")
+            print(f"--- Script for worker {a.ip} ({a.node_type.name}){docker_str}{bwrap_str}{tunnel_str}{_tailnet_tag(a)} ---")
             for line in worker_script:
                 print(f"  {line}")
             print()

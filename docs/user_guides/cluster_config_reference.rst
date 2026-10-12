@@ -115,7 +115,9 @@ Top-level keys
    * - ``file_mounts``
      - ``{}``
      - ``{remote_path: local_path}`` directories rsync'd to each node before the
-       main script.
+       main script. Paths are passed to rsync verbatim, so end ``local_path``
+       with ``/`` to copy the directory's *contents* into ``remote_path``
+       (without it rsync nests the directory: ``remote_path/<dirname>``).
    * - ``rsync_exclude``
      - ``[]``
      - Patterns passed to rsync ``--exclude`` (e.g. ``**/.git``).

@@ -94,7 +94,7 @@ chia up examples/tailscale/cluster.yaml        # add --dry-run to inspect first
 export RAY_ADDRESS=127.200.0.1:6379            # head_advertise_ip:gcs_port
 export RAY_grpc_enable_http_proxy=1
 export grpc_proxy=http://127.0.0.1:13129       # the head relay's CONNECT proxy
-export no_grpc_proxy=127.200.0.1               # head self-dials go direct
+export no_grpc_proxy=127.200.0.1,127.0.0.1,localhost  # local dials go direct
 
 python examples/tailscale/loop.py              # smoke test
 python examples/tailscale/connectivity-matrix.py   # full NxN sweep: ChiaFunctions
@@ -111,6 +111,22 @@ The example config takes the machine addresses from the environment
 (`HEAD_IP`, `HEAD_TAILNET_IP`, `WORKER_TAILNET_IP`); for more workers,
 add their tailscale IPs to `compatible_ips` and raise `num_workers`.
 Adjust the conda env names in `*_env_commands` if yours differ.
+
+Workers can also live on the head machine itself: list the head's IP
+(`${HEAD_IP}`) in a node type's `compatible_ips` — see the
+`head_worker` type in `cluster_ec2_fullymanaged.yaml`. They
+participate like any tailnet worker
+(unique advertise IP, own port block, served by the head's relay);
+peers reach them through the head's tailscaled.
+
+Cloud workers join the same way. `cluster_ec2_fullymanaged.yaml` (EC2 via
+`aws_nodes`) and `cluster_gcp_fullymanaged.yaml` (Compute Engine via
+`gcp_nodes`) are the same cluster — head + colocated worker + on-prem worker +
+one cloud worker, tailscale managed by CHIA on every machine — differing only
+in the cloud block: EC2 uses a cloud-registered key pair (`KeyName`) and an
+AMI, GCP injects your `ssh_private_key`'s `.pub` via instance metadata and
+takes a `project`/`zone`/image family, with API access from Application
+Default Credentials (`gcloud auth application-default login`).
 
 That's it — the presence of the `tailnet:` block opts the cluster in.
 Every worker IP that isn't the head machine is automatically treated as

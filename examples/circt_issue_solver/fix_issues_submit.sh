@@ -35,11 +35,16 @@ CHIABIN="${CIRCT_SOLVER_CHIA:-chia}"
 
 : "${GITHUB_TOKEN:?set GITHUB_TOKEN before submitting}"
 
+# --backend opencode reads its Vertex project from GOOGLE_CLOUD_PROJECT; the job
+# env is only what we forward here, so pass it through when set (same as the token).
+GCP_ENV=""
+[ -n "${GOOGLE_CLOUD_PROJECT:-}" ] && GCP_ENV=", \"GOOGLE_CLOUD_PROJECT\": \"${GOOGLE_CLOUD_PROJECT}\""
+
 WAIT_FLAG=()
 [ "${NO_WAIT:-0}" = "1" ] && WAIT_FLAG=(--no-wait)
 
 exec "$CHIABIN" job submit \
   --address "$ADDR" \
   "${WAIT_FLAG[@]}" \
-  --runtime-env-json "{\"env_vars\": {\"GITHUB_TOKEN\": \"${GITHUB_TOKEN}\"}}" \
+  --runtime-env-json "{\"env_vars\": {\"GITHUB_TOKEN\": \"${GITHUB_TOKEN}\"${GCP_ENV}}}" \
   -- "$PYBIN" "$FLOW_DIR/circt_issue_loop.py" "$@"

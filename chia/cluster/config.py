@@ -244,6 +244,7 @@ class AWSClusterConfig:
     ssh_private_key: str | None = None
     use_public_ip: bool = False
     s3_bucket: str = "firesim-chia-builds"
+    workers: dict[str, dict] = field(default_factory=dict)
 
 
 @dataclass
@@ -480,7 +481,7 @@ def _expand_env_vars(data):
         import re
         return re.sub(r'\$\{([^}]+)\}', lambda m: os.environ.get(m.group(1), m.group(0)), data)
     if isinstance(data, dict):
-        return {k: _expand_env_vars(v) for k, v in data.items()}
+        return {_expand_env_vars(k): _expand_env_vars(v) for k, v in data.items()}
     if isinstance(data, list):
         return [_expand_env_vars(item) for item in data]
     return data
@@ -1006,6 +1007,7 @@ def build_config(raw: dict) -> ClusterConfig:
             ssh_private_key=aws_raw.get("ssh_private_key"),
             use_public_ip=aws_raw.get("use_public_ip", False),
             s3_bucket=aws_raw.get("s3_bucket", "firesim-chia-builds"),
+            workers=aws_raw.get("workers", {}),
         )
         logger.debug(f"  AWS config: region={aws_config.region}, key={aws_config.key_name}")
 

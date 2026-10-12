@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/_static/chia-logo-inv.png">
-    <img alt="CHIA" src="docs/_static/chia-logo.png" width="420"/>
+    <img alt="CHIA" src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/chia-logo.png" width="420"/>
   </picture>
 </p>
 
@@ -17,7 +17,7 @@
 
 ## What is CHIA?
 
-CHIA is an open-source framework for agile and principled hardware/software co-design research. Even though many of the steps of the  hardware/software co-design process can be accelerated by AI, existing research using AI in these contexts has been limited to small studies on isolated examples because it is still too hard to assemble more complex experiments. CHIA solves this problem by enabling  users to express the whole co-design **workflow** in an agile way with all of the tools you already use. CHIA abstracts workflows as graphs, and provides an efficient, feature rich runtime system to execute these workflows.
+CHIA is an open-source framework for agile and principled hardware/software co-design research. Even though many of the steps of the hardware/software co-design process can be accelerated by AI, existing research using AI in these contexts has been limited to small studies on isolated examples because it is still too hard to assemble more complex experiments. CHIA solves this problem by enabling users to express the whole co-design **workflow** in an agile way with all of the tools you already use. CHIA abstracts workflows as graphs, and provides an efficient, feature rich runtime system to execute these workflows.
 
 See the [documentation](https://docs.chialoops.ai/en/latest/getting-started/quickstart.html) to run your first flow!
 
@@ -48,7 +48,7 @@ User guides:
 ## Overview of CHIA and Early Case Studies
 
 <p align="center">
-  <img src="docs/_static/overviewfig.png" alt="CHIA overview" width="820"/>
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/overviewfig.png" alt="CHIA overview" width="820"/>
 </p>
 
 ## Integrations & Ecosystem
@@ -56,23 +56,23 @@ User guides:
 CHIA workflows compose the tools you already use across the hardware/software co-design stack:
 
 <p align="center">
-  <img src="docs/_static/project-logos/claude-code.svg" alt="Claude Code" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/openai-codex.svg" alt="OpenAI Codex" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/github-copilot.svg" alt="GitHub Copilot" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/google-antigravity.svg" alt="Google Antigravity" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/alphaevolve.svg" alt="AlphaEvolve" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/openevolve.png" alt="OpenEvolve" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/adaevolve.svg" alt="AdaEvolve" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/skydiscover.png" alt="SkyDiscover" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/chisel.svg" alt="Chisel" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/chipyard.svg" alt="Chipyard" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/circt.svg" alt="CIRCT" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/hammer.png" alt="Hammer" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/gem5.png" alt="gem5" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/firesim.png" alt="FireSim" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/verilator.png" alt="Verilator" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/spike.svg" alt="Spike" height="40"/> &nbsp;&nbsp;
-  <img src="docs/_static/project-logos/champsim.svg" alt="ChampSim" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/claude-code.svg" alt="Claude Code" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/openai-codex.svg" alt="OpenAI Codex" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/github-copilot.svg" alt="GitHub Copilot" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/google-antigravity.svg" alt="Google Antigravity" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/alphaevolve.svg" alt="AlphaEvolve" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/openevolve.png" alt="OpenEvolve" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/adaevolve.svg" alt="AdaEvolve" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/skydiscover.png" alt="SkyDiscover" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/chisel.svg" alt="Chisel" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/chipyard.svg" alt="Chipyard" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/circt.svg" alt="CIRCT" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/hammer.png" alt="Hammer" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/gem5.png" alt="gem5" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/firesim.png" alt="FireSim" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/verilator.png" alt="Verilator" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/spike.svg" alt="Spike" height="40"/> &nbsp;&nbsp;
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/champsim.svg" alt="ChampSim" height="40"/> &nbsp;&nbsp;
 </p>
 
 <p align="center">
@@ -80,7 +80,7 @@ CHIA workflows compose the tools you already use across the hardware/software co
 </p>
 
 <p align="center">
-  <img src="docs/_static/project-logos/ray.png" alt="Ray" height="40"/>
+  <img src="https://raw.githubusercontent.com/ucb-bar/chia/main/docs/_static/project-logos/ray.png" alt="Ray" height="40"/>
 </p>
 
 ## Attribution

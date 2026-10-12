@@ -1,7 +1,8 @@
 """LLM nodes for the MemCpy example: implement + debug.
 
-Both nodes drive an LLM backend — :class:`chia.models.claude.ClaudeCodeLLM` or
-:class:`chia.models.opencode.OpenCodeLLM`, chosen per run with ``--llm`` — over
+Both nodes drive an LLM backend — :class:`chia.models.claude.ClaudeCodeLLM`,
+:class:`chia.models.opencode.OpenCodeLLM` or
+:class:`chia.models.antigravity.AntigravityLLM`, chosen per run with ``--llm`` — over
 the ``chipyard_bash`` MCP tool (a BashTool deployed into the chipyard
 container). A single LLM instance is built once (see :func:`make_llm`) and
 reused across the whole loop; for Claude Code that lets the debug calls
@@ -27,10 +28,13 @@ from pathlib import Path
 from chia.base.ChiaFunction import get
 from chia.base.tools.BashTool import BashTool
 from chia.base.llm_call import QueryResult
+from chia.models.antigravity import AntigravityLLM
 from chia.models.claude import ClaudeCodeLLM
-from chia.models.opencode import OpenCodeLLM
+from chia.models.opencode import AdditionalModelProvider, OpenCodeLLM
 
 from constants import (
+    ANTIGRAVITY_MODEL,
+    ANTIGRAVITY_RESOURCE,
     BUILD_CONFIG,
     CHIPYARD_SRC_PATH,
     COMMIT_LOG_TAIL_LINES,
@@ -44,6 +48,8 @@ from constants import (
     MAX_OUTPUT_CHARS,
     OPENCODE_MODEL,
     OPENCODE_RESOURCE,
+    OPENCODE_VERTEX_LOCATION,
+    OPENCODE_VERTEX_PROJECT,
 )
 from helpers import Outcome
 from chia.chipyard.state_def import BuildArtifact, RunResult
@@ -175,18 +181,58 @@ def format_sim_failure(
 # LLM nodes  (dispatched onto the dedicated claude "llm" or "opencode" worker)
 # ---------------------------------------------------------------------------
 #
-# Both ClaudeCodeLLM.prompt and OpenCodeLLM.prompt are @ChiaFunctions, so the
-# CLI runs on the worker holding the backend's resource ("llm" for claude,
-# "opencode_creds" for opencode), not on the head. The backend is chosen per run
-# via the loop's --llm flag.
+# ClaudeCodeLLM.prompt, OpenCodeLLM.prompt and AntigravityLLM.prompt are all
+# @ChiaFunctions, so the CLI runs on the worker holding the backend's resource
+# ("llm" for claude, "opencode_creds" for opencode, "antigravity_creds" for
+# antigravity), not on the head. The backend is chosen per run via --llm.
 #
 # Claude: implement (first call) and every debug call share ONE session — a
 # fixed session_id plus the session transcript threaded from each call into the
 # next (the @_session_tracked wrapper syncs cli.session_transcript on get), so
 # the debugger resumes the implement conversation and remembers prior fixes.
-# Session persistence for other backends (opencode) is in development; for now
-# each opencode call is independent and the full failure context is re-supplied
-# inline (see format_build_failure / format_sim_failure) regardless.
+# Antigravity: same shape — one agy conversation, resumed via --conversation,
+# with the conversation db carried across workers on the result.
+# Session persistence for opencode is in development; for now each opencode
+# call is independent. The full failure context is re-supplied inline (see
+# format_build_failure / format_sim_failure) for every backend regardless.
+
+
+def _vertex_provider(model_id: str) -> AdditionalModelProvider:
+    """opencode `google-vertex` provider block for Gemini on Vertex AI.
+
+    opencode has this provider built in, but we (re)declare it to pin the GCP
+    project + location (so e.g. Gemini Pro is served from `global`) and to
+    register *model_id* even if opencode's model catalog lags Vertex.
+    """
+    if not OPENCODE_VERTEX_PROJECT:
+        raise RuntimeError(
+            "MEMCPY_OPENCODE_MODEL selects google-vertex/ but no GCP project is set: "
+            "export GOOGLE_CLOUD_PROJECT (and forward it to the job, see README)."
+        )
+    return AdditionalModelProvider(
+        id="google-vertex",
+        npm="@ai-sdk/google-vertex",
+        name="Google Vertex AI",
+        models=[model_id],
+        options={"project": OPENCODE_VERTEX_PROJECT, "location": OPENCODE_VERTEX_LOCATION},
+    )
+
+
+# Providers that need config beyond a credential, keyed by the `provider` half of
+# OPENCODE_MODEL. Anything not listed here runs on opencode's built-in provider
+# setup + stored credentials untouched. Add an entry to support another one.
+_OPENCODE_PROVIDER_CONFIG = {
+    "google-vertex": _vertex_provider,
+}
+
+
+def _opencode_providers(model: str | None) -> list[AdditionalModelProvider]:
+    """Provider blocks to inject into the opencode config for *model*, if any."""
+    if not model or "/" not in model:
+        return []
+    provider_id, _, model_id = model.partition("/")
+    builder = _OPENCODE_PROVIDER_CONFIG.get(provider_id)
+    return [builder(model_id)] if builder else []
 
 
 def make_llm(backend: str, chipyard_bash: BashTool):
@@ -196,16 +242,35 @@ def make_llm(backend: str, chipyard_bash: BashTool):
     ``@_session_tracked`` wrapper thread the session automatically: each
     ``get()`` syncs the transcript *and* advances the call counter onto this
     instance, so every ``debug`` call ``--resume``s the ``implement``
-    conversation with no manual session bookkeeping. (Session persistence for
-    OpenCode is in development — each OpenCode call is independent — so reuse is
-    just a convenience there; the failure context is re-supplied inline.)
+    conversation with no manual session bookkeeping. ``AntigravityLLM`` shares
+    the same wrapper and result fields, so ``--llm antigravity`` threads one agy
+    conversation the same way. (Session persistence for OpenCode is in
+    development — each OpenCode call is independent — so reuse is just a
+    convenience there; the failure context is re-supplied inline regardless.)
     """
+    if backend == "antigravity":
+        # `agy --print --output-format stream-json`: full tool/usage transcript on
+        # stream_result; the system prompt is folded into the user message and
+        # effort rides on the model id. resume_session threads one agy
+        # conversation across implement + debug exactly like Claude (the
+        # conversation db is carried on the result and re-pasted before each
+        # --conversation run). agy's own file/shell tools act on the antigravity
+        # container, but the prompts direct all work through chipyard_bash.
+        return AntigravityLLM(
+            model=ANTIGRAVITY_MODEL,
+            system_message=LLM_SYSTEM_MESSAGE,
+            timeout_seconds=LLM_TIMEOUT_SECONDS,
+            logging_name="memcpy_generator",
+            resume_session=True,   # implement + every debug call share one conversation
+        )
     if backend == "opencode":
         return OpenCodeLLM(
             model=OPENCODE_MODEL,
             system_message=LLM_SYSTEM_MESSAGE,
             timeout_seconds=LLM_TIMEOUT_SECONDS,
             logging_name="memcpy_generator",
+            # Provider-specific config for the chosen provider (none for most).
+            additional_providers=_opencode_providers(OPENCODE_MODEL),
             # Restrict opencode to ONLY the chipyard_bash MCP tool. Its built-in
             # write/edit/bash tools act on the opencode container's own FS, not
             # the chipyard container — deny all, allow just this MCP server.
@@ -224,11 +289,12 @@ def make_llm(backend: str, chipyard_bash: BashTool):
 
 def _run_llm(llm, prompt: str, chipyard_bash: BashTool) -> QueryResult:
     """Dispatch *prompt* to *llm*'s worker (its backend's creds resource)."""
-    resources = (
-        {"opencode_creds": OPENCODE_RESOURCE}
-        if isinstance(llm, OpenCodeLLM)
-        else {"llm": LLM_RESOURCE}
-    )
+    if isinstance(llm, OpenCodeLLM):
+        resources = {"opencode_creds": OPENCODE_RESOURCE}
+    elif isinstance(llm, AntigravityLLM):
+        resources = {"antigravity_creds": ANTIGRAVITY_RESOURCE}
+    else:
+        resources = {"llm": LLM_RESOURCE}
     return get(
         llm.prompt.options(resources=resources).chia_remote(llm, prompt, [chipyard_bash])
     )

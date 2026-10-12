@@ -27,7 +27,10 @@
 #       -v /path/to/project:/workspace -w /workspace \
 #       ghcr.io/ucb-bar/chia-claude-code:latest \
 #       -p --dangerously-skip-permissions "Review the code in this directory"
-FROM ghcr.io/ucb-bar/chia:latest
+# Pinned to the released chia image on a release build, so the version this
+# ships is the version it was built against.
+ARG BASE_IMAGE=ghcr.io/ucb-bar/chia:latest
+FROM ${BASE_IMAGE}
 
 USER root
 

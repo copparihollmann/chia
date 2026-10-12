@@ -1,5 +1,7 @@
 import fcntl
+import functools
 import os
+import time
 import shutil
 import stat
 import subprocess
@@ -76,6 +78,7 @@ class VerilatorRunNode:
 
     def _setup(self, artifact: BuildArtifact, test_binary_content: bytes, test_binary_name: str, work_dir: str, dramsim_ini_files: dict[str, bytes]) -> str:
         os.makedirs(work_dir, exist_ok=True)
+        self._reap_stale_task_dirs(work_dir)
 
         # Create a unique task-level subdirectory to isolate concurrent runs
         # sharing the same Docker container / work_dir.
@@ -88,6 +91,18 @@ class VerilatorRunNode:
         os.chmod(binary_path, os.stat(binary_path).st_mode
                  | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         self._binary_path = binary_path
+
+        # Stage the artifact's shared libraries (the golden model) beside the
+        # binary: nothing shared, nothing outliving the task dir.
+        for lib_name, lib_content in artifact.runtime_libs:
+            with open(os.path.join(self._task_dir, os.path.basename(lib_name)), "wb") as f:
+                f.write(lib_content)
+        if artifact.runtime_libs:
+            self.logger.info(
+                f"Staged {len(artifact.runtime_libs)} runtime lib(s) in "
+                f"{self._task_dir}: {[n for n, _ in artifact.runtime_libs]}"
+                + (f" (golden model {artifact.golden_model_digest[:12]})"
+                   if artifact.golden_model_digest else ""))
 
         test_binary_path = os.path.join(self._task_dir, test_binary_name)
         with open(test_binary_path, "wb") as f:
@@ -106,6 +121,41 @@ class VerilatorRunNode:
 
         self.logger.info(f"Setup complete. Task dir: {self._task_dir}, Simulator: {self._binary_path}, test binary: {test_binary_path}")
         return test_binary_path
+
+    STALE_TASK_DIR_SECONDS = 24 * 3600   # longer than any task wall clock
+
+    def _reap_stale_task_dirs(self, work_dir: str) -> None:
+        """Remove task dirs left behind by killed tasks, which skip finally."""
+        cutoff = time.time() - self.STALE_TASK_DIR_SECONDS
+        for name in os.listdir(work_dir):
+            path = os.path.join(work_dir, name)
+            try:
+                if (len(name) == 8 and all(c in "0123456789abcdef" for c in name)
+                        and os.path.isdir(path) and os.path.getmtime(path) < cutoff):
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                pass                       # raced with another task's cleanup
+
+    @staticmethod
+    def _cleans_task_dir(fn):
+        """Run _cleanup_task_dir however *fn* ends, not only on clean return."""
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            try:
+                return fn(self, *args, **kwargs)
+            finally:
+                if kwargs.get("cleanup_task_dir", True):
+                    self._cleanup_task_dir()
+        return wrapper
+    def _env(self) -> dict:
+        """The simulator's environment with the task dir first on
+        LD_LIBRARY_PATH, so staged libraries beat the image's (the binary's
+        rpath is DT_RUNPATH, which this overrides)."""
+        env = dict(os.environ)
+        existing = env.get("LD_LIBRARY_PATH", "")
+        env["LD_LIBRARY_PATH"] = (f"{self._task_dir}:{existing}" if existing
+                                  else self._task_dir)
+        return env
 
     def _cleanup_task_dir(self):
         """Remove the per-task directory to avoid disk bloat.
@@ -178,6 +228,7 @@ class VerilatorRunNode:
             self.logger.warning(f"S3 upload of {filename} failed: {e}; s3_path will be empty")
             return "", size
 
+    @_cleans_task_dir
     def _execute(
         self,
         argv: list[str],
@@ -225,6 +276,7 @@ class VerilatorRunNode:
             stdout=logfile,
             stderr=subprocess.PIPE,
             stdin=subprocess.DEVNULL,
+            env=self._env(),
         )
 
         dasm_proc = subprocess.Popen(
@@ -319,8 +371,6 @@ class VerilatorRunNode:
                 "vcd_s3_path": vcd_s3_path,
             })
 
-        if (cleanup_task_dir):
-            self._cleanup_task_dir()
         return result
 
     @ChiaFunction(resources={"verilator_run": 1})

@@ -1,0 +1,104 @@
+name: Release Images
+
+# Every published image ships the chia package, so a release has to rebuild all
+# of them or the version tags lie. Ordering matters: the images that derive
+# FROM ghcr.io/ucb-bar/chia resolve that base at build time, and each build
+# pins the base to the tag being released rather than to :latest, so
+# chia-gem5:v1.2.3 is built against chia:v1.2.3 and not against whatever
+# :latest happened to be.
+#
+# chia-circt-base is deliberately absent: it carries no chia (the chia install
+# lives in the chia-circt child) and takes ~30 min to rebuild.
+
+on:
+  push:
+    tags: ["v[0-9]*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  chia:
+    uses: ./.github/workflows/chia.yml
+    secrets: inherit
+
+  # Everything below is FROM ghcr.io/ucb-bar/chia.
+  chipyard:
+    needs: chia
+    uses: ./.github/workflows/chipyard.yml
+    secrets: inherit
+
+  gem5:
+    needs: chia
+    uses: ./.github/workflows/gem5.yml
+    secrets: inherit
+
+  cacti:
+    needs: chia
+    uses: ./.github/workflows/cacti.yml
+    secrets: inherit
+
+  riscv-cross:
+    needs: chia
+    uses: ./.github/workflows/riscv-cross.yml
+    secrets: inherit
+
+  riscv-dv:
+    needs: chia
+    uses: ./.github/workflows/riscv-dv.yml
+    secrets: inherit
+
+  antigravity:
+    needs: chia
+    uses: ./.github/workflows/antigravity.yml
+    secrets: inherit
+
+  opencode:
+    needs: chia
+    uses: ./.github/workflows/opencode.yml
+    secrets: inherit
+
+  claude-code:
+    needs: chia
+    uses: ./.github/workflows/claude-code.yml
+    secrets: inherit
+
+  # Also COPYs spike/DRAMSim out of chia-chisel-build, so it needs both.
+  verilator-run:
+    needs: [chia, chipyard]
+    uses: ./.github/workflows/verilator-run.yml
+    secrets: inherit
+
+  firemarshal:
+    needs: chipyard
+    uses: ./.github/workflows/firemarshal.yml
+    secrets: inherit
+
+  firesim:
+    needs: chia
+    uses: ./.github/workflows/firesim.yml
+    secrets: inherit
+
+  # These install chia themselves instead of deriving from the chia image, so
+  # they can start immediately.
+  champsim:
+    uses: ./.github/workflows/champsim.yml
+    secrets: inherit
+
+  ollama:
+    uses: ./.github/workflows/ollama.yml
+    secrets: inherit
+
+  vllm:
+    uses: ./.github/workflows/vllm.yml
+    secrets: inherit
+
+  chia-circt:
+    uses: ./.github/workflows/chia-circt.yml
+    secrets: inherit
+
+  esp:
+    uses: ./.github/workflows/esp.yml
+    secrets: inherit
