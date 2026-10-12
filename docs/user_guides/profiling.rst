@@ -114,8 +114,12 @@ For a Claude Code CLI call that delegates to several models, the terminal ``mode
 folded into the public ``QueryResult.usage`` and the default profiler's token totals, even when
 AET is not installed. The per-model counters also appear under ``extra.model_usage``. The one
 ``llm_request`` record for the CLI invocation uses ``model="mixed"`` when multiple models were
-used, so the aggregate is not falsely attributed to its primary model. This does not identify
-individual internal Claude Code subagents; ``agent_scope`` covers agents orchestrated by Chia.
+used, so the aggregate is not falsely attributed to its primary model. The CLI stream's
+``task_started`` and ``task_notification`` events also provide stable internal task IDs,
+which Chia emits as child ``agent_start`` / ``agent_end`` records without AET. The terminal
+usage split remains **per model**, not per child: two children using one model cannot be
+allocated exact token classes from that split. ``agent_scope`` covers agents orchestrated
+by Chia.
 
 For OpenCode, Chia follows the ``task`` tool's child session IDs, exports each delegated
 session once, and records its model and counters under ``extra.agent_usage``. If every child

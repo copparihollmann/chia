@@ -936,6 +936,58 @@ class ClaudeCodeLLM(LLMCallBase):
         except Exception as exc:                     # pragma: no cover - defensive
             self.logger.debug("stream telemetry not attached: %s", exc)
 
+    def _record_child_profiles(self, raw_events) -> None:
+        """Emit Claude internal child lifecycles from stable task IDs.
+
+        ``task_started`` and ``task_notification`` contain task IDs, type, and
+        status without requiring AET. They do not contain per-child token
+        classes, so this records identity/timing only and leaves the terminal
+        ``modelUsage`` counters grouped by model.
+        """
+        try:
+            from dataclasses import replace
+            from chia.trace.profile_events import agent_event
+            from chia.trace.profiler import get_profiler
+
+            profiler = get_profiler()
+            if not profiler.enabled:
+                return
+            parent = profiler.profile_context()
+            wall_offset = time.time() - time.monotonic()
+            started = {}
+            for monotonic_s, line in raw_events:
+                try:
+                    event = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if event.get("type") != "system":
+                    continue
+                subtype = event.get("subtype")
+                task_id = event.get("task_id")
+                if not isinstance(task_id, str) or not task_id:
+                    continue
+                if subtype == "task_started":
+                    name = str(event.get("subagent_type") or "subagent")
+                    context = replace(
+                        parent, session_id=str(event.get("session_id") or parent.session_id),
+                        agent_id=f"claude:{task_id}",
+                        parent_agent_id=(parent.agent_id if event.get("spawn_depth") == 1 else ""),
+                    )
+                    started[task_id] = (name, context)
+                    record = agent_event("agent_start", context, name=name)
+                    record["ts"] = monotonic_s + wall_offset
+                    profiler.log_profile_event(record)
+                elif subtype == "task_notification" and task_id in started:
+                    name, context = started.pop(task_id)
+                    record = agent_event(
+                        "agent_end", context, name=name,
+                        status=str(event.get("status") or "unknown"),
+                    )
+                    record["ts"] = monotonic_s + wall_offset
+                    profiler.log_profile_event(record)
+        except Exception as exc:  # pragma: no cover - profile failures cannot fail inference
+            self.logger.debug("child profile events unavailable: %s", exc)
+
     def _capture_transcript(self, cli: ClaudeCodeQueryResult) -> None:
         """Read the on-disk transcript after a run into memory and onto *cli*.
 
@@ -1267,6 +1319,7 @@ class ClaudeCodeLLM(LLMCallBase):
         # Derive the activity summary here, on the worker, where the events already are.
         # ``prompt`` may run on any Ray worker, so only this summary travels back to the
         # driver — never the raw lines, which carry prompt text and tool output.
+        self._record_child_profiles(raw_events)
         self._attach_stream_telemetry(raw_events)
 
         if not result_text_parts:

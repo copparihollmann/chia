@@ -1,4 +1,5 @@
 import json
+import time
 from io import StringIO
 
 import pytest
@@ -217,6 +218,40 @@ def test_cli_result_folds_all_models_and_cache_classes_without_aet():
     assert llm._last_metadata["cache_read_input_tokens"] == 100
     assert llm._last_metadata["cache_creation_input_tokens"] == 20
     assert llm._last_metadata["model_usage"]["fixture/weak"]["input_tokens"] == 7
+
+
+def test_claude_stream_child_task_id_produces_balanced_lifecycle(monkeypatch):
+    captured = []
+
+    class FakeProfiler:
+        enabled = True
+
+        @staticmethod
+        def profile_context():
+            return ProfileContext(call_id="call", agent_id="lead")
+
+        @staticmethod
+        def log_profile_event(event):
+            captured.append(event)
+
+    monkeypatch.setattr("chia.trace.profiler.get_profiler", lambda: FakeProfiler())
+    llm = ClaudeCodeLLM(model="sonnet")
+    now = time.monotonic()
+    llm._record_child_profiles([
+        (now, json.dumps({"type": "system", "subtype": "task_started",
+                          "task_id": "child-1", "subagent_type": "explorer",
+                          "spawn_depth": 1, "session_id": "session"})),
+        (now + 0.1, json.dumps({"type": "system", "subtype": "task_notification",
+                                "task_id": "child-1", "status": "completed",
+                                "usage": {"total_tokens": 100}})),
+    ])
+    assert [event["type"] for event in captured] == ["agent_start", "agent_end"]
+    assert [event["agent_id"] for event in captured] == ["claude:child-1"] * 2
+    assert all(event["parent_agent_id"] == "lead" for event in captured)
+    assert captured[0]["name"] == captured[1]["name"] == "explorer"
+    assert captured[1]["status"] == "completed"
+    assert captured[1]["ts"] - captured[0]["ts"] == pytest.approx(0.1)
+    assert "usage" not in captured[1]
 
 
 def test_retry_trace_events_sum_to_the_cumulative_result_once(monkeypatch):
