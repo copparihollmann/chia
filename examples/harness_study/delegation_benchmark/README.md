@@ -17,4 +17,42 @@ export TMPDIR=/scratch/agustin/research/chia/tasks/chia-results-integration-2026
 
 `relay.py` is the accounting component for a future paid run. Point both harnesses at separate loopback relay instances, one per arm. The relay forwards OpenAI-compatible Chat Completions to the selected provider and writes one privacy-safe JSONL row for **every** upstream request, including OpenCode's automatic title request. It records model, timestamps, HTTP status, fresh/cache-read/cache-write/output tokens and whether the provider supplied a complete usage block; it stores no prompts, responses or keys. A local fake-upstream test covers two ordinary requests and a streamed child request. An arm with missing provider usage cannot support a full-cost comparison.
 
-The remaining execution work is to connect the two installed CLIs to this relay for each prepared snapshot, define a provider/model pair and current price table, enforce an approved budget, then run and grade the 50 scheduled arms. The current host has no configured AWS profile or paid OpenCode provider key. See the task's `deliverables/REMAINING_STUDIES.md` for the outcome, cost, and cache-TTL analysis plan.
+`run_arms.py` now connects each scheduled arm to the relay. It archives a fresh
+baseline, gives each CLI its own home and writable workspace, and runs the CLI
+inside bubblewrap with its network namespace disconnected. A single Unix
+socket forwards only the model endpoint to the host relay. The agent cannot
+read the evaluator directory or reach the public fork; the oracle runs after
+the agent exits. OpenCode's generated config is placed inside the bound
+workspace. The runner captures the patch, answer, oracle outcome, public Chia
+usage, the default Ray profiler log, and every provider request. A conservative
+per-request reservation checks a supplied dollar cap before sending upstream.
+If usage is incomplete, the schedule stops so unknown spending is not treated
+as zero.
+
+The runner passed a **no-spend installed-CLI smoke** for both harnesses in this
+sandbox. Both made strong → weak → strong calls. The fake provider led to zero
+code changes, so both oracle grades correctly failed. Claude's three provider
+requests reconciled exactly with its public 30-input/9-output counters.
+OpenCode made four requests; the extra 10-input/3-output title request was
+visible in provider logs and absent from its public exported-session counters.
+The default Chia profiler recorded Claude's child lifecycle and mixed-model
+request, and OpenCode's three attributed turns plus a tool interval. These
+are transport/accounting checks, **not** task-quality or real-cost results.
+
+For a paid run, supply a JSON price table keyed by the exact upstream model
+IDs, each with `input`, `read`, `write`, and `output` USD per million tokens.
+Choose a provider that implements OpenAI-compatible Chat Completions and
+returns complete usage in streamed and ordinary responses. The `run` command
+requires an explicit provider credential environment variable, source schedule,
+rate table, models, and dollar cap; start with `--max-arms 2` for one paired
+pilot. This host currently has no configured paid provider key, and **no paid
+arm has run**. See the task's `deliverables/REMAINING_STUDIES.md` for the
+comparison and cache-TTL analysis plan.
+
+After a complete run, `analyze.py <run-directory>` checks the 25 matched
+pairs. It counts an outcome as delegated success only if the held-out oracle
+passes **and** the weak model was called. It reports a paired success
+difference and task-clustered bootstrap interval, then compares cost computed
+from complete provider usage and the supplied current rates, and CLI
+wall time on pairs where both succeeded. Incomplete arms or usage prevent a
+full-study ranking. The local fixture is not a quality result.

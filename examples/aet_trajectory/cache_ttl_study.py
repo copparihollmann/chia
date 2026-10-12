@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import random
 import statistics
@@ -125,7 +126,8 @@ async def run_study(args) -> None:
         raise ValueError("ANTHROPIC_API_KEY is required for run")
     prices = {key: getattr(args, f"price_{key}")
               for key in ("input", "read", "write", "output")}
-    if any(value < 0 for value in prices.values()) or args.cap_usd <= 0:
+    if (any(not math.isfinite(value) or value < 0 for value in prices.values())
+            or not math.isfinite(args.cap_usd) or args.cap_usd <= 0):
         raise ValueError("prices must be nonnegative and cap positive")
     run_id = uuid.uuid4().hex[:12]
     arms = schedule(args.seed, args.repetitions, run_id=run_id)

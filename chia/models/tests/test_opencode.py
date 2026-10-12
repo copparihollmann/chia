@@ -34,6 +34,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from chia.base.sandbox import SandboxSpec
 from chia.models import opencode as oc_mod
 from chia.models.opencode import (
     OpenCodeQueryResult,
@@ -197,6 +198,24 @@ def test_run_result_carries_usage_and_session_id(monkeypatch):
     assert cli.usage.input_tokens == 10 and cli.usage.output_tokens == 4
     assert cli.session_id == "ses_test123"
     assert "[Usage]" in cli.stream_result and "[Result]" in cli.stream_result
+
+
+def test_sandboxed_run_places_config_inside_bound_workspace(tmp_path, monkeypatch):
+    llm = OpenCodeLLM(model="fixture/strong", work_dir=str(tmp_path),
+                      sandbox_spec=SandboxSpec(workspace=tmp_path))
+    seen = []
+
+    def fake_capture(_cmd, env):
+        path = pathlib.Path(env["OPENCODE_CONFIG"])
+        seen.append((path, json.loads(path.read_text())))
+        return SimpleNamespace(returncode=1, stdout="", stderr="fixture stop")
+
+    monkeypatch.setattr(llm, "_capture", fake_capture)
+    llm._run_opencode("hi", [])
+    assert len(seen) == 1
+    assert seen[0][0].parent == tmp_path
+    assert seen[0][1]["agent"]
+    assert not seen[0][0].exists()
 
 
 def test_constructor_defaults():

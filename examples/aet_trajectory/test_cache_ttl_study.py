@@ -3,7 +3,11 @@
 import asyncio
 import importlib.util
 import json
+import math
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -63,3 +67,12 @@ def test_gap_starts_at_confirmed_read_request_and_summary_keeps_only_valid(tmp_p
     assert result["gaps"]["past_5m"]["valid_arms"] == 1
     assert result["gaps"]["past_5m"]["cache_read_arms"] == 0
     assert result["measured_cost_usd"] == 0.03
+
+
+def test_paid_run_rejects_nonfinite_cap_before_request(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-only")
+    args = SimpleNamespace(price_input=1, price_read=0.1,
+                           price_write=1.25, price_output=2,
+                           cap_usd=math.nan)
+    with pytest.raises(ValueError):
+        asyncio.run(study.run_study(args))

@@ -320,6 +320,16 @@ def test_billing_mode_is_read_where_the_cli_runs(no_auth_env, monkeypatch):
     assert llm.billing_mode == "per_token"
 
 
+def test_billing_mode_uses_effective_cli_environment(no_auth_env, monkeypatch):
+    assert ClaudeCodeLLM(
+        backend="cli", extra_env={"ANTHROPIC_AUTH_TOKEN": "local-gateway"}
+    ).billing_mode == "per_token"
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "host-only-key")
+    assert ClaudeCodeLLM(
+        backend="cli", extra_env={"ANTHROPIC_API_KEY": ""}
+    ).billing_mode == "subscription"
+
+
 # ---------------------------------------------------------------------------
 # Mocked-loop tests (fake anthropic; no network, no SDK required)
 # ---------------------------------------------------------------------------

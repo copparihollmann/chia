@@ -567,7 +567,8 @@ class ClaudeCodeLLM(LLMCallBase):
         """
         if self.backend == "api" or self.api_key:
             return "per_token"
-        if any(os.environ.get(var) for var in self._METERED_AUTH_ENV_VARS):
+        if any(self.extra_env.get(var, os.environ.get(var))
+               for var in self._METERED_AUTH_ENV_VARS):
             return "per_token"
         return "subscription"
 

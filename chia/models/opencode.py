@@ -867,8 +867,13 @@ class OpenCodeLLM(LLMCallBase):
         tools = tools or []
         cfg = self._build_config(tools)
 
+        # A sandboxed CLI only sees its bound workspace. Keep the generated
+        # config there so OPENCODE_CONFIG resolves inside bwrap or Docker too.
+        cfg_dir = (str(self.sandbox_spec.workspace)
+                   if self.sandbox_spec is not None else None)
         tmp = tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", prefix="opencode_cfg_", delete=False
+            mode="w", suffix=".json", prefix="opencode_cfg_", delete=False,
+            dir=cfg_dir,
         )
         json.dump(cfg, tmp)
         tmp.close()
