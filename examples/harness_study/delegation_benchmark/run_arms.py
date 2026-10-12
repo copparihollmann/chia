@@ -186,12 +186,14 @@ def snapshot_diff(baseline: str, workspace: Path, task_id: str) -> str:
 
 def usage_summary(path: Path, weak: str) -> dict:
     records = [json.loads(line) for line in path.read_text().splitlines() if line]
+    upstream = [row for row in records if not row.get("budget_rejected")]
     token_fields = ("input_tokens", "output_tokens", "cache_read_input_tokens",
                     "cache_creation_input_tokens")
     return {
-        "provider_requests": len(records),
-        "weak_model_requests": sum(row["model"] == weak for row in records),
-        "full_usage": bool(records) and all(row.get("usage_complete") for row in records),
+        "provider_requests": len(upstream),
+        "budget_rejections": len(records) - len(upstream),
+        "weak_model_requests": sum(row["model"] == weak for row in upstream),
+        "full_usage": bool(upstream) and all(row.get("usage_complete") for row in records),
         "cost_usd": sum(row.get("cost_usd") or 0 for row in records),
         "budget_debit_usd": sum(row.get("budget_debit_usd") or 0 for row in records),
         "provider_tokens": {field: sum(row.get(field) or 0 for row in records)
@@ -271,6 +273,7 @@ def execute(args) -> Path:
             (arm_dir / "answer.txt").write_text(result.result)
         usage = usage_summary(usage_log, args.weak) if usage_log.exists() else {
             "provider_requests": 0, "weak_model_requests": 0,
+            "budget_rejections": 0,
             "full_usage": False, "cost_usd": 0, "budget_debit_usd": 0,
             "provider_tokens": {},
         }

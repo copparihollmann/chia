@@ -195,6 +195,12 @@ def build_relay_app(*, upstream_base_url: str, credential_env: str,
             except ValueError as error:
                 return JSONResponse({"error": str(error)}, status_code=400)
             if reserved is None:
+                rejected = {"request_id": uuid.uuid4().hex, "arm_id": arm_id,
+                            "model": body["model"], "stream": streaming,
+                            "start_ts": time.time(), "end_ts": time.time(),
+                            "status": 429, "usage_complete": False,
+                            "budget_rejected": True}
+                await write_record(rejected)
                 return JSONResponse({"error": "study dollar cap reached"}, status_code=429)
             reservation = reserved
         record = {

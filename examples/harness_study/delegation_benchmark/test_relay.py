@@ -149,7 +149,9 @@ def test_relay_budget_rejects_before_any_upstream_request(tmp_path, monkeypatch)
 
     asyncio.run(exercise())
     assert seen == []
-    assert not log.exists()
+    record = json.loads(log.read_text())
+    assert record["budget_rejected"] is True
+    assert record["budget_debit_usd"] == 0
 
 
 def test_relay_rejects_nonfinite_budget_and_prices(tmp_path):
